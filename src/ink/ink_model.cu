@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <thread>
+#include <type_traits>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -150,22 +151,43 @@ struct Engine::Impl {
     cudaStream_t s = nullptr;
     std::vector<Layer> L;
     DMat embd, output;
+    // The embedding's rows stay in the GGUF's mapping (a token needs one): its row copied up through h_erow, a prompt
+    // chunk's gathered into the pinned staging and copied to pf.Erows.  INK_EMBD_VRAM=1: the table in VRAM as before.
+    bool embd_host = true;
+    uint8_t *h_erow = nullptr, *d_erow = nullptr;
     float *tok_norm = nullptr, *out_norm = nullptr;
     std::unique_ptr<Pool> pool;
+    CpuLane lane;   // the token path's CPU experts, a layer at a time
     size_t dev_bytes = 0;
 
     // device scratch
     float *x = nullptr, *a = nullptr, *q = nullptr, *kk = nullptr, *vv = nullptr, *r = nullptr, *rel = nullptr;
     float *o_ = nullptr, *ao = nullptr, *f = nullptr, *fg = nullptr, *fu = nullptr, *fo = nullptr;
-    float *routed = nullptr, *sg = nullptr, *su = nullptr, *so = nullptr, *logits = nullptr, *rlog = nullptr;
+    float *sg = nullptr, *su = nullptr, *so = nullptr, *logits = nullptr, *rlog = nullptr;
     float *tau = nullptr, *gamma = nullptr, *attn_scr = nullptr;
+    float* tokd = nullptr;   // the token's tau (tau points here), then its position (dpos) - the graphs read them
+    int* dpos = nullptr;
+    float* d_tail = nullptr;   // a MoE layer's end: which lanes ran (2 ints, 2 spare), the CPU lane's sum (n_embd)
     int8_t* xq = nullptr;
     float* xd = nullptr;
     uint16_t* e16 = nullptr;
     // host (pinned)
-    float *h_f = nullptr, *h_rlog = nullptr, *h_routed = nullptr, *h_logits = nullptr, *h_tau = nullptr,
+    float *h_f = nullptr, *h_rlog = nullptr, *h_tail = nullptr, *h_logits = nullptr, *h_tokd = nullptr,
           *h_gamma = nullptr;
     Stats st;
+    // (INK_STEP_TIMES) the token path's host time by phase, printed every 64 tokens
+    struct PhaseTimes {
+        double att = 0, route = 0, glaunch = 0, cpu = 0, tail = 0, head = 0, adapt = 0, embed = 0, dense = 0;
+        long cpu_experts = 0, tokens = 0;
+        double gpu_att = 0;   // (a MoE layer's attention segment on the GPU, layer 10's, by events)
+        cudaEvent_t e0 = nullptr, e1 = nullptr;
+    } pt;
+    // (INK_ROUTE_LOG=FILE) the routing as it goes, for replaying the expert cache's choices offline: 'T' + a token's
+    // n_used experts a MoE layer; 'P' + layer + a prompt chunk's counts an expert (uint16); 'E' a prompt's end (the
+    // cache refilled there)
+    FILE* route_log = nullptr;
+    std::vector<uint8_t> route_tok;
+    bool pf_open = false;   // a prompt read through the prompt path, no token written since (its buffers not lent)
 
     template <class T> T* dalloc(size_t n) {
         void* p = nullptr;
@@ -328,6 +350,16 @@ struct Engine::Impl {
 
     bool load(const Options& opt, std::string& err);
     const float* step(int token);
+    void tok_attention(Layer& l, const Layer* prev);
+    void tok_router(const Layer& l);
+    void tok_tail(const Layer& l);
+    void tok_head(const Layer& last);
+    int fuse = 15;   // the token path's fused kernels (tok_attention's bits)
+    void tok_graphs();
+    size_t tail_bytes() const { return ((size_t) 4 + g.n_embd) * sizeof(float); }
+    std::vector<cudaGraphExec_t> gx;   // a MoE layer's graph (tok_graphs)
+    cudaGraphExec_t gx_head = nullptr;
+    int graphs = -1;   // -1: not made yet, 0: none, 1: made
 
     // ---------------------------------------------------------------- the prompt path (prefill)
     // A chunk of up to C tokens a layer at a time on the GPU: the dense matrices decoded to F16 and multiplied by
@@ -339,6 +371,8 @@ struct Engine::Impl {
         int C = 0, GE = 0;
         long group_ctr = 0;
         size_t s_elems = 0, slot_bytes = 0, w1_elems = 0, w2_elems = 0;
+        uint8_t* arena = nullptr;   // the buffers below: one allocation, lent to the expert cache between prompts
+        size_t arena_bytes = 0;
         uint8_t* gbuf[2] = {nullptr, nullptr};
         cudaEvent_t gready[2] = {nullptr, nullptr}, gfreed[2] = {nullptr, nullptr};
         cublasHandle_t cb = nullptr;
@@ -350,6 +384,7 @@ struct Engine::Impl {
         __half *Ah = nullptr, *Qh = nullptr, *AOh = nullptr, *Kw = nullptr, *Vw = nullptr, *Xe = nullptr, *He = nullptr;
         __half *P = nullptr, *W1 = nullptr, *W2 = nullptr;
         int *h_ids = nullptr, *h_cnt = nullptr, *h_off = nullptr;
+        uint8_t* Erows = nullptr;
         float* h_tau = nullptr;
         double copy_bytes = 0, copy_ms = 0, moe_ms = 0, attn_ms = 0;
     } pf;
@@ -383,27 +418,79 @@ struct Engine::Impl {
     // Slots of VRAM, each one routed expert's gate | up | down as the GGUF holds them, for the experts used most
     // (score: each time a token or a prompt's token chose it, decaying as tokens are written): a token's experts that
     // are in a slot are multiplied on the GPU while the CPU lane takes the others; a prompt's are not copied again.
-    // Filled after each prompt (the best-scored in) and adapted as tokens are written (a few swaps every few tokens);
-    // the scores can be kept in a file (Options::profile) for the next start.
+    // Filled after each prompt (the best-scored in) and adapted as tokens are written (up to `per` swaps every `every`
+    // tokens, each a better score than its slot's expert by `margin` x + 0.5); the scores decay by `decay` a token, so
+    // they follow what the conversation uses now (the measured best, replaying ab.py's routing: ec-sim.py in
+    // test-results\2026-11-04-inkling); the scores can be kept in a file (Options::profile) for the next start.
+    // A swap's copy is staged in pieces (INK_CACHE_STAGE_KB, 2 MB) while the CPU waits for a layer's attention on the
+    // GPU, when its RAM is idle, and the expert is used from the token after the one its last piece went up in (by
+    // then long arrived; the same tokens every run).  INK_CACHE_DEFER=0: copied at the swap.
+    static constexpr int kKvSlack = 4096;   // (K / V rows reserved past the position: 8 MB a global layer's K or V)
+    // A slot is sized for its class: the layers whose experts take the same bytes (UD-Q4_K_XL: 38 layers' 15.2 MB, one
+    // layer's 16.3 MB, one's 18.4 MB), each class's share of the slots its share of the layers.  The slots past `own`
+    // lie in the prompt path's buffers (pf.arena, the class of the most layers): the cache's while no prompt is read,
+    // emptied before one is (ec_reclaim) and filled again after it.  Past those, slots in the global layers' K / V
+    // caches' rows beyond the position (each cache's end cut into slots): usable while no row of theirs is reserved
+    // (kv_hi: the rows below it are, the position plus kKvSlack), emptied as the position reaches them (ec_kv_reserve),
+    // usable again after a reset.  INK_CACHE_POOLS=0: one class, the largest bytes; INK_LEND=0 / INK_LEND_KV=0:
+    // nothing lent from the prompt path's buffers / the K / V caches.
     struct EC {
-        int slots = 0, ne = 0;
-        size_t slot_bytes = 0;
-        uint8_t* base = nullptr;
-        std::vector<int> owner, where;   // slot -> key (layer x n_expert + expert) or -1; key -> slot or -1
+        int slots = 0, ne = 0, own = 0, lend_cls = 0, arena_end = 0;   // [own, arena_end): the prompt path's
+        bool lent = false;                   // the prompt path's slots usable
+        std::vector<int> kv_row;             // slot -> its first K / V row (a slot in a K / V cache), else -1
+        int kv_hi = 0;                       // the K / V rows below it reserved (not usable as slots)
+        std::vector<uint8_t*> ptr;           // slot -> its VRAM
+        std::vector<int> cls;                // slot -> its class
+        std::vector<int> layer_cls;          // layer -> its experts' class (-1: a dense layer)
+        std::vector<size_t> cls_bytes;       // class -> bytes a slot
+        std::vector<int> owner, where;   // slot -> key (layer x n_expert + expert) or -1; key -> slot, -1, or
+                                         // -2: being copied in (its slot's owner already)
         std::vector<float> score;
         long lookups = 0, hits = 0, copies = 0, tok = 0;
-        float decay = 0.998f, margin = 1.25f;
-        int every = 8, per = 4;
+        float decay = 0.99f, margin = 1.5f;
+        int every = 2, per = 16;
         float *gu = nullptr, *h = nullptr, *y = nullptr, *routed = nullptr, *hd = nullptr;
         int8_t* hq = nullptr;
+        cudaEvent_t copied = nullptr;
+        // the swaps' copies being staged (key, slot, bytes so far, bytes), and those all up, used after the token's end
+        struct Pending {
+            int key = 0, slot = 0;
+            size_t done = 0, bytes = 0;
+        };
+        std::vector<Pending> pend;
+        size_t pend_head = 0;
+        std::vector<std::pair<int, int>> arrived, arrived_prev;   // (this token's, the last token's)
+        cudaEvent_t arrived_ev = nullptr;                          // (after the last token's pieces)
+        bool defer = true;
+        size_t piece = (size_t) 2 << 20;
+        uint8_t* apin[2] = {nullptr, nullptr};
+        cudaEvent_t aev[2] = {nullptr, nullptr};
+        int ak = 0;
+        size_t stage_n = 0;   // (the piece the workers copy now, and where its bytes lie)
+        std::vector<std::pair<const uint8_t*, size_t>> stage_parts;
+        std::function<void(int)> stage_fn;
     } ec;
     void ec_alloc();
     void ec_copy(int key, int slot);
+    void ec_copy_many(const std::vector<std::pair<int, int>>& todo);
     void ec_fill();
     void ec_adapt();
+    void ec_reclaim();
+    void ec_flush();
+    bool ec_stage_begin(size_t budget);
+    void ec_stage_end();
+    void ec_arrive();
+    bool ec_usable(int sl) const {
+        if (sl < ec.own) return true;
+        if (sl < ec.arena_end) return ec.lent;
+        return ec.kv_row[(size_t) sl] >= ec.kv_hi;
+    }
+    void ec_kv_reserve(int rows);
+    // an expert's bytes [off, off + n) as they lie in its slot (gate | up | down), from the GGUF's mapping
+    void ec_src_parts(int key, size_t off, size_t n, std::vector<std::pair<const uint8_t*, size_t>>& out) const;
     const uint8_t* ec_blob(int il, int e) const {
         const int sl = ec.slots ? ec.where[(size_t) il * ec.ne + e] : -1;
-        return sl >= 0 ? ec.base + (size_t) sl * ec.slot_bytes : nullptr;
+        return sl >= 0 ? ec.ptr[(size_t) sl] : nullptr;
     }
     void gpu_experts(const Layer& l, const int* slot, const float* w, int n);
     bool save_profile(const std::string& path) const;
@@ -436,6 +523,7 @@ const float* Engine::prefill(const int* ids, int n, void (*progress)(void*, int)
 
 void Engine::reset() {
     p->pos = 0;
+    p->ec.kv_hi = 0;   // (the K / V caches' slots usable again: empty, the next fill or swaps take them)
     const int km1 = p->g.conv_k - 1;
     const size_t conv = (size_t) km1 * (2 * p->kvw + 2 * p->g.n_embd);
     for (auto& l : p->L) CK(cudaMemsetAsync(l.conv, 0, conv * sizeof(float), p->s));
@@ -537,7 +625,29 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     const int E = g.n_embd, H = g.n_head, hd = g.head_dim, kc = g.conv_k;
 
     // the weights in VRAM
-    if (!mat("token_embd.weight", E, g.vocab, embd, err) || !mat("output.weight", E, g.vocab, output, err)) return false;
+    if (const char* v = std::getenv("INK_EMBD_VRAM")) embd_host = std::atoi(v) == 0;
+    if (embd_host) {
+        const Tensor* t = find("token_embd.weight");
+        if (!t || t->info->shape.size() < 2 || (int64_t) t->info->shape[0] != E ||
+            (int64_t) t->info->shape[1] != g.vocab) {
+            err = "the GGUF has no token_embd.weight of [" + std::to_string(E) + ", " + std::to_string(g.vocab) + "]";
+            return false;
+        }
+        embd.type = (int) t->info->type;
+        embd.k = E;
+        embd.n = g.vocab;
+        embd.rb = row_bytes_of(embd.type, E);
+        embd.w = t->data;
+        if (embd.rb == 0 || (!is_float(embd.type) && embd.type != 8)) {
+            err = "token_embd.weight: type " + std::string(t->info->type_name()) + " has no row decoder here";
+            return false;
+        }
+        h_erow = halloc<uint8_t>(embd.rb);
+        d_erow = dalloc<uint8_t>(embd.rb);
+    } else if (!mat("token_embd.weight", E, g.vocab, embd, err)) {
+        return false;
+    }
+    if (!mat("output.weight", E, g.vocab, output, err)) return false;
     if (!(tok_norm = f32("token_embd_norm.weight", (size_t) E, err))) return false;
     if (!(out_norm = f32("output_norm.weight", (size_t) E, err))) return false;
     L.resize((size_t) g.n_layer);
@@ -617,24 +727,27 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     fg = dalloc<float>((size_t) std::max(g.n_ff, 2 * g.n_ff_exp));
     fu = dalloc<float>((size_t) std::max(g.n_ff, 2 * g.n_ff_exp));
     fo = dalloc<float>(E);
-    routed = dalloc<float>(E);
+    d_tail = dalloc<float>((size_t) 4 + E);
     sg = dalloc<float>((size_t) 2 * g.n_ff_exp);
     su = dalloc<float>((size_t) 2 * g.n_ff_exp);
     so = dalloc<float>((size_t) 2 * E);
     logits = dalloc<float>((size_t) g.vocab);
     rlog = dalloc<float>((size_t) g.n_expert + g.n_shexp);
-    tau = dalloc<float>(1);
+    tokd = dalloc<float>(2);
+    tau = tokd;
+    dpos = (int*) (tokd + 1);
     gamma = dalloc<float>(2);
-    attn_scr = dalloc<float>(k::attn_scratch_floats(H, hd, max_ctx));
+    attn_scr = dalloc<float>(
+        k::attn_scratch_floats(H, hd, std::max(k::attn_nsp(0, max_ctx), k::attn_nsp(g.n_swa, g.n_swa))));
     const int kmax = std::max(g.n_ff, 2 * g.n_ff_exp) * 2;
     xq = dalloc<int8_t>((size_t) kmax);
     xd = dalloc<float>((size_t) kmax / 32);
     e16 = dalloc<uint16_t>(E);
     h_f = halloc<float>(E);
     h_rlog = halloc<float>((size_t) g.n_expert + g.n_shexp);
-    h_routed = halloc<float>(E);
+    h_tail = halloc<float>((size_t) 4 + E);
     h_logits = halloc<float>((size_t) g.vocab);
-    h_tau = halloc<float>(1);
+    h_tokd = halloc<float>(2);
     h_gamma = halloc<float>(2);
 
     int threads = o.threads > 0 ? o.threads : (int) std::max(1u, std::thread::hardware_concurrency() / 2);
@@ -669,6 +782,11 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
             std::fprintf(stderr, "maya-ink: the routed experts' %.1f GB touched in %.1f s (working set %.1f GB)\n", gb,
                          (now_ms() - tp) / 1000.0, working_set_gb());
     }
+    if (const char* rl = std::getenv("INK_ROUTE_LOG")) route_log = std::fopen(rl, "ab");
+    if (const char* fv = std::getenv("INK_FUSE")) fuse = std::atoi(fv) & 15;
+    if (!(k::fused_ok(E, g.head_dim, g.conv_k, g.d_rel) && g.n_head % g.n_head_kv == 0 && g.n_head / g.n_head_kv <= 8 &&
+          g.n_head * g.head_dim == E))
+        fuse = 0;
     const size_t before_pf = dev_bytes;
     if (!pf_alloc(err)) return false;
     const size_t before_ec = dev_bytes;
@@ -681,14 +799,25 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
             std::fprintf(stderr, "maya-ink: the expert profile %s: %ld experts into VRAM in %.1f s\n", o.profile.c_str(),
                          ec.copies, (now_ms() - tf) / 1000.0);
     }
-    if (o.verbose)
+    if (o.verbose) {
+        std::string cls;
+        for (size_t c = 0; c < ec.cls_bytes.size(); ++c) {
+            int n_all = 0, n_l = 0;
+            for (int sl = 0; sl < ec.slots; ++sl) n_all += ec.cls[(size_t) sl] == (int) c;
+            for (int il = g.n_dense; il < g.n_layer; ++il) n_l += ec.layer_cls[(size_t) il] == (int) c;
+            char b[128];
+            std::snprintf(b, sizeof b, "%s%d of %.1f MB (%d layers)", c ? ", " : "", n_all, ec.cls_bytes[c] / 1e6, n_l);
+            cls += b;
+        }
         std::fprintf(stderr,
                      "maya-ink: Inkling %d layers, %d experts (top %d + %d shared), context %d; %.2f GB in VRAM (the "
-                     "prompt path's chunks of %d tokens %.2f of it, %d expert slots %.2f), the routed experts in the "
-                     "GGUF's mapping; CPU lane %d threads; loaded in %.1f s\n",
+                     "prompt path's chunks of %d tokens %.2f of it, %d expert slots %.2f, %d more in the prompt "
+                     "path's buffers between prompts and %d in the K / V caches' rows past the position: %s), the "
+                     "routed experts in the GGUF's mapping; CPU lane %d threads; loaded in %.1f s\n",
                      g.n_layer, g.n_expert, g.n_used, g.n_shexp, max_ctx, dev_bytes / 1e9, pf.C,
-                     (before_ec - before_pf) / 1e9, ec.slots, (dev_bytes - before_ec) / 1e9, pool->threads(),
-                     (now_ms() - t0) / 1000.0);
+                     (before_ec - before_pf) / 1e9, ec.own, (dev_bytes - before_ec) / 1e9, ec.arena_end - ec.own,
+                     ec.slots - ec.arena_end, cls.c_str(), pool->threads(), (now_ms() - t0) / 1000.0);
+    }
     return true;
 }
 
@@ -696,7 +825,6 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
 void Engine::Impl::ec_alloc() {
     const int E = g.n_embd, ff = g.n_ff_exp;
     ec.ne = g.n_expert;
-    ec.slot_bytes = (pf.slot_bytes + 255) & ~(size_t) 255;
     ec.where.assign((size_t) g.n_layer * ec.ne, -1);
     ec.score.assign((size_t) g.n_layer * ec.ne, 0.0f);
     ec.gu = dalloc<float>((size_t) 16 * 2 * ff);
@@ -705,35 +833,130 @@ void Engine::Impl::ec_alloc() {
     ec.hd = dalloc<float>((size_t) 16 * ff / 32);
     ec.y = dalloc<float>((size_t) 16 * E);
     ec.routed = dalloc<float>(E);
+    CK(cudaEventCreateWithFlags(&ec.copied, cudaEventDisableTiming));
     if (const char* v = std::getenv("INK_CACHE_DECAY")) ec.decay = (float) std::atof(v);
     if (const char* v = std::getenv("INK_CACHE_EVERY")) ec.every = std::max(1, std::atoi(v));
     if (const char* v = std::getenv("INK_CACHE_SWAPS")) ec.per = std::max(0, std::atoi(v));
+    if (const char* v = std::getenv("INK_CACHE_MARGIN")) ec.margin = (float) std::atof(v);
+    if (const char* v = std::getenv("INK_CACHE_DEFER")) ec.defer = std::atoi(v) != 0;
+    if (const char* v = std::getenv("INK_CACHE_STAGE_KB")) ec.piece = (size_t) std::max(64, std::atoi(v)) << 10;
+    if (ec.defer) {
+        for (int i = 0; i < 2 && ec.defer; ++i) {
+            ec.defer = cudaHostAlloc((void**) &ec.apin[i], 4 * ec.piece, cudaHostAllocPortable) == cudaSuccess;
+            if (ec.defer) CK(cudaEventCreateWithFlags(&ec.aev[i], cudaEventDisableTiming));
+        }
+        if (ec.defer) CK(cudaEventCreateWithFlags(&ec.arrived_ev, cudaEventDisableTiming));
+        if (!ec.defer) cudaGetLastError();
+    }
+    const char* pv = std::getenv("INK_CACHE_POOLS");
+    const bool pools = !pv || std::atoi(pv) != 0;
+    const char* lv = std::getenv("INK_LEND");
+    const bool lend = !lv || std::atoi(lv) != 0;
+    // the classes: each MoE layer's expert bytes (gate | up | down as the GGUF holds them), a 256-byte multiple
+    ec.layer_cls.assign((size_t) g.n_layer, -1);
+    std::vector<size_t> eb((size_t) g.n_layer, 0);
+    size_t eb_max = 0;
+    for (int il = g.n_dense; il < g.n_layer; ++il) {
+        const CpuLayer& c = L[(size_t) il].cl;
+        eb[(size_t) il] = ((size_t) ff * (c.rg + c.ru) + (size_t) E * c.rd + 255) & ~(size_t) 255;
+        eb_max = std::max(eb_max, eb[(size_t) il]);
+    }
+    for (int il = g.n_dense; il < g.n_layer; ++il) {
+        const size_t b = pools ? eb[(size_t) il] : eb_max;
+        auto it = std::find(ec.cls_bytes.begin(), ec.cls_bytes.end(), b);
+        if (it == ec.cls_bytes.end()) {
+            ec.cls_bytes.push_back(b);
+            it = ec.cls_bytes.end() - 1;
+        }
+        ec.layer_cls[(size_t) il] = (int) (it - ec.cls_bytes.begin());
+    }
+    const int nc = (int) ec.cls_bytes.size(), nmoe = g.n_layer - g.n_dense;
+    std::vector<int> nl((size_t) nc, 0);
+    for (int il = g.n_dense; il < g.n_layer; ++il) ++nl[(size_t) ec.layer_cls[(size_t) il]];
+    ec.lend_cls = (int) (std::max_element(nl.begin(), nl.end()) - nl.begin());
+    // the cache's own VRAM: what is free, less the reserve, each class's slots its share of the layers
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     size_t reserve = (size_t) 1536 << 20;
     if (const char* v = std::getenv("INK_VRAM_RESERVE_MIB")) reserve = (size_t) std::max(0, std::atoi(v)) << 20;
     size_t want = fr > reserve ? fr - reserve : 0;
     if (o.cache_gb >= 0.0) want = std::min(want, (size_t) (o.cache_gb * 1e9));
-    int n = (int) (want / ec.slot_bytes);
-    while (n > 0) {   // (one allocation; a smaller one if the free memory is in pieces)
+    double per_slot = 0;   // bytes a slot, on average over the classes' shares
+    for (int c = 0; c < nc; ++c) per_slot += (double) nl[(size_t) c] / nmoe * (double) ec.cls_bytes[(size_t) c];
+    auto counts = [&](size_t budget) {
+        std::vector<int> n((size_t) nc, 0);
+        const double N = (double) budget / per_slot;
+        size_t used = 0;
+        for (int c = 0; c < nc; ++c) {
+            n[(size_t) c] = (int) (N * nl[(size_t) c] / nmoe);
+            used += (size_t) n[(size_t) c] * ec.cls_bytes[(size_t) c];
+        }
+        if (budget > used) n[(size_t) ec.lend_cls] += (int) ((budget - used) / ec.cls_bytes[(size_t) ec.lend_cls]);
+        return n;
+    };
+    std::vector<int> n = counts(want);
+    uint8_t* base = nullptr;
+    for (;;) {   // (one allocation; a smaller one if the free memory is in pieces)
+        size_t bytes = 0;
+        for (int c = 0; c < nc; ++c) bytes += (size_t) n[(size_t) c] * ec.cls_bytes[(size_t) c];
+        if (bytes == 0) break;
         void* p = nullptr;
-        if (cudaMalloc(&p, (size_t) n * ec.slot_bytes) == cudaSuccess) {
-            ec.base = (uint8_t*) p;
-            dev_bytes += (size_t) n * ec.slot_bytes;
+        if (cudaMalloc(&p, bytes) == cudaSuccess) {
+            base = (uint8_t*) p;
+            dev_bytes += bytes;
             break;
         }
         cudaGetLastError();
-        n = n * 15 / 16;
+        want = want / 16 * 15;
+        n = counts(want);
     }
-    ec.slots = ec.base ? n : 0;
+    if (base) {
+        uint8_t* at = base;
+        for (int c = 0; c < nc; ++c)
+            for (int i = 0; i < n[(size_t) c]; ++i) {
+                ec.ptr.push_back(at);
+                ec.cls.push_back(c);
+                at += ec.cls_bytes[(size_t) c];
+            }
+    }
+    ec.own = (int) ec.ptr.size();
+    // the prompt path's buffers, lent between prompts: slots of the class of the most layers
+    if (lend && base && pf.arena) {
+        const size_t b = ec.cls_bytes[(size_t) ec.lend_cls];
+        for (size_t at = 0; at + b <= pf.arena_bytes; at += b) {
+            ec.ptr.push_back(pf.arena + at);
+            ec.cls.push_back(ec.lend_cls);
+        }
+    }
+    ec.arena_end = (int) ec.ptr.size();
+    ec.lent = ec.arena_end > ec.own;
+    ec.kv_row.assign(ec.ptr.size(), -1);
+    const char* kv = std::getenv("INK_LEND_KV");
+    if (base && (!kv || std::atoi(kv) != 0)) {
+        const size_t b = ec.cls_bytes[(size_t) ec.lend_cls], row = (size_t) kvw * sizeof(__half);
+        for (const Layer& l : L) {
+            if (l.swa) continue;
+            for (__half* buf : {l.K, l.V}) {
+                const size_t bytes = (size_t) l.kv_rows * row;
+                for (size_t end = bytes; end >= b && end - b >= (size_t) kKvSlack * row; end -= b) {
+                    ec.ptr.push_back((uint8_t*) buf + (end - b));
+                    ec.cls.push_back(ec.lend_cls);
+                    ec.kv_row.push_back((int) ((end - b) / row));
+                }
+            }
+        }
+    }
+    ec.slots = (int) ec.ptr.size();
+    ec.kv_hi = 0;
     ec.owner.assign((size_t) ec.slots, -1);
 }
 
+// (the driver's staging; ec_copy_many's when there is no pinned staging)
 void Engine::Impl::ec_copy(int key, int slot) {
     const int il = key / ec.ne, e = key % ec.ne, E = g.n_embd, ff = g.n_ff_exp;
     const CpuLayer& c = L[(size_t) il].cl;
     const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru, db = (size_t) E * c.rd;
-    uint8_t* d = ec.base + (size_t) slot * ec.slot_bytes;
+    uint8_t* d = ec.ptr[(size_t) slot];
     if (ec.owner[(size_t) slot] >= 0) ec.where[(size_t) ec.owner[(size_t) slot]] = -1;
     CK(cudaMemcpyAsync(d, c.gate + (size_t) e * gb, gb, cudaMemcpyHostToDevice, s));
     CK(cudaMemcpyAsync(d + gb, c.up + (size_t) e * ub, ub, cudaMemcpyHostToDevice, s));
@@ -743,68 +966,299 @@ void Engine::Impl::ec_copy(int key, int slot) {
     ++ec.copies;
 }
 
+// Experts (key, slot) into their slots: as many as fill a pinned staging buffer at a time, copied into it by the CPU
+// lane's threads (1 MB pieces), then one DMA each on the copy stream from there; the compute stream waits for the last.
+// (Called with the GPU done with the slots' old experts: after a prompt, or at the end of a token.)
+void Engine::Impl::ec_copy_many(const std::vector<std::pair<int, int>>& todo) {
+    if (todo.empty()) return;
+    if (!stg.on) {
+        for (const auto& kv : todo) ec_copy(kv.first, kv.second);
+        return;
+    }
+    const int E = g.n_embd, ff = g.n_ff_exp;
+    struct Part {
+        const uint8_t* src;
+        size_t off, len;
+    };
+    size_t i = 0;
+    while (i < todo.size()) {
+        // a batch: the experts that fit the buffer, laid out there as in their slots
+        std::vector<Part> parts;
+        std::vector<std::pair<size_t, size_t>> dma;   // (todo index, offset in the buffer)
+        size_t fill = 0;
+        for (; i < todo.size(); ++i) {
+            const int key = todo[i].first, il = key / ec.ne, e = key % ec.ne;
+            const CpuLayer& c = L[(size_t) il].cl;
+            const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru, db = (size_t) E * c.rd;
+            if (fill + gb + ub + db > stg.cap) {
+                if (fill == 0) {   // (an expert larger than the buffer: the driver's staging)
+                    ec_copy(key, todo[i].second);
+                    continue;
+                }
+                break;
+            }
+            dma.push_back({i, fill});
+            const std::pair<const uint8_t*, size_t> rs[3] = {
+                {c.gate + (size_t) e * gb, gb}, {c.up + (size_t) e * ub, ub}, {c.down + (size_t) e * db, db}};
+            for (const auto& r0 : rs) {
+                for (size_t o0 = 0; o0 < r0.second; o0 += (size_t) 1 << 20)
+                    parts.push_back({r0.first + o0, fill + o0, std::min((size_t) 1 << 20, r0.second - o0)});
+                fill += r0.second;
+            }
+        }
+        CK(cudaEventSynchronize(stg.ev[stg.k]));   // (that buffer's last DMA is done)
+        uint8_t* pin = stg.pin[stg.k];
+        pool->run((int) parts.size(), [&](int j) {
+            const Part& p0 = parts[(size_t) j];
+            std::memcpy(pin + p0.off, p0.src, p0.len);
+        });
+        for (const auto& d : dma) {
+            const int key = todo[d.first].first, sl = todo[d.first].second, il = key / ec.ne;
+            const CpuLayer& c = L[(size_t) il].cl;
+            const size_t bytes = (size_t) ff * (c.rg + c.ru) + (size_t) E * c.rd;
+            CK(cudaMemcpyAsync(ec.ptr[(size_t) sl], pin + d.second, bytes, cudaMemcpyHostToDevice, pf.cs));
+            if (ec.owner[(size_t) sl] >= 0) ec.where[(size_t) ec.owner[(size_t) sl]] = -1;
+            ec.owner[(size_t) sl] = key;
+            ec.where[(size_t) key] = sl;
+            ++ec.copies;
+        }
+        CK(cudaEventRecord(stg.ev[stg.k], pf.cs));
+        stg.k ^= 1;
+    }
+    CK(cudaEventRecord(ec.copied, pf.cs));
+    CK(cudaStreamWaitEvent(s, ec.copied, 0));
+}
+
 void Engine::Impl::ec_fill() {
     if (ec.slots == 0) return;
-    std::vector<int> keys;
-    for (int il = g.n_dense; il < g.n_layer; ++il)
-        for (int e = 0; e < ec.ne; ++e)
-            if (ec.score[(size_t) il * ec.ne + e] > 0.0f) keys.push_back(il * ec.ne + e);
-    const size_t top = std::min(keys.size(), (size_t) ec.slots);
-    std::partial_sort(keys.begin(), keys.begin() + (long) top, keys.end(), [&](int a1, int b1) {
-        return ec.score[(size_t) a1] > ec.score[(size_t) b1] || (ec.score[(size_t) a1] == ec.score[(size_t) b1] && a1 < b1);
-    });
+    ec_flush();
+    std::vector<std::pair<int, int>> todo;
     std::vector<char> want(ec.where.size(), 0);
-    for (size_t i = 0; i < top; ++i) want[(size_t) keys[i]] = 1;
-    std::vector<int> spare;
-    for (int sl = ec.slots - 1; sl >= 0; --sl)
-        if (ec.owner[(size_t) sl] < 0 || !want[(size_t) ec.owner[(size_t) sl]]) spare.push_back(sl);
-    for (size_t i = 0; i < top && !spare.empty(); ++i)
-        if (ec.where[(size_t) keys[i]] < 0) {
-            ec_copy(keys[i], spare.back());
-            spare.pop_back();
-        }
+    for (int c = 0; c < (int) ec.cls_bytes.size(); ++c) {
+        std::vector<int> keys;
+        for (int il = g.n_dense; il < g.n_layer; ++il)
+            if (ec.layer_cls[(size_t) il] == c)
+                for (int e = 0; e < ec.ne; ++e)
+                    if (ec.score[(size_t) il * ec.ne + e] > 0.0f) keys.push_back(il * ec.ne + e);
+        int avail = 0;
+        for (int sl = 0; sl < ec.slots; ++sl) avail += ec.cls[(size_t) sl] == c && ec_usable(sl);
+        const size_t top = std::min(keys.size(), (size_t) avail);
+        std::partial_sort(keys.begin(), keys.begin() + (long) top, keys.end(), [&](int a1, int b1) {
+            return ec.score[(size_t) a1] > ec.score[(size_t) b1] ||
+                   (ec.score[(size_t) a1] == ec.score[(size_t) b1] && a1 < b1);
+        });
+        for (size_t i = 0; i < top; ++i) want[(size_t) keys[i]] = 1;
+        std::vector<int> spare;
+        for (int sl = ec.slots - 1; sl >= 0; --sl)
+            if (ec.cls[(size_t) sl] == c && ec_usable(sl) &&
+                (ec.owner[(size_t) sl] < 0 || !want[(size_t) ec.owner[(size_t) sl]]))
+                spare.push_back(sl);
+        for (size_t i = 0; i < top && !spare.empty(); ++i)
+            if (ec.where[(size_t) keys[i]] < 0) {
+                todo.push_back({keys[i], spare.back()});
+                spare.pop_back();
+            }
+    }
+    ec_copy_many(todo);
 }
 
 void Engine::Impl::ec_adapt() {
     if (ec.slots == 0 || ec.per == 0) return;
-    // the best-scored experts not in VRAM, the worst-scored in it
+    if (ec.pend.size() - ec.pend_head >= (size_t) ec.per) return;   // (the last swaps still on their way)
     const int per = ec.per;
-    std::vector<int> best, worst;
-    for (int il = g.n_dense; il < g.n_layer; ++il)
-        for (int e = 0; e < ec.ne; ++e) {
-            const int key = il * ec.ne + e;
-            if (ec.where[(size_t) key] >= 0 || ec.score[(size_t) key] <= 0.0f) continue;
-            best.push_back(key);
-            std::push_heap(best.begin(), best.end(), [&](int a1, int b1) { return ec.score[(size_t) a1] > ec.score[(size_t) b1]; });
-            if ((int) best.size() > per) {
-                std::pop_heap(best.begin(), best.end(), [&](int a1, int b1) { return ec.score[(size_t) a1] > ec.score[(size_t) b1]; });
-                best.pop_back();
+    auto by_score = [&](int a1, int b1) { return ec.score[(size_t) a1] > ec.score[(size_t) b1]; };
+    std::vector<std::pair<int, int>> todo;
+    for (int c = 0; c < (int) ec.cls_bytes.size(); ++c) {
+        // the class's best-scored experts not in VRAM, its worst-scored in it
+        std::vector<int> best, worst;
+        for (int il = g.n_dense; il < g.n_layer; ++il) {
+            if (ec.layer_cls[(size_t) il] != c) continue;
+            for (int e = 0; e < ec.ne; ++e) {
+                const int key = il * ec.ne + e;
+                if (ec.where[(size_t) key] != -1 || ec.score[(size_t) key] <= 0.0f) continue;
+                best.push_back(key);
+                std::push_heap(best.begin(), best.end(), by_score);
+                if ((int) best.size() > per) {
+                    std::pop_heap(best.begin(), best.end(), by_score);
+                    best.pop_back();
+                }
             }
         }
-    std::sort(best.begin(), best.end(), [&](int a1, int b1) { return ec.score[(size_t) a1] > ec.score[(size_t) b1]; });
-    std::vector<int> free_slots;
-    for (int sl = 0; sl < ec.slots; ++sl) {
-        const int key = ec.owner[(size_t) sl];
-        if (key < 0) free_slots.push_back(sl);
-        else worst.push_back(sl);
-    }
-    std::partial_sort(worst.begin(), worst.begin() + (long) std::min(worst.size(), (size_t) per), worst.end(),
-                      [&](int a1, int b1) {
-                          return ec.score[(size_t) ec.owner[(size_t) a1]] < ec.score[(size_t) ec.owner[(size_t) b1]];
-                      });
-    size_t wi = 0;
-    for (int key : best) {
-        if (!free_slots.empty()) {
-            ec_copy(key, free_slots.back());
-            free_slots.pop_back();
-            continue;
+        std::sort(best.begin(), best.end(), by_score);
+        std::vector<int> free_slots;
+        for (int sl = 0; sl < ec.slots; ++sl) {
+            if (ec.cls[(size_t) sl] != c || !ec_usable(sl)) continue;
+            const int ow = ec.owner[(size_t) sl];
+            if (ow < 0) free_slots.push_back(sl);
+            else if (ec.where[(size_t) ow] >= 0) worst.push_back(sl);   // (not one being copied in)
         }
-        if (wi >= worst.size() || (int) wi >= per) break;
-        const int sl = worst[wi];
-        if (ec.score[(size_t) key] <= ec.margin * ec.score[(size_t) ec.owner[(size_t) sl]] + 0.5f) break;
-        ec_copy(key, sl);
-        ++wi;
+        std::partial_sort(worst.begin(), worst.begin() + (long) std::min(worst.size(), (size_t) per), worst.end(),
+                          [&](int a1, int b1) {
+                              return ec.score[(size_t) ec.owner[(size_t) a1]] < ec.score[(size_t) ec.owner[(size_t) b1]];
+                          });
+        size_t wi = 0;
+        for (int key : best) {
+            if (!free_slots.empty()) {
+                todo.push_back({key, free_slots.back()});
+                free_slots.pop_back();
+                continue;
+            }
+            if (wi >= worst.size() || (int) wi >= per) break;
+            const int sl = worst[wi];
+            if (ec.score[(size_t) key] <= ec.margin * ec.score[(size_t) ec.owner[(size_t) sl]] + 0.5f) break;
+            todo.push_back({key, sl});
+            ++wi;
+        }
     }
+    if (!ec.defer) {
+        ec_copy_many(todo);
+        return;
+    }
+    // the slots given to their new experts now, the bytes staged in the next tokens' gaps (ec_stage_begin)
+    const int E = g.n_embd, ff = g.n_ff_exp;
+    for (const auto& kv : todo) {
+        const int key = kv.first, sl = kv.second;
+        if (ec.owner[(size_t) sl] >= 0) ec.where[(size_t) ec.owner[(size_t) sl]] = -1;
+        ec.owner[(size_t) sl] = key;
+        ec.where[(size_t) key] = -2;
+        const CpuLayer& c = L[(size_t) (key / ec.ne)].cl;
+        EC::Pending p;
+        p.key = key;
+        p.slot = sl;
+        p.bytes = (size_t) ff * (c.rg + c.ru) + (size_t) E * c.rd;
+        ec.pend.push_back(p);
+    }
+}
+
+// The lent slots back to the prompt path: emptied, once the GPU is through with them (its experts, the copies into them)
+void Engine::Impl::ec_reclaim() {
+    if (!ec.lent) return;
+    ec_flush();
+    CK(cudaStreamSynchronize(pf.cs));
+    CK(cudaStreamSynchronize(s));
+    for (int sl = ec.own; sl < ec.arena_end; ++sl)
+        if (ec.owner[(size_t) sl] >= 0) {
+            ec.where[(size_t) ec.owner[(size_t) sl]] = -1;
+            ec.owner[(size_t) sl] = -1;
+        }
+    ec.lent = false;
+}
+
+// The K / V rows below `rows` about to be written: the slots there emptied first (the GPU done with them, the copies
+// into them finished), and the reserve kKvSlack rows past it, so this happens once in kKvSlack tokens
+void Engine::Impl::ec_kv_reserve(int rows) {
+    if (rows <= ec.kv_hi || ec.slots == ec.arena_end) return;
+    const int hi = std::min(max_ctx, rows + kKvSlack);
+    bool any = false;
+    for (int sl = ec.arena_end; sl < ec.slots && !any; ++sl) any = ec.kv_row[(size_t) sl] < hi && ec.owner[(size_t) sl] >= 0;
+    if (any) {
+        ec_flush();
+        CK(cudaStreamSynchronize(pf.cs));
+        CK(cudaStreamSynchronize(s));
+        for (int sl = ec.arena_end; sl < ec.slots; ++sl)
+            if (ec.kv_row[(size_t) sl] < hi && ec.owner[(size_t) sl] >= 0) {
+                ec.where[(size_t) ec.owner[(size_t) sl]] = -1;
+                ec.owner[(size_t) sl] = -1;
+            }
+    }
+    ec.kv_hi = hi;
+}
+
+void Engine::Impl::ec_src_parts(int key, size_t off, size_t n,
+                                std::vector<std::pair<const uint8_t*, size_t>>& out) const {
+    const int il = key / ec.ne, e = key % ec.ne, E = g.n_embd, ff = g.n_ff_exp;
+    const CpuLayer& c = L[(size_t) il].cl;
+    const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru, db = (size_t) E * c.rd;
+    const std::pair<const uint8_t*, size_t> rs[3] = {
+        {c.gate + (size_t) e * gb, gb}, {c.up + (size_t) e * ub, ub}, {c.down + (size_t) e * db, db}};
+    size_t at = 0;
+    for (const auto& r0 : rs) {
+        const size_t a0 = std::max(off, at), a1 = std::min(off + n, at + r0.second);
+        if (a0 < a1) out.push_back({r0.first + (a0 - at), a1 - a0});
+        at += r0.second;
+    }
+}
+
+// The pending copies' next piece (up to `budget` bytes of the first one) into a pinned buffer, by the CPU lane's
+// workers, while this thread waits for the GPU; ec_stage_end joins them and puts the piece's DMA on the copy stream.
+bool Engine::Impl::ec_stage_begin(size_t budget) {
+    if (!ec.defer || ec.pend_head >= ec.pend.size()) return false;
+    EC::Pending& p = ec.pend[ec.pend_head];
+    const size_t n = std::min(budget, p.bytes - p.done);
+    CK(cudaEventSynchronize(ec.aev[ec.ak]));   // (that buffer's last DMA: long done)
+    ec.stage_n = n;
+    ec.stage_parts.clear();
+    ec_src_parts(p.key, p.done, n, ec.stage_parts);
+    const auto* parts = &ec.stage_parts;   // (by pointer: the workers run the job)
+    // the piece in jobs of 128 KB, each its bytes from the parts it spans
+    const size_t job = (size_t) 128 << 10;
+    const int nj = (int) ((n + job - 1) / job);
+    uint8_t* dst = ec.apin[ec.ak];
+    ec.stage_fn = [parts, dst, job, n](int j) {
+        const size_t a0 = (size_t) j * job, a1 = std::min(n, a0 + job);
+        size_t at = 0;
+        for (const auto& pr : *parts) {
+            const size_t b0 = std::max(a0, at), b1 = std::min(a1, at + pr.second);
+            if (b0 < b1) std::memcpy(dst + b0, pr.first + (b0 - at), b1 - b0);
+            at += pr.second;
+        }
+    };
+    pool->start(nj, &ec.stage_fn);
+    return true;
+}
+
+void Engine::Impl::ec_stage_end() {
+    pool->join();
+    EC::Pending& p = ec.pend[ec.pend_head];
+    CK(cudaMemcpyAsync(ec.ptr[(size_t) p.slot] + p.done, ec.apin[ec.ak], ec.stage_n, cudaMemcpyHostToDevice, pf.cs));
+    CK(cudaEventRecord(ec.aev[ec.ak], pf.cs));
+    ec.ak ^= 1;
+    p.done += ec.stage_n;
+    if (p.done == p.bytes) {
+        ec.arrived.push_back({p.key, p.slot});
+        if (++ec.pend_head == ec.pend.size()) {
+            ec.pend.clear();
+            ec.pend_head = 0;
+        }
+    }
+}
+
+// (a token's end) the experts whose last piece went up during the token before: used from the next token on (their
+// DMAs, a token old, are done: the event's wait is no wait); this token's wait for the next
+void Engine::Impl::ec_arrive() {
+    if (!ec.arrived_prev.empty()) {
+        CK(cudaEventSynchronize(ec.arrived_ev));
+        for (const auto& kv : ec.arrived_prev) {
+            ec.where[(size_t) kv.first] = kv.second;
+            ++ec.copies;
+        }
+        ec.arrived_prev.clear();
+    }
+    if (!ec.arrived.empty()) {
+        CK(cudaEventRecord(ec.arrived_ev, pf.cs));
+        std::swap(ec.arrived_prev, ec.arrived);
+    }
+}
+
+// Every pending copy finished now (whole experts again, through ec_copy_many), before the slots are refilled or lent back
+void Engine::Impl::ec_flush() {
+    if (!ec.arrived.empty() || !ec.arrived_prev.empty()) {
+        CK(cudaStreamSynchronize(pf.cs));
+        for (auto* v : {&ec.arrived_prev, &ec.arrived}) {
+            for (const auto& kv : *v) {
+                ec.where[(size_t) kv.first] = kv.second;
+                ++ec.copies;
+            }
+            v->clear();
+        }
+    }
+    if (ec.pend_head >= ec.pend.size()) return;
+    CK(cudaStreamSynchronize(pf.cs));
+    std::vector<std::pair<int, int>> todo;
+    for (size_t i = ec.pend_head; i < ec.pend.size(); ++i) todo.push_back({ec.pend[i].key, ec.pend[i].slot});
+    ec.pend.clear();
+    ec.pend_head = 0;
+    ec_copy_many(todo);
 }
 
 void Engine::Impl::gpu_experts(const Layer& l, const int* slot, const float* w, int n) {
@@ -813,7 +1267,7 @@ void Engine::Impl::gpu_experts(const Layer& l, const int* slot, const float* w, 
     const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru;
     iq::MvJob jobs[32];
     for (int i = 0; i < n; ++i) {
-        const uint8_t* b = ec.base + (size_t) slot[i] * ec.slot_bytes;
+        const uint8_t* b = ec.ptr[(size_t) slot[i]];
         for (int r = 0; r < 2; ++r) {
             iq::MvJob& j = jobs[2 * i + r];
             j = iq::MvJob{};
@@ -836,7 +1290,7 @@ void Engine::Impl::gpu_experts(const Layer& l, const int* slot, const float* w, 
     k::q8(ec.h, n, ff, ec.hq, ec.hd, s);
     iq::MvJob dj[16];
     for (int i = 0; i < n; ++i) {
-        const uint8_t* b = ec.base + (size_t) slot[i] * ec.slot_bytes;
+        const uint8_t* b = ec.ptr[(size_t) slot[i]];
         dj[i].w = b + gb + ub;
         dj[i].ld = c.rd;
         dj[i].type = c.td;
@@ -1004,50 +1458,66 @@ bool Engine::Impl::pf_alloc(std::string& err) {
     cublasSetStream(pf.cb, s);
     CK(cudaStreamCreateWithFlags(&pf.cs, cudaStreamNonBlocking));
     const size_t CE = (size_t) C * E;
-    pf.ids = dalloc<int>(C);
-    pf.X = dalloc<float>(CE);
-    pf.A = dalloc<float>(CE);
-    pf.Q = dalloc<float>((size_t) C * qw);
-    pf.Kf = dalloc<float>((size_t) C * kvw);
-    pf.Vf = dalloc<float>((size_t) C * kvw);
-    pf.Kc = dalloc<float>((size_t) C * kvw);
-    pf.Vc = dalloc<float>((size_t) C * kvw);
-    pf.R = dalloc<float>((size_t) C * H * g.d_rel);
-    pf.Y = dalloc<float>(CE);
-    pf.Ye = dalloc<float>(CE);
-    pf.GU = dalloc<float>((size_t) C * 2 * ffe);
-    pf.RL = dalloc<float>((size_t) C * (ne + nsh));
-    pf.sel = dalloc<int>((size_t) C * nu);
-    pf.wts = dalloc<float>((size_t) C * (nu + nsh));
-    pf.cnt = dalloc<int>(ne);
-    pf.off = dalloc<int>(ne);
-    pf.list = dalloc<int>((size_t) C * nu);
-    pf.wl = dalloc<float>((size_t) C * nu);
-    pf.tau = dalloc<float>(C);
-    pf.Ah = dalloc<__half>(CE);
-    pf.Qh = dalloc<__half>((size_t) C * qw);
-    pf.AOh = dalloc<__half>((size_t) C * qw);
-    pf.Xe = dalloc<__half>(CE);
-    pf.He = dalloc<__half>((size_t) C * ffe);
-    pf.Kw = dalloc<__half>((size_t) (g.n_swa + C) * kvw);
-    pf.Vw = dalloc<__half>((size_t) (g.n_swa + C) * kvw);
-    pf.Ot = dalloc<float>((size_t) G * C * hd);
     size_t mib = 960;
     if (const char* v = std::getenv("INK_SCORES_MIB")) mib = (size_t) std::max(64, std::atoi(v));
     pf.s_elems = (mib << 20) / 6;   // S F32 and P F16
-    pf.S = dalloc<float>(pf.s_elems);
-    pf.P = dalloc<__half>(pf.s_elems);
     pf.w1_elems = std::max({(size_t) 2 * ffd * E, (size_t) 2 * ffe * E, (size_t) qw * E});
     pf.w2_elems = std::max({(size_t) ffd * E, (size_t) ffe * E, (size_t) E * qw});
-    pf.W1 = dalloc<__half>(pf.w1_elems);
-    pf.W2 = dalloc<__half>(pf.w2_elems);
     for (const Layer& l : L)
         if (!l.dense)
             pf.slot_bytes = std::max(pf.slot_bytes, (size_t) ffe * (l.cl.rg + l.cl.ru) + (size_t) E * l.cl.rd);
-    // two group buffers in turn, `stage` experts each (the copy of one group while the other's are multiplied)
     pf.GE = std::max(1, std::min(ne, o.stage));
+    // Every buffer in one arena (none holds anything from one prompt to the next, so the expert cache can borrow it,
+    // and each is written before it is read): the same list twice, first its size, then its pointers, 256-byte aligned.
+    for (int pass = 0; pass < 2; ++pass) {
+        size_t at = 0;
+        auto carve = [&](auto*& ptr, size_t n) {
+            using T = std::remove_reference_t<decltype(*ptr)>;
+            if (pass == 1) ptr = (T*) (pf.arena + at);
+            at += (n * sizeof(T) + 255) & ~(size_t) 255;
+        };
+        carve(pf.ids, (size_t) C);
+        carve(pf.X, CE);
+        carve(pf.A, CE);
+        carve(pf.Q, (size_t) C * qw);
+        carve(pf.Kf, (size_t) C * kvw);
+        carve(pf.Vf, (size_t) C * kvw);
+        carve(pf.Kc, (size_t) C * kvw);
+        carve(pf.Vc, (size_t) C * kvw);
+        carve(pf.R, (size_t) C * H * g.d_rel);
+        carve(pf.Y, CE);
+        carve(pf.Ye, CE);
+        carve(pf.GU, (size_t) C * 2 * ffe);
+        carve(pf.RL, (size_t) C * (ne + nsh));
+        carve(pf.sel, (size_t) C * nu);
+        carve(pf.wts, (size_t) C * (nu + nsh));
+        carve(pf.cnt, (size_t) ne);
+        carve(pf.off, (size_t) ne);
+        carve(pf.list, (size_t) C * nu);
+        carve(pf.wl, (size_t) C * nu);
+        carve(pf.tau, (size_t) C);
+        carve(pf.Ah, CE);
+        carve(pf.Qh, (size_t) C * qw);
+        carve(pf.AOh, (size_t) C * qw);
+        carve(pf.Xe, CE);
+        carve(pf.He, (size_t) C * ffe);
+        carve(pf.Kw, (size_t) (g.n_swa + C) * kvw);
+        carve(pf.Vw, (size_t) (g.n_swa + C) * kvw);
+        carve(pf.Ot, (size_t) G * C * hd);
+        carve(pf.S, pf.s_elems);
+        carve(pf.P, pf.s_elems);
+        carve(pf.W1, pf.w1_elems);
+        carve(pf.W2, pf.w2_elems);
+        // two group buffers in turn, `stage` experts each (the copy of one group while the other's are multiplied)
+        carve(pf.gbuf[0], (size_t) pf.GE * pf.slot_bytes);
+        carve(pf.gbuf[1], (size_t) pf.GE * pf.slot_bytes);
+        if (embd_host) carve(pf.Erows, (size_t) C * embd.rb);   // (a chunk's embedding rows)
+        if (pass == 0) {
+            pf.arena_bytes = at;
+            pf.arena = dalloc<uint8_t>(at);
+        }
+    }
     for (int i = 0; i < 2; ++i) {
-        pf.gbuf[i] = dalloc<uint8_t>((size_t) pf.GE * pf.slot_bytes);
         CK(cudaEventCreateWithFlags(&pf.gready[i], cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&pf.gfreed[i], cudaEventDisableTiming));
     }
@@ -1195,6 +1665,13 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
     static const bool no_copy = std::getenv("INK_PF_NOCOPY") != nullptr, no_math = std::getenv("INK_PF_NOMATH") != nullptr;
     for (int e = 0; e < ne; ++e)
         if (pf.h_cnt[e]) ec.score[(size_t) il * ne + e] += (float) pf.h_cnt[e];
+    if (route_log) {
+        std::vector<uint16_t> c16((size_t) ne);
+        for (int e = 0; e < ne; ++e) c16[(size_t) e] = (uint16_t) std::min(pf.h_cnt[e], 65535);
+        const uint8_t hdr[2] = {'P', (uint8_t) il};
+        std::fwrite(hdr, 1, 2, route_log);
+        std::fwrite(c16.data(), 2, c16.size(), route_log);
+    }
     // The experts in groups of GE: a group's used experts that are not in VRAM copied into one of two group buffers
     // (each run of consecutive ones in one copy a tensor - large copies are what the driver's staging moves fastest),
     // laid out as the GGUF holds them: [the gates | the ups | the downs] of the group's experts.
@@ -1271,9 +1748,34 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
 void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
     const int E = g.n_embd, H = g.n_head, Hkv = g.n_head_kv, hd = g.head_dim, kc = g.conv_k, qw = H * hd;
     const int pos0 = pos;
-    std::memcpy(pf.h_ids, ids, (size_t) T * sizeof(int));
+    ec_kv_reserve(pos0 + T);
+    const uint8_t* ew = embd.w;
+    if (embd_host) {
+        // the chunk's rows gathered from the mapping into the pinned staging (or one by one without it), then the
+        // rows read in order
+        const size_t rb = embd.rb;
+        if (stg.on && (size_t) T * rb <= stg.cap) {
+            CK(cudaEventSynchronize(stg.ev[stg.k]));
+            uint8_t* pin = stg.pin[stg.k];
+            pool->run((T + 255) / 256, [&](int j) {
+                for (int t = j * 256; t < std::min(T, j * 256 + 256); ++t)
+                    std::memcpy(pin + (size_t) t * rb, embd.w + (size_t) ids[t] * rb, rb);
+            });
+            CK(cudaMemcpyAsync(pf.Erows, pin, (size_t) T * rb, cudaMemcpyHostToDevice, s));
+            CK(cudaEventRecord(stg.ev[stg.k], s));
+            stg.k ^= 1;
+        } else {
+            for (int t = 0; t < T; ++t)
+                CK(cudaMemcpyAsync(pf.Erows + (size_t) t * rb, embd.w + (size_t) ids[t] * rb, rb,
+                                   cudaMemcpyHostToDevice, s));
+        }
+        ew = pf.Erows;
+        for (int t = 0; t < T; ++t) pf.h_ids[t] = t;
+    } else {
+        std::memcpy(pf.h_ids, ids, (size_t) T * sizeof(int));
+    }
     CK(cudaMemcpyAsync(pf.ids, pf.h_ids, (size_t) T * sizeof(int), cudaMemcpyHostToDevice, s));
-    if (!k::embed_rows(embd.w, embd.type, embd.rb, pf.ids, T, E, pf.X, s)) {
+    if (!k::embed_rows(ew, embd.type, embd.rb, pf.ids, T, E, pf.X, s)) {
         std::fprintf(stderr, "maya-ink: no embedding rows for type %d\n", embd.type);
         std::abort();
     }
@@ -1386,12 +1888,19 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
         if (progress) progress(ctx, n);
         return lg;
     }
+    // the lent slots back to their buffers until the next token is written (a long prompt comes in pieces)
+    ec_reclaim();
+    pf_open = true;
     for (int c0 = 0; c0 < n; c0 += pf.C) {
         const int T = std::min(pf.C, n - c0);
         chunk(ids + c0, T, c0 + T == n);
         if (progress) progress(ctx, c0 + T);
     }
     // the prompt's experts as the next tokens' best guess: the VRAM cache refilled from the scores
+    if (route_log) {
+        std::fputc('E', route_log);
+        std::fflush(route_log);
+    }
     ec_fill();
     CK(cudaStreamSynchronize(s));
     st.pf_ms += now_ms() - t0;
@@ -1400,28 +1909,204 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     return h_logits;
 }
 
+// ------------------------------------------------------------------------------------------------ the token path
+// A layer's attention for the token at *dpos (the position and tau read on the device, so the same launches serve
+// every position: a CUDA graph's), x += it; prev: the MoE layer before, whose end (tok_tail's) comes first.  Fused
+// (Impl::fuse's bits, INK_FUSE; the same bits of output either way): 1 the norm and its int8 rows in one kernel (after
+// the previous end's / the output's convolution, kept over many blocks), the FFN's norm (f) and f's int8 rows made at
+// the end; 2 k / v's convolutions, k's norm and their store in one; 4 q's norm and the bias band inside the attention;
+// 8 the output's int8 rows in the attention's combine.
+void Engine::Impl::tok_attention(Layer& l, const Layer* prev) {
+    const int E = g.n_embd, H = g.n_head, Hkv = g.n_head_kv, hd = g.head_dim, kc = g.conv_k;
+    float* cv = l.conv;
+    float *st_k = cv, *st_v = cv + (size_t) (kc - 1) * kvw, *st_a = cv + (size_t) (kc - 1) * 2 * kvw;
+    const float* t = (!l.swa && g.log_floor > 0) ? tau : nullptr;
+    const int ring = l.swa ? g.n_swa : 0;
+    if (prev) {
+        if (fuse & 1) {
+            CK(cudaMemcpyAsync(d_tail, h_tail, tail_bytes(), cudaMemcpyHostToDevice, s));
+            float* st_m = prev->conv + (size_t) (kc - 1) * (2 * kvw + E);
+            k::conv_add(2, x, d_tail + 4, ec.routed, so, (const int*) d_tail, st_m, prev->sc_mlp, kc, E, s);
+        } else {
+            tok_tail(*prev);
+        }
+    }
+    if (fuse & 1) {
+        k::norm_q8(x, l.attn_norm, g.eps, a, xq, xd, E, s);
+    } else {
+        k::rmsnorm(x, l.attn_norm, a, 1, E, g.eps, s);
+        quant(a, 1, E);
+    }
+    {
+        const DMat* ms[4] = {&l.wq, &l.wk, &l.wv, &l.wr};
+        const int rows[4] = {0, 0, 0, 0};
+        float* ys[4] = {q, kk, vv, r};
+        mv_jobs(ms, rows, ys, 4, a);
+    }
+    if (fuse & 2) {
+        k::kv_conv_store(kk, vv, st_k, st_v, l.sc_k, l.sc_v, kc, l.k_norm, g.eps, l.K, l.V, dpos, ring, Hkv, hd, s);
+    } else {
+        k::shortconv(kk, st_k, l.sc_k, 1, kvw, kc, s);
+        k::shortconv(vv, st_v, l.sc_v, 1, kvw, kc, s);
+        k::head_norm(kk, l.k_norm, 1, Hkv, hd, g.eps, nullptr, s);
+        k::kv_store_dev(kk, vv, l.K, l.V, dpos, ring, kvw, s);
+    }
+    k::AttnFuse fz;
+    if (fuse & 4) {
+        fz.qn = l.q_norm;
+        fz.tau = t;
+        fz.eps = g.eps;
+        fz.rr = r;
+        fz.proj = l.rel_proj;
+        fz.d_rel = g.d_rel;
+    } else {
+        k::head_norm(q, l.q_norm, 1, H, hd, g.eps, t, s);
+        k::rel_logits(r, l.rel_proj, t, rel, 1, H, g.d_rel, l.E, s);
+    }
+    if (fuse & 8) {
+        fz.oq = xq;
+        fz.od = xd;
+    }
+    k::attn_decode(q, l.K, l.V, l.kv_rows, 0, dpos, ring, (fuse & 4) ? nullptr : rel, l.E, H, Hkv, hd,
+                   1.0f / (float) hd, o_, attn_scr, s, &fz);
+    if (!(fuse & 8)) quant(o_, 1, H * hd);
+    mv(l.wo, o_, 0, ao);
+    if (fuse & 1) {
+        k::conv_add(1, x, ao, nullptr, nullptr, nullptr, st_a, l.sc_attn, kc, E, s);
+        k::norm_q8(x, l.ffn_norm, g.eps, f, xq, xd, E, s);
+    } else {
+        k::shortconv(ao, st_a, l.sc_attn, 1, E, kc, s);
+        k::add(x, ao, E, s);
+    }
+}
+
+// A MoE layer's router: f = rmsnorm(x) and its int8 rows (the VRAM experts' and the shared experts' input; fused: made
+// by tok_attention), the logits, f and the logits to the host.
+void Engine::Impl::tok_router(const Layer& l) {
+    const int E = g.n_embd;
+    if (!(fuse & 1)) {
+        k::rmsnorm(x, l.ffn_norm, f, 1, E, g.eps, s);
+        quant(f, 1, E);
+    }
+    mv(l.gate_inp, f, 0, rlog);
+    CK(cudaMemcpyAsync(h_f, f, (size_t) E * sizeof(float), cudaMemcpyDeviceToHost, s));
+    CK(cudaMemcpyAsync(h_rlog, rlog, (size_t) (g.n_expert + g.n_shexp) * sizeof(float), cudaMemcpyDeviceToHost, s));
+}
+
+// A MoE layer's end (unfused): the CPU lane's sum and which lanes ran (h_tail, written by the host) up to the device,
+// then moe_tail: fo, the FFN's short convolution, x += it.
+void Engine::Impl::tok_tail(const Layer& l) {
+    const int E = g.n_embd, kc = g.conv_k;
+    float* st_m = l.conv + (size_t) (kc - 1) * (2 * kvw + E);
+    CK(cudaMemcpyAsync(d_tail, h_tail, tail_bytes(), cudaMemcpyHostToDevice, s));
+    k::moe_tail(x, d_tail + 4, ec.routed, so, (const int*) d_tail, st_m, l.sc_mlp, E, kc, s);
+}
+
+// The last MoE layer's end and the output head: the logits to the host.
+void Engine::Impl::tok_head(const Layer& last) {
+    const int E = g.n_embd, kc = g.conv_k;
+    if (fuse & 1) {
+        CK(cudaMemcpyAsync(d_tail, h_tail, tail_bytes(), cudaMemcpyHostToDevice, s));
+        float* st_m = last.conv + (size_t) (kc - 1) * (2 * kvw + E);
+        k::conv_add(2, x, d_tail + 4, ec.routed, so, (const int*) d_tail, st_m, last.sc_mlp, kc, E, s);
+        k::norm_q8(x, out_norm, g.eps, a, xq, xd, E, s);
+    } else {
+        tok_tail(last);
+        k::rmsnorm(x, out_norm, a, 1, E, g.eps, s);
+        if (!is_float(output.type)) quant(a, 1, E);
+    }
+    if (is_float(output.type)) k::gemv_f(output.w, output.type, output.rb, a, logits, output.n, output.k, s);
+    else mv(output, a, 0, logits, g.logit_scale);
+    CK(cudaMemcpyAsync(h_logits, logits, (size_t) g.vocab * sizeof(float), cudaMemcpyDeviceToHost, s));
+}
+
+// The CUDA graphs: a MoE layer's from its sync back to the next (the previous layer's end when that one is a MoE
+// layer, the attention, the router), and the head's (the last layer's end, the head): two launches a layer become one,
+// and the GPU runs them without the launches' gaps.  Captured on the first token; INK_GRAPHS=0: none.
+void Engine::Impl::tok_graphs() {
+    graphs = 0;
+    const char* v = std::getenv("INK_GRAPHS");
+    if ((v && std::atoi(v) == 0) || std::getenv("INK_TRACE")) return;
+    gx.assign((size_t) g.n_layer, nullptr);
+    auto capture = [&](auto&& body, cudaGraphExec_t& out) {
+        cudaGraph_t gr = nullptr;
+        if (cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return false;
+        body();
+        if (cudaStreamEndCapture(s, &gr) != cudaSuccess || !gr) return false;
+        const bool ok = cudaGraphInstantiate(&out, gr, 0) == cudaSuccess;
+        cudaGraphDestroy(gr);
+        return ok;
+    };
+    bool ok = true;
+    for (int il = g.n_dense; il < g.n_layer && ok; ++il) {
+        Layer& l = L[(size_t) il];
+        ok = capture(
+            [&] {
+                tok_attention(l, il > g.n_dense ? &L[(size_t) il - 1] : nullptr);
+                tok_router(l);
+            },
+            gx[(size_t) il]);
+    }
+    ok = ok && capture([&] { tok_head(L[(size_t) g.n_layer - 1]); }, gx_head);
+    if (!ok) {
+        cudaGetLastError();
+        std::fprintf(stderr, "maya-ink: the token path's CUDA graphs could not be made; it launches its kernels one by one\n");
+        for (auto& e : gx)
+            if (e) cudaGraphExecDestroy(e);
+        gx.clear();
+        if (gx_head) cudaGraphExecDestroy(gx_head);
+        gx_head = nullptr;
+        return;
+    }
+    graphs = 1;
+}
+
 const float* Engine::Impl::step(int token) {
     if (pos >= max_ctx || token < 0 || token >= g.vocab) return nullptr;
     const double t0 = now_ms();
     double cpu_ms = 0.0;
-    const int E = g.n_embd, H = g.n_head, Hkv = g.n_head_kv, hd = g.head_dim, kc = g.conv_k;
+    const int E = g.n_embd, kc = g.conv_k;
+    static const bool ptimes = std::getenv("INK_STEP_TIMES") != nullptr;
+    double tp = t0;   // (INK_STEP_TIMES: the last phase's end)
+    auto phase = [&](double& acc) {
+        if (!ptimes) return;
+        const double t = now_ms();
+        acc += t - tp;
+        tp = t;
+    };
+    if (pf_open) {   // the first token after a prompt: the prompt path's buffers lent to the cache again, and filled
+        pf_open = false;
+        if (ec.arena_end > ec.own) {
+            ec.lent = true;
+            ec_fill();
+        }
+    }
+    if (graphs < 0) tok_graphs();
+    ec_kv_reserve(pos + 1);
 
     // the token's row, normed
+    const uint8_t* erow = embd.w + (size_t) token * embd.rb;
+    if (embd_host) {
+        std::memcpy(h_erow, erow, embd.rb);
+        CK(cudaMemcpyAsync(d_erow, h_erow, embd.rb, cudaMemcpyHostToDevice, s));
+        erow = d_erow;
+    }
     if (is_float(embd.type)) {
-        k::row_to_f32(embd.w + (size_t) token * embd.rb, embd.type, x, E, s);
+        k::row_to_f32(erow, embd.type, x, E, s);
     } else {
-        if (!iq::f16_rows(embd.type, embd.w + (size_t) token * embd.rb, E, 1, e16, E, s)) {
+        if (!iq::f16_rows(embd.type, erow, E, 1, e16, E, s)) {
             std::fprintf(stderr, "maya-ink: no row decoder for the embedding's type %d\n", embd.type);
             std::abort();
         }
         k::f16_to_f32((const __half*) e16, x, E, s);
     }
     k::rmsnorm(x, tok_norm, x, 1, E, g.eps, s);
-    // the global layers' log-N scale
-    h_tau[0] = g.log_floor > 0 ? 1.0f + g.log_alpha * std::log(std::max((float) (pos + 1) / (float) g.log_floor, 1.0f))
-                               : 1.0f;
-    CK(cudaMemcpyAsync(tau, h_tau, sizeof(float), cudaMemcpyHostToDevice, s));
-    const bool tau_on = g.log_floor > 0;
+    // the global layers' log-N scale, and the position, on the device
+    h_tokd[0] = g.log_floor > 0 ? 1.0f + g.log_alpha * std::log(std::max((float) (pos + 1) / (float) g.log_floor, 1.0f))
+                                : 1.0f;
+    std::memcpy(h_tokd + 1, &pos, sizeof(int));
+    CK(cudaMemcpyAsync(tokd, h_tokd, 2 * sizeof(float), cudaMemcpyHostToDevice, s));
+    phase(pt.embed);
 
     static const bool trace = std::getenv("INK_TRACE") != nullptr;
     for (int il = 0; il < g.n_layer; ++il) {
@@ -1431,161 +2116,190 @@ const float* Engine::Impl::step(int token) {
             std::fprintf(stderr, "[trace] pos %d layer %d\n", pos, il);
             std::fflush(stderr);
         }
-        float* cv = l.conv;
-        float *st_k = cv, *st_v = cv + (size_t) (kc - 1) * kvw, *st_a = cv + (size_t) (kc - 1) * 2 * kvw,
-              *st_m = cv + (size_t) (kc - 1) * (2 * kvw + E);
-        // attention
-        k::rmsnorm(x, l.attn_norm, a, 1, E, g.eps, s);
-        quant(a, 1, E);
-        {
-            const DMat* ms[4] = {&l.wq, &l.wk, &l.wv, &l.wr};
-            const int rows[4] = {0, 0, 0, 0};
-            float* ys[4] = {q, kk, vv, r};
-            mv_jobs(ms, rows, ys, 4, a);
-        }
-        k::shortconv(kk, st_k, l.sc_k, 1, kvw, kc, s);
-        k::shortconv(vv, st_v, l.sc_v, 1, kvw, kc, s);
-        const float* t = (!l.swa && tau_on) ? tau : nullptr;
-        k::head_norm(q, l.q_norm, 1, H, hd, g.eps, t, s);
-        k::head_norm(kk, l.k_norm, 1, Hkv, hd, g.eps, nullptr, s);
-        k::rel_logits(r, l.rel_proj, t, rel, 1, H, g.d_rel, l.E, s);
-        const int slot = l.swa ? pos % g.n_swa : pos;
-        k::kv_store(kk, vv, l.K, l.V, slot, kvw, s);
-        const int n_kv = l.swa ? std::min(pos + 1, g.n_swa) : pos + 1;
-        k::attn_decode(q, l.K, l.V, n_kv, pos, l.swa ? g.n_swa : 0, rel, l.E, H, Hkv, hd, 1.0f / (float) hd, o_,
-                       attn_scr, s);
-        quant(o_, 1, H * hd);
-        mv(l.wo, o_, 0, ao);
-        k::shortconv(ao, st_a, l.sc_attn, 1, E, kc, s);
-        k::add(x, ao, E, s);
-
-        // the FFN
-        k::rmsnorm(x, l.ffn_norm, f, 1, E, g.eps, s);
         if (l.dense) {
-            quant(f, 1, E);
+            float* st_m = l.conv + (size_t) (kc - 1) * (2 * kvw + E);
+            tok_attention(l, nullptr);
+            if (!(fuse & 1)) {   // (fused: f and its int8 rows made at the attention's end)
+                k::rmsnorm(x, l.ffn_norm, f, 1, E, g.eps, s);
+                quant(f, 1, E);
+            }
             mv(l.gate, f, 0, fg);
             mv(l.up, f, 0, fu);
             k::swiglu(fg, fu, fg, g.n_ff, nullptr, s);
             quant(fg, 1, g.n_ff);
             mv(l.down, fg, 0, fo);
             k::mul_scalar(fo, l.gscale_d, E, s);
-        } else {
-            const int ne = g.n_expert, nsh = g.n_shexp, ff = g.n_ff_exp;
-            quant(f, 1, E);
-            mv(l.gate_inp, f, 0, rlog);
-            CK(cudaMemcpyAsync(h_f, f, (size_t) E * sizeof(float), cudaMemcpyDeviceToHost, s));
-            CK(cudaMemcpyAsync(h_rlog, rlog, (size_t) (ne + nsh) * sizeof(float), cudaMemcpyDeviceToHost, s));
-            CK(cudaStreamSynchronize(s));
-            const double c0 = now_ms();
-            // routing: the top n_used of sigmoid(logit) + bias, ties to the lower id
-            int sel[16];
-            {
-                float sc[512];
-                int idx[512];
-                for (int e = 0; e < ne; ++e) {
-                    sc[e] = 1.0f / (1.0f + std::exp(-h_rlog[e])) + l.exp_bias[(size_t) e];
-                    idx[e] = e;
-                }
-                std::partial_sort(idx, idx + g.n_used, idx + ne,
-                                  [&](int a1, int b1) { return sc[a1] > sc[b1] || (sc[a1] == sc[b1] && a1 < b1); });
-                for (int i = 0; i < g.n_used; ++i) sel[i] = idx[i];
-            }
-            // weights: softmax over logsigmoid of [the chosen raw logits, the shared logits], x scale x gscale
-            float wv[18];
-            const int nw = g.n_used + nsh;
-            float mx = -INFINITY;
-            for (int i = 0; i < nw; ++i) {
-                const float z = i < g.n_used ? h_rlog[sel[i]] : h_rlog[ne + (i - g.n_used)];
-                wv[i] = z >= 0.0f ? -std::log1p(std::exp(-z)) : z - std::log1p(std::exp(z));   // logsigmoid
-                mx = std::max(mx, wv[i]);
-            }
-            float sum = 0.0f;
-            for (int i = 0; i < nw; ++i) {
-                wv[i] = std::exp(wv[i] - mx);
-                sum += wv[i];
-            }
-            for (int i = 0; i < nw; ++i) wv[i] = wv[i] / sum * g.exp_scale * l.gscale;
-            // the chosen experts in VRAM go to the GPU (launched first: it works while the CPU lane takes the rest)
-            int gslot[16], csel[16];
-            float gw[16], cw[16];
-            int ng = 0, nc = 0;
-            for (int i = 0; i < g.n_used; ++i) {
-                const size_t key = (size_t) il * ne + sel[i];
-                ec.score[key] += 1.0f;
-                const int sl = ec.slots ? ec.where[key] : -1;
-                if (sl >= 0) {
-                    gslot[ng] = sl;
-                    gw[ng++] = wv[i];
-                } else {
-                    csel[nc] = sel[i];
-                    cw[nc++] = wv[i];
-                }
-            }
-            ec.lookups += g.n_used;
-            ec.hits += ng;
-            if (ng) gpu_experts(l, gslot, gw, ng);
-            h_gamma[0] = wv[g.n_used];
-            h_gamma[1] = wv[g.n_used + 1];
-            CK(cudaMemcpyAsync(gamma, h_gamma, 2 * sizeof(float), cudaMemcpyHostToDevice, s));
-            // the shared experts, their gammas before the down (the GPU's experts have read f's int8 rows by now)
-            {
-                const DMat* ms[4] = {&l.sh_gate[0], &l.sh_up[0], &l.sh_gate[1], &l.sh_up[1]};
-                const int rows[4] = {0, 0, 0, 0};
-                float* ys[4] = {sg, su, sg + ff, su + ff};
-                mv_jobs(ms, rows, ys, 2 * nsh, f);
-            }
-            for (int sh = 0; sh < nsh; ++sh)
-                k::swiglu(sg + (size_t) sh * ff, su + (size_t) sh * ff, sg + (size_t) sh * ff, ff, gamma + sh, s);
-            quant(sg, nsh, ff);
-            {
-                const DMat* ms[2] = {&l.sh_down[0], &l.sh_down[1]};
-                const int rows[2] = {0, 1};
-                float* ys[2] = {so, so + E};
-                mv_jobs(ms, rows, ys, nsh, sg);
-            }
-            if (trace) {
-                CK(cudaStreamSynchronize(s));
-                std::fprintf(stderr, "[trace] layer %d: experts %d %d %d %d %d %d, %d on the GPU; CPU lane next\n", il,
-                             sel[0], sel[1], sel[2], sel[3], sel[4], sel[5], ng);
-                std::fflush(stderr);
-            }
-            if (nc) cpu_experts(*pool, l.cl, E, ff, csel, cw, nc, h_f, h_routed);
-            cpu_ms += now_ms() - c0;
-            if (nc) {
-                CK(cudaMemcpyAsync(routed, h_routed, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s));
-                CK(cudaMemcpyAsync(fo, routed, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s));
-                if (ng) k::add(fo, ec.routed, E, s);
-            } else {
-                CK(cudaMemcpyAsync(fo, ec.routed, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s));
-            }
-            for (int sh = 0; sh < nsh; ++sh) k::add(fo, so + (size_t) sh * E, E, s);
+            k::shortconv(fo, st_m, l.sc_mlp, 1, E, kc, s);
+            k::add(x, fo, E, s);
+            phase(pt.dense);
+            continue;
         }
-        k::shortconv(fo, st_m, l.sc_mlp, 1, E, kc, s);
-        k::add(x, fo, E, s);
+        // (the previous layer's end,) the attention and the router: one graph, or their launches
+        const bool ev = ptimes && il == 10;
+        if (ev) {
+            if (!pt.e0) {
+                CK(cudaEventCreate(&pt.e0));
+                CK(cudaEventCreate(&pt.e1));
+            }
+            CK(cudaEventRecord(pt.e0, s));
+        }
+        if (graphs > 0) {
+            CK(cudaGraphLaunch(gx[(size_t) il], s));
+        } else {
+            tok_attention(l, il > g.n_dense ? &L[(size_t) il - 1] : nullptr);
+            tok_router(l);
+        }
+        const int ne = g.n_expert, nsh = g.n_shexp, ff = g.n_ff_exp;
+        if (ev) CK(cudaEventRecord(pt.e1, s));
+        const bool staging = ec_stage_begin(ec.piece);   // (a piece of the swaps' copies while the GPU works)
+        CK(cudaStreamSynchronize(s));
+        if (staging) ec_stage_end();
+        if (ev) {
+            float ms = 0;
+            CK(cudaEventElapsedTime(&ms, pt.e0, pt.e1));
+            pt.gpu_att += ms;
+        }
+        phase(pt.att);
+        const double c0 = now_ms();
+        // routing: the top n_used of sigmoid(logit) + bias, ties to the lower id
+        int sel[16];
+        {
+            float sc[512];
+            int idx[512];
+            for (int e = 0; e < ne; ++e) {
+                sc[e] = 1.0f / (1.0f + std::exp(-h_rlog[e])) + l.exp_bias[(size_t) e];
+                idx[e] = e;
+            }
+            std::partial_sort(idx, idx + g.n_used, idx + ne,
+                              [&](int a1, int b1) { return sc[a1] > sc[b1] || (sc[a1] == sc[b1] && a1 < b1); });
+            for (int i = 0; i < g.n_used; ++i) sel[i] = idx[i];
+        }
+        // weights: softmax over logsigmoid of [the chosen raw logits, the shared logits], x scale x gscale
+        float wv[18];
+        const int nw = g.n_used + nsh;
+        float mx = -INFINITY;
+        for (int i = 0; i < nw; ++i) {
+            const float z = i < g.n_used ? h_rlog[sel[i]] : h_rlog[ne + (i - g.n_used)];
+            wv[i] = z >= 0.0f ? -std::log1p(std::exp(-z)) : z - std::log1p(std::exp(z));   // logsigmoid
+            mx = std::max(mx, wv[i]);
+        }
+        float sum = 0.0f;
+        for (int i = 0; i < nw; ++i) {
+            wv[i] = std::exp(wv[i] - mx);
+            sum += wv[i];
+        }
+        for (int i = 0; i < nw; ++i) wv[i] = wv[i] / sum * g.exp_scale * l.gscale;
+        phase(pt.route);
+        // the chosen experts in VRAM go to the GPU, the others to the CPU lane, both at once
+        int gslot[16], csel[16];
+        float gw[16], cw[16];
+        int ng = 0, nc = 0;
+        if (route_log)
+            for (int i = 0; i < g.n_used; ++i) route_tok.push_back((uint8_t) sel[i]);
+        for (int i = 0; i < g.n_used; ++i) {
+            const size_t key = (size_t) il * ne + sel[i];
+            ec.score[key] += 1.0f;
+            const int sl = ec.slots ? ec.where[key] : -1;
+            if (sl >= 0) {
+                gslot[ng] = sl;
+                gw[ng++] = wv[i];
+            } else {
+                csel[nc] = sel[i];
+                cw[nc++] = wv[i];
+            }
+        }
+        ec.lookups += g.n_used;
+        ec.hits += ng;
+        // the CPU lane's workers start on the rest now; this thread launches the GPU's part, then joins them
+        static const bool early = !std::getenv("INK_LANE_EARLY") || std::atoi(std::getenv("INK_LANE_EARLY")) != 0;
+        float* h_routed = h_tail + 4;
+        if (nc && early) lane.begin(*pool, l.cl, E, ff, csel, cw, nc, h_f, h_routed);
+        if (ng) gpu_experts(l, gslot, gw, ng);
+        h_gamma[0] = wv[g.n_used];
+        h_gamma[1] = wv[g.n_used + 1];
+        CK(cudaMemcpyAsync(gamma, h_gamma, 2 * sizeof(float), cudaMemcpyHostToDevice, s));
+        // the shared experts, their gammas before the down (the GPU's experts have read f's int8 rows by now)
+        {
+            const DMat* ms[4] = {&l.sh_gate[0], &l.sh_up[0], &l.sh_gate[1], &l.sh_up[1]};
+            const int rows[4] = {0, 0, 0, 0};
+            float* ys[4] = {sg, su, sg + ff, su + ff};
+            mv_jobs(ms, rows, ys, 2 * nsh, f);
+        }
+        for (int sh = 0; sh < nsh; ++sh)
+            k::swiglu(sg + (size_t) sh * ff, su + (size_t) sh * ff, sg + (size_t) sh * ff, ff, gamma + sh, s);
+        quant(sg, nsh, ff);
+        {
+            const DMat* ms[2] = {&l.sh_down[0], &l.sh_down[1]};
+            const int rows[2] = {0, 1};
+            float* ys[2] = {so, so + E};
+            mv_jobs(ms, rows, ys, nsh, sg);
+        }
+        if (trace) {
+            CK(cudaStreamSynchronize(s));
+            std::fprintf(stderr, "[trace] layer %d: experts %d %d %d %d %d %d, %d on the GPU; CPU lane next\n", il,
+                         sel[0], sel[1], sel[2], sel[3], sel[4], sel[5], ng);
+            std::fflush(stderr);
+        }
+        phase(pt.glaunch);
+        if (nc && !early) lane.begin(*pool, l.cl, E, ff, csel, cw, nc, h_f, h_routed);
+        if (nc) lane.end();
+        cpu_ms += now_ms() - c0;
+        phase(pt.cpu);
+        pt.cpu_experts += nc;
+        // which lanes ran, for this layer's end (the next graph's start)
+        int* flags = (int*) h_tail;
+        flags[0] = nc > 0;
+        flags[1] = ng > 0;
+        phase(pt.tail);
     }
 
-    // the output head
-    k::rmsnorm(x, out_norm, a, 1, E, g.eps, s);
-    if (is_float(output.type)) {
-        k::gemv_f(output.w, output.type, output.rb, a, logits, output.n, output.k, s);
+    // the last layer's end and the output head
+    if (graphs > 0) {
+        CK(cudaGraphLaunch(gx_head, s));
     } else {
-        quant(a, 1, E);
-        mv(output, a, 0, logits, g.logit_scale);
+        tok_head(L[(size_t) g.n_layer - 1]);
     }
-    CK(cudaMemcpyAsync(h_logits, logits, (size_t) g.vocab * sizeof(float), cudaMemcpyDeviceToHost, s));
+    const bool staging = ec_stage_begin(4 * ec.piece);   // (the head's GEMV is the token's longest wait)
     CK(cudaStreamSynchronize(s));
+    if (staging) ec_stage_end();
     if (is_float(output.type))
         for (int i = 0; i < g.vocab; ++i) h_logits[i] *= g.logit_scale;
     for (int i = g.vocab_unpadded; i < g.vocab; ++i) h_logits[i] = -INFINITY;
     ++pos;
-    // the scores decay as tokens are written; a few swaps every few tokens
+    if (route_log) {
+        std::fputc('T', route_log);
+        std::fwrite(route_tok.data(), 1, route_tok.size(), route_log);
+        route_tok.clear();
+        if (pos % 64 == 0) std::fflush(route_log);
+    }
+    phase(pt.head);
+    // the scores decay as tokens are written; a few swaps every few tokens (the copies that went up during this token
+    // in use from the next)
     if (ec.slots) {
+        ec_arrive();
         for (float& v : ec.score) v *= ec.decay;
         if (++ec.tok % ec.every == 0) ec_adapt();
     }
+    phase(pt.adapt);
     st.ms_total += now_ms() - t0;
     st.ms_cpu += cpu_ms;
     ++st.tokens;
+    if (ptimes && ++pt.tokens == 64) {
+        const double n = (double) pt.tokens;
+        std::fprintf(stderr,
+                     "maya-ink: step phases, ms a token (64 tokens): embed %.2f, attention+sync %.2f, routing %.2f, GPU "
+                     "launches %.2f, CPU lane %.2f (%.1f experts, %.3f ms each), tail %.2f, dense layers %.2f, head %.2f, "
+                     "adapt %.2f; total %.2f; layer 10's attention on the GPU %.0f us\n",
+                     pt.embed / n, pt.att / n, pt.route / n, pt.glaunch / n, pt.cpu / n, pt.cpu_experts / n,
+                     pt.cpu_experts ? pt.cpu / pt.cpu_experts : 0.0, pt.tail / n, pt.dense / n, pt.head / n,
+                     pt.adapt / n,
+                     (pt.embed + pt.att + pt.route + pt.glaunch + pt.cpu + pt.tail + pt.dense + pt.head + pt.adapt) / n,
+                     pt.gpu_att / n * 1000.0);
+        const cudaEvent_t e0 = pt.e0, e1 = pt.e1;
+        pt = PhaseTimes{};
+        pt.e0 = e0;
+        pt.e1 = e1;
+    }
     return h_logits;
 }
 

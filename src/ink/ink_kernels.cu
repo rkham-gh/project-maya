@@ -99,63 +99,343 @@ __global__ void kv_store_kernel(const float* __restrict__ k, const float* __rest
     K[i] = __float2half(k[i]);
     V[i] = __float2half(v[i]);
 }
-
-constexpr int kSplit = 256;   // keys a block of the decode attention
-
-// grid (splits, Hkv), a warp per query head of the group (blockDim = 32 G); each warp's (m, l, acc) for its split
-__global__ void attn_decode_kernel(const float* __restrict__ q, const __half* __restrict__ K,
-                                   const __half* __restrict__ V, int n_kv, int pos, int ring,
-                                   const float* __restrict__ rel, int E, int H, int Hkv, int hd, float scale,
-                                   float* __restrict__ part) {
-    const int split = blockIdx.x, g = blockIdx.y, w = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int G = H / Hkv, h = g * G + w;
-    const int per = hd / 32;
-    float qv[8], acc[8];
-    for (int i = 0; i < per; ++i) {
-        qv[i] = q[(size_t) h * hd + lane + 32 * i];
-        acc[i] = 0.0f;
-    }
-    float m = -INFINITY, l = 0.0f;
-    const int j0 = split * kSplit, j1 = min(n_kv, j0 + kSplit);
-    const size_t row = (size_t) Hkv * hd;
-    for (int j = j0; j < j1; ++j) {
-        const __half* kr = K + (size_t) j * row + (size_t) g * hd;
-        float s = 0.0f;
-        for (int i = 0; i < per; ++i) s += qv[i] * __half2float(kr[lane + 32 * i]);
-        s = warp_sum(s) * scale;
-        int dist = ring > 0 ? ((pos - j) % ring + ring) % ring : pos - j;
-        if (dist >= 0 && dist < E) s += rel[(size_t) h * E + dist];
-        const float mn = fmaxf(m, s);
-        const float c1 = __expf(m - mn), c2 = __expf(s - mn);
-        l = l * c1 + c2;
-        const __half* vr = V + (size_t) j * row + (size_t) g * hd;
-        for (int i = 0; i < per; ++i) acc[i] = acc[i] * c1 + c2 * __half2float(vr[lane + 32 * i]);
-        m = mn;
-    }
-    const int nsp = gridDim.x;
-    float* pp = part + ((size_t) h * nsp + split) * (hd + 2);
-    if (lane == 0) {
-        pp[0] = m;
-        pp[1] = l;
-    }
-    for (int i = 0; i < per; ++i) pp[2 + lane + 32 * i] = acc[i];
+// (the row from the position on the device: ring > 0 pos % ring, else pos)
+__global__ void kv_store_dev_kernel(const float* __restrict__ k, const float* __restrict__ v, __half* __restrict__ K,
+                                    __half* __restrict__ V, const int* __restrict__ dpos, int ring, int kvw) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kvw) return;
+    const int pos = *dpos, slot = ring > 0 ? pos % ring : pos;
+    K[(size_t) slot * kvw + i] = __float2half(k[i]);
+    V[(size_t) slot * kvw + i] = __float2half(v[i]);
 }
 
-// grid H, blockDim hd: the splits' partial sums merged
-__global__ void attn_combine_kernel(const float* __restrict__ part, int nsp, int hd, float* __restrict__ out) {
+// ------------------------------------------------------------------------------------------------ fused token kernels
+// The token path's small steps fused (the same arithmetic in the same order as the kernels they replace, so the same
+// bits): one block of 256 threads for a row of n = 256 x kPerT channels, thread t channels t + 256 k (rmsnorm_kernel's
+// order for the sum of squares, block_sum for its total), then each warp's 32-channel blocks rounded as q8_kernel does.
+constexpr int kPerT = 16;
+
+__global__ void __launch_bounds__(256) norm_q8_kernel(const float* __restrict__ x, const float* __restrict__ w, float eps,
+                                                     float* __restrict__ y, int8_t* __restrict__ q, float* __restrict__ d,
+                                                     int n) {
+    const int t = threadIdx.x, per = n / 256;
+    float xv[kPerT];
+    float ss = 0.0f;
+#pragma unroll
+    for (int k = 0; k < kPerT; ++k) {
+        if (k >= per) break;
+        const float xc = x[t + 256 * k];
+        xv[k] = xc;
+        ss += xc * xc;
+    }
+    ss = block_sum(ss);
+    const float sc = rsqrtf(ss / (float) n + eps);
+    const int lane = t & 31;
+#pragma unroll
+    for (int k = 0; k < kPerT; ++k) {
+        if (k >= per) break;
+        const int c = t + 256 * k;
+        const float a = xv[k] * sc * w[c];
+        if (y) y[c] = a;
+        const float am = warp_max(fabsf(a));
+        const float s8 = am / 127.0f;
+        q[c] = (int8_t) (am > 0.0f ? __float2int_rn(a / s8) : 0);
+        if (lane == 0) d[c / 32] = s8;
+    }
+}
+
+// A residual's update before a norm, a thread a channel: mode 1 x += shortconv(in) (shortconv + add), mode 2
+// x += shortconv(moe_tail's sum) (moe_tail).  (Over many blocks: in norm_q8's one block, 4096 channels' convolution
+// loads were slower than the kernels they replaced.)
+template <int MODE>
+__global__ void conv_add_kernel(float* __restrict__ x, const float* __restrict__ in, const float* __restrict__ gpu,
+                                const float* __restrict__ so, const int* __restrict__ flags, float* __restrict__ state,
+                                const float* __restrict__ kern, int K, int n) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    float v;
+    if (MODE == 2) {
+        if (flags[0]) {
+            v = in[c];
+            if (flags[1]) v += gpu[c];
+        } else {
+            v = gpu[c];
+        }
+        v += so[c];
+        v += so[n + c];
+    } else {
+        v = in[c];
+    }
+    float wk[8], win[8];
+    for (int i = 0; i < K; ++i) wk[i] = kern[(size_t) c * K + i];
+    for (int i = 0; i < K - 1; ++i) win[i] = state[(size_t) c * (K - 1) + i];
+    win[K - 1] = v;
+    float sum = 0.0f;
+    for (int i = 0; i < K; ++i) sum += win[i] * wk[i];
+    const float out = v + sum;
+    for (int i = 0; i < K - 1; ++i) state[(size_t) c * (K - 1) + i] = win[i + 1];
+    x[c] += out;
+}
+
+// grid Hkv, 64 threads: warp 0 the KV head's k (shortconv, head_norm_kernel's norm, F16 into K's row), warp 1 its v
+// (shortconv, F16 into V's row); the row from the position on the device
+__global__ void kv_conv_store_kernel(const float* __restrict__ kk, const float* __restrict__ vv,
+                                     float* __restrict__ st_k, float* __restrict__ st_v,
+                                     const float* __restrict__ sc_k, const float* __restrict__ sc_v, int K,
+                                     const float* __restrict__ k_norm, float eps, __half* __restrict__ Kc,
+                                     __half* __restrict__ Vc, const int* __restrict__ dpos, int ring, int hd, int kvw) {
+    const int h = blockIdx.x, wv = threadIdx.x >> 5, lane = threadIdx.x & 31, per = hd / 32;
+    const int pos = *dpos, slot = ring > 0 ? pos % ring : pos;
+    const float* in = wv ? vv : kk;
+    float* st = wv ? st_v : st_k;
+    const float* kern = wv ? sc_v : sc_k;
+    float v[8];
+    for (int i = 0; i < per; ++i) {
+        const int c = h * hd + lane + 32 * i;
+        float wk[8], win[8];
+        for (int j = 0; j < K; ++j) wk[j] = kern[(size_t) c * K + j];
+        for (int j = 0; j < K - 1; ++j) win[j] = st[(size_t) c * (K - 1) + j];
+        const float xin = in[c];
+        win[K - 1] = xin;
+        float sum = 0.0f;
+        for (int j = 0; j < K; ++j) sum += win[j] * wk[j];
+        v[i] = xin + sum;
+        for (int j = 0; j < K - 1; ++j) st[(size_t) c * (K - 1) + j] = win[j + 1];
+    }
+    if (wv == 0) {
+        float ss = 0.0f;
+        for (int i = 0; i < per; ++i) ss += v[i] * v[i];
+        ss = warp_sum(ss);
+        const float sc = rsqrtf(ss / (float) hd + eps);
+        for (int i = 0; i < per; ++i) v[i] = v[i] * sc * k_norm[lane + 32 * i];
+    }
+    __half* dst = (wv ? Vc : Kc) + (size_t) slot * kvw + (size_t) h * hd;
+    for (int i = 0; i < per; ++i) dst[lane + 32 * i] = __float2half(v[i]);
+}
+
+// A MoE layer's end in one kernel, a thread a channel: fo = (the CPU lane's sum, then + the VRAM experts' when both
+// ran; else the one that did) + the shared experts' two outputs, then the FFN's short convolution (shortconv_kernel's
+// arithmetic) and x += it.  flags[0]: the CPU lane ran, flags[1]: the VRAM experts did.
+__global__ void moe_tail_kernel(float* __restrict__ x, const float* __restrict__ cpu, const float* __restrict__ gpu,
+                                const float* __restrict__ so, const int* __restrict__ flags, float* __restrict__ state,
+                                const float* __restrict__ kern, int n, int K) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    float v;
+    if (flags[0]) {
+        v = cpu[c];
+        if (flags[1]) v += gpu[c];
+    } else {
+        v = gpu[c];
+    }
+    v += so[c];
+    v += so[n + c];
+    float w[8], win[8];
+    for (int i = 0; i < K; ++i) w[i] = kern[(size_t) c * K + i];
+    for (int i = 0; i < K - 1; ++i) win[i] = state[(size_t) c * (K - 1) + i];
+    win[K - 1] = v;
+    float sum = 0.0f;
+    for (int i = 0; i < K; ++i) sum += win[i] * w[i];   // ggml_ssm_conv's order: oldest input first
+    const float out = v + sum;
+    for (int i = 0; i < K - 1; ++i) state[(size_t) c * (K - 1) + i] = win[i + 1];
+    x[c] += out;
+}
+
+// The decode attention, a block a (split of the keys, KV head): the split's scores for the group's G query heads (a
+// thread a key, its K row read once for all G - every thread's loads independent, so they are in flight together), the
+// split's softmax (a warp a head), then its weighted V rows (a thread a dimension, the keys unrolled); the splits'
+// (max, sum, acc) merged by attn_combine_kernel.  The split's size from the keys there are, so the grid can stay the same
+// from one token to the next (a CUDA graph): a ring of n_swa rows in splits of kRingSplit keys, a full cache in at most
+// nsp_max splits of a multiple of 64 keys.  dpos (when set): the query's position read on the device.
+constexpr int kAttnThreads = 128, kRingSplit = 64, kMaxG = 8, kAttnMaxSplit = 1024;
+
+__host__ __device__ inline int attn_n_kv(int pos, int ring) { return ring > 0 ? min(pos + 1, ring) : pos + 1; }
+__host__ __device__ inline int attn_split_keys(int n_kv, int ring, int nsp_max) {
+    if (ring > 0) return kRingSplit;
+    const int per = (n_kv + nsp_max - 1) / nsp_max;
+    return max(64, (per + 63) / 64 * 64);
+}
+
+// (fused) qn: q's head norm done here (head_norm_kernel's arithmetic, a warp a head, times tau when set); rr / proj: the
+// bias band computed for each key's distance (rel_logits_kernel's arithmetic) instead of read from rel.
+__global__ void __launch_bounds__(kAttnThreads) attn_decode_kernel(const float* __restrict__ q,
+                                                                   const __half* __restrict__ K,
+                                                                   const __half* __restrict__ V, int pos_arg,
+                                                                   const int* __restrict__ dpos, int ring, int nsp_max,
+                                                                   const float* __restrict__ rel, int E, int H, int Hkv,
+                                                                   int hd, float scale, float* __restrict__ part,
+                                                                   const float* __restrict__ qn,
+                                                                   const float* __restrict__ tau, float eps,
+                                                                   const float* __restrict__ rr,
+                                                                   const float* __restrict__ proj, int d_rel) {
+    extern __shared__ float sm[];   // q [G][hd], then the scores / weights [G][S], then r [G][d_rel]
+    const int split = blockIdx.x, g = blockIdx.y, t = threadIdx.x, G = H / Hkv;
+    const int pos = dpos ? *dpos : pos_arg, n_kv = attn_n_kv(pos, ring), S = attn_split_keys(n_kv, ring, nsp_max);
+    const int j0 = split * S, j1 = min(n_kv, j0 + S);
+    if (j0 >= n_kv) return;   // (a split past the keys: the combine reads only those before)
+    float* qs = sm;
+    float* sc = sm + (size_t) G * hd;
+    float* rs = sc + (size_t) G * S;
+    if (qn) {
+        const int w = t >> 5, lane = t & 31, per = hd / 32;
+        const float tv = tau ? tau[0] : 1.0f;
+        for (int hl = w; hl < G; hl += kAttnThreads / 32) {
+            const float* p = q + ((size_t) g * G + hl) * hd;
+            float v[8];
+            float ss = 0.0f;
+            for (int i = 0; i < per; ++i) {
+                v[i] = p[lane + 32 * i];
+                ss += v[i] * v[i];
+            }
+            ss = warp_sum(ss);
+            const float s0 = rsqrtf(ss / (float) hd + eps);
+            for (int i = 0; i < per; ++i) qs[(size_t) hl * hd + lane + 32 * i] = v[i] * s0 * qn[lane + 32 * i] * tv;
+        }
+    } else {
+        for (int i = t; i < G * hd; i += kAttnThreads) qs[i] = q[(size_t) g * G * hd + i];
+    }
+    if (rr)
+        for (int i = t; i < G * d_rel; i += kAttnThreads) rs[i] = rr[(size_t) g * G * d_rel + i];
+    __syncthreads();
+    const size_t row = (size_t) Hkv * hd;
+    // the scores: thread t takes keys j0 + t, j0 + t + 128, ...
+    for (int j = j0 + t; j < j1; j += kAttnThreads) {
+        const uint4* kr = reinterpret_cast<const uint4*>(K + (size_t) j * row + (size_t) g * hd);
+        float acc[kMaxG];
+#pragma unroll
+        for (int h = 0; h < kMaxG; ++h) acc[h] = 0.0f;
+        for (int c0 = 0; c0 < hd / 8; c0 += 4) {   // 4 x 8 values in flight
+            uint4 kv[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) kv[u] = c0 + u < hd / 8 ? kr[c0 + u] : make_uint4(0, 0, 0, 0);
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                if (c0 + u >= hd / 8) break;
+                const __half2* k2 = reinterpret_cast<const __half2*>(&kv[u]);
+                float kf[8];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const float2 f2 = __half22float2(k2[e]);
+                    kf[2 * e] = f2.x;
+                    kf[2 * e + 1] = f2.y;
+                }
+                const int d0 = (c0 + u) * 8;
+#pragma unroll
+                for (int h = 0; h < kMaxG; ++h) {
+                    if (h >= G) break;
+                    const float* qh = qs + (size_t) h * hd + d0;
+                    float s = acc[h];
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) s = fmaf(qh[e], kf[e], s);
+                    acc[h] = s;
+                }
+            }
+        }
+        const int dist = ring > 0 ? ((pos - j) % ring + ring) % ring : pos - j;
+        if (rr) {
+            const bool band = dist >= 0 && dist < E;
+            float pc[32];   // (the band's column at this distance)
+            if (band)
+                for (int d = 0; d < d_rel; ++d) pc[d] = __ldg(proj + (size_t) d * E + dist);
+            const float tv = tau ? tau[0] : 1.0f;
+            for (int h = 0; h < G; ++h) {
+                float s = acc[h] * scale;
+                if (band) {
+                    float b = 0.0f;
+                    for (int d = 0; d < d_rel; ++d) b += pc[d] * rs[(size_t) h * d_rel + d];
+                    if (tau) b *= tv;
+                    s += b;
+                }
+                sc[(size_t) h * S + (j - j0)] = s;
+            }
+        } else {
+            for (int h = 0; h < G; ++h) {
+                float s = acc[h] * scale;
+                if (dist >= 0 && dist < E) s += rel[(size_t) (g * G + h) * E + dist];
+                sc[(size_t) h * S + (j - j0)] = s;
+            }
+        }
+    }
+    __syncthreads();
+    // the split's softmax, a warp a head: (m, l) and the weights exp(s - m) in place
+    const int w = t >> 5, lane = t & 31, nk = j1 - j0, nsp = gridDim.x;
+    for (int h = w; h < G; h += kAttnThreads / 32) {
+        float* sh = sc + (size_t) h * S;
+        float m = -INFINITY;
+        for (int i = lane; i < nk; i += 32) m = fmaxf(m, sh[i]);
+        m = warp_max(m);
+        float l = 0.0f;
+        for (int i = lane; i < nk; i += 32) {
+            const float p = __expf(sh[i] - m);
+            sh[i] = p;
+            l += p;
+        }
+        l = warp_sum(l);
+        if (lane == 0) {
+            float* pp = part + ((size_t) (g * G + h) * nsp + split) * (hd + 2);
+            pp[0] = m;
+            pp[1] = l;
+        }
+    }
+    __syncthreads();
+    // the weighted V rows: thread t a dimension (and t + 128, ...), the keys 8 at a time
+    for (int d = t; d < hd; d += kAttnThreads) {
+        float o[kMaxG];
+#pragma unroll
+        for (int h = 0; h < kMaxG; ++h) o[h] = 0.0f;
+        const __half* vb = V + (size_t) j0 * row + (size_t) g * hd + d;
+        int i = 0;
+        for (; i + 8 <= nk; i += 8) {
+            float vv[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) vv[u] = __half2float(vb[(size_t) (i + u) * row]);
+#pragma unroll
+            for (int h = 0; h < kMaxG; ++h) {
+                if (h >= G) break;
+                const float* ph = sc + (size_t) h * S + i;
+                float a = o[h];
+#pragma unroll
+                for (int u = 0; u < 8; ++u) a = fmaf(ph[u], vv[u], a);
+                o[h] = a;
+            }
+        }
+        for (; i < nk; ++i) {
+            const float v = __half2float(vb[(size_t) i * row]);
+            for (int h = 0; h < G; ++h) o[h] = fmaf(sc[(size_t) h * S + i], v, o[h]);
+        }
+        for (int h = 0; h < G; ++h) part[((size_t) (g * G + h) * nsp + split) * (hd + 2) + 2 + d] = o[h];
+    }
+}
+
+// grid H, blockDim hd: the splits' partial sums merged (the splits that hold keys)
+__global__ void attn_combine_kernel(const float* __restrict__ part, int nsp, int pos_arg, const int* __restrict__ dpos,
+                                    int ring, int nsp_max, int hd, float* __restrict__ out, int8_t* __restrict__ oq,
+                                    float* __restrict__ od) {
     const int h = blockIdx.x, d = threadIdx.x;
+    const int pos = dpos ? *dpos : pos_arg, n_kv = attn_n_kv(pos, ring), S = attn_split_keys(n_kv, ring, nsp_max);
+    const int used = min(nsp, (n_kv + S - 1) / S);
     const float* pp = part + (size_t) h * nsp * (hd + 2);
     float M = -INFINITY;
-    for (int s = 0; s < nsp; ++s) M = fmaxf(M, pp[(size_t) s * (hd + 2)]);
+#pragma unroll 8
+    for (int s = 0; s < used; ++s) M = fmaxf(M, pp[(size_t) s * (hd + 2)]);
     float L = 0.0f, o = 0.0f;
-    for (int s = 0; s < nsp; ++s) {
+#pragma unroll 8
+    for (int s = 0; s < used; ++s) {
         const float* p = pp + (size_t) s * (hd + 2);
-        if (p[0] == -INFINITY) continue;
-        const float c = __expf(p[0] - M);
+        const float m = p[0];
+        const float c = m == -INFINITY ? 0.0f : __expf(m - M);
         L += p[1] * c;
         o += p[2 + d] * c;
     }
-    out[(size_t) h * hd + d] = L > 0.0f ? o / L : 0.0f;
+    const float v = L > 0.0f ? o / L : 0.0f;
+    out[(size_t) h * hd + d] = v;
+    if (oq) {   // (fused) q8_kernel's rounding of the row: a warp a block of 32 (blockDim = hd, a multiple of 32)
+        const float am = warp_max(fabsf(v));
+        const float s8 = am / 127.0f;
+        const size_t c = (size_t) h * hd + d;
+        oq[c] = (int8_t) (am > 0.0f ? __float2int_rn(v / s8) : 0);
+        if ((d & 31) == 0) od[c / 32] = s8;
+    }
 }
 
 // a warp a block of 32 values
@@ -567,15 +847,48 @@ void rel_logits(const float* r, const float* proj, const float* tau, float* rel,
 void kv_store(const float* k, const float* v, __half* K, __half* V, int slot, int kvw, cudaStream_t s) {
     kv_store_kernel<<<blocks(kvw, 256), 256, 0, s>>>(k, v, K + (size_t) slot * kvw, V + (size_t) slot * kvw, kvw);
 }
-size_t attn_scratch_floats(int H, int hd, int n_kv) {
-    const int nsp = (n_kv + kSplit - 1) / kSplit;
-    return (size_t) H * nsp * (hd + 2);
+void kv_store_dev(const float* k, const float* v, __half* K, __half* V, const int* dpos, int ring, int kvw,
+                  cudaStream_t s) {
+    kv_store_dev_kernel<<<blocks(kvw, 256), 256, 0, s>>>(k, v, K, V, dpos, ring, kvw);
 }
-void attn_decode(const float* q, const __half* K, const __half* V, int n_kv, int pos, int ring, const float* rel, int E,
-                 int H, int Hkv, int hd, float scale, float* out, float* scratch, cudaStream_t s) {
-    const int nsp = (n_kv + kSplit - 1) / kSplit, G = H / Hkv;
-    attn_decode_kernel<<<dim3(nsp, Hkv), 32 * G, 0, s>>>(q, K, V, n_kv, pos, ring, rel, E, H, Hkv, hd, scale, scratch);
-    attn_combine_kernel<<<H, hd, 0, s>>>(scratch, nsp, hd, out);
+void moe_tail(float* x, const float* cpu, const float* gpu, const float* so, const int* flags, float* state,
+              const float* kern, int n, int K, cudaStream_t s) {
+    moe_tail_kernel<<<blocks(n, 256), 256, 0, s>>>(x, cpu, gpu, so, flags, state, kern, n, K);
+}
+int attn_nsp(int ring, int rows) {
+    if (ring > 0) return (ring + kRingSplit - 1) / kRingSplit;
+    return std::max(128, (rows + kAttnMaxSplit - 1) / kAttnMaxSplit);
+}
+size_t attn_scratch_floats(int H, int hd, int nsp) { return (size_t) H * nsp * (hd + 2); }
+void attn_decode(const float* q, const __half* K, const __half* V, int rows, int pos, const int* dpos, int ring,
+                 const float* rel, int E, int H, int Hkv, int hd, float scale, float* out, float* scratch,
+                 cudaStream_t s, const AttnFuse* fz) {
+    const int nsp = attn_nsp(ring, rows), G = H / Hkv;
+    const int S_max = attn_split_keys(ring > 0 ? ring : rows, ring, nsp);
+    const int d_rel = fz && fz->rr ? fz->d_rel : 0;
+    const size_t smem = ((size_t) G * (hd + S_max) + (size_t) G * d_rel) * sizeof(float);
+    attn_decode_kernel<<<dim3(nsp, Hkv), kAttnThreads, smem, s>>>(
+        q, K, V, pos, dpos, ring, nsp, rel, E, H, Hkv, hd, scale, scratch, fz ? fz->qn : nullptr,
+        fz ? fz->tau : nullptr, fz ? fz->eps : 0.0f, fz ? fz->rr : nullptr, fz ? fz->proj : nullptr, d_rel);
+    attn_combine_kernel<<<H, hd, 0, s>>>(scratch, nsp, pos, dpos, ring, nsp, hd, out, fz ? fz->oq : nullptr,
+                                         fz ? fz->od : nullptr);
+}
+bool fused_ok(int n, int hd, int K, int d_rel) {
+    return n % 256 == 0 && n / 256 <= kPerT && hd % 32 == 0 && hd <= 256 && K <= 8 && d_rel <= 32;
+}
+void norm_q8(const float* x, const float* w, float eps, float* y, int8_t* q, float* d, int n, cudaStream_t s) {
+    norm_q8_kernel<<<1, 256, 0, s>>>(x, w, eps, y, q, d, n);
+}
+void conv_add(int mode, float* x, const float* in, const float* gpu, const float* so, const int* flags, float* state,
+              const float* kern, int K, int n, cudaStream_t s) {
+    if (mode == 1) conv_add_kernel<1><<<blocks(n, 256), 256, 0, s>>>(x, in, gpu, so, flags, state, kern, K, n);
+    else conv_add_kernel<2><<<blocks(n, 256), 256, 0, s>>>(x, in, gpu, so, flags, state, kern, K, n);
+}
+void kv_conv_store(const float* kk, const float* vv, float* st_k, float* st_v, const float* sc_k, const float* sc_v,
+                   int K, const float* k_norm, float eps, __half* Kc, __half* Vc, const int* dpos, int ring, int Hkv,
+                   int hd, cudaStream_t s) {
+    kv_conv_store_kernel<<<Hkv, 64, 0, s>>>(kk, vv, st_k, st_v, sc_k, sc_v, K, k_norm, eps, Kc, Vc, dpos, ring, hd,
+                                            Hkv * hd);
 }
 void q8(const float* x, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
     const int wpb = 8;

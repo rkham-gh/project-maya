@@ -75,45 +75,85 @@ int argmax(const float* l, int n) {
     return best;
 }
 
+// A token from the logits at the request's sampling.  The candidates are the finite logits (top_k of them when set);
+// their probabilities are softmax(logit / temperature) normalized over the candidates; min_p keeps those at least
+// min_p x the most likely one, top_p the most likely ones until their sum reaches it.  With neither (the card's
+// temperature 1, top_p 1) the token is drawn from the whole distribution in one pass, in id order - nothing sorted
+// (sorting the 200K ids took ~10 ms a token); otherwise only as many of the most likely ones are sorted as the cut
+// needs.  The same distribution either way.
 int sample(const float* logits, int V, const Sampling& sp, std::mt19937_64& rng) {
     if (sp.temperature <= 0.0f) return argmax(logits, V);
-    // the candidates: top_k of them (all when 0), most likely first
+    const double inv_t = 1.0 / sp.temperature;
+    const int mxi = argmax(logits, V);
+    const double mx = logits[mxi];
+    if (sp.top_k <= 0 && sp.top_p >= 1.0f && sp.min_p <= 0.0f) {
+        static thread_local std::vector<float> p;
+        p.resize((size_t) V);
+        const float fmx = (float) mx, fit = (float) inv_t;
+        for (int i = 0; i < V; ++i) p[(size_t) i] = std::exp((logits[i] - fmx) * fit);   // (-inf: 0)
+        double sum = 0.0;
+        for (int i = 0; i < V; ++i) sum += p[(size_t) i];
+        std::uniform_real_distribution<double> U(0.0, sum);
+        double u = U(rng);
+        int last = mxi;
+        for (int i = 0; i < V; ++i) {
+            if (!(p[(size_t) i] > 0.0f)) continue;
+            last = i;
+            u -= p[(size_t) i];
+            if (u <= 0.0) return i;
+        }
+        return last;
+    }
+    // the candidates, most likely first as far as the cuts look (ties: the lower id)
     std::vector<int> idx;
     idx.reserve((size_t) V);
     for (int i = 0; i < V; ++i)
         if (std::isfinite(logits[i])) idx.push_back(i);
-    const size_t k = sp.top_k > 0 ? std::min<size_t>((size_t) sp.top_k, idx.size()) : idx.size();
     auto by = [&](int a, int b) { return logits[a] > logits[b] || (logits[a] == logits[b] && a < b); };
-    if (k < idx.size()) {
-        std::partial_sort(idx.begin(), idx.begin() + (long) k, idx.end(), by);
-        idx.resize(k);
-    } else {
-        std::sort(idx.begin(), idx.end(), by);
+    if (sp.top_k > 0 && (size_t) sp.top_k < idx.size()) {
+        std::nth_element(idx.begin(), idx.begin() + sp.top_k, idx.end(), by);
+        idx.resize((size_t) sp.top_k);
     }
-    std::vector<double> p(idx.size());
-    const double mx = logits[idx[0]];
-    double sum = 0.0;
-    for (size_t i = 0; i < idx.size(); ++i) {
-        p[i] = std::exp(((double) logits[idx[i]] - mx) / sp.temperature);
-        sum += p[i];
-    }
-    for (auto& v : p) v /= sum;
-    size_t keep = p.size();
-    if (sp.min_p > 0.0f)
-        for (size_t i = 1; i < keep; ++i)
-            if (p[i] < sp.min_p * p[0]) {
-                keep = i;
-                break;
+    double sum = 0.0;   // (the candidates' total, for the normalization)
+    for (int i : idx) sum += std::exp(((double) logits[i] - mx) * inv_t);
+    const double pmin = sp.min_p > 0.0f ? (double) sp.min_p : 0.0;   // (relative to the most likely, whose p is 1 / sum)
+    size_t sorted = 0, keep = idx.size();
+    std::vector<double> p;
+    for (size_t m = std::min<size_t>(256, idx.size());; m = std::min(idx.size(), m * 8)) {
+        if (m > sorted) {
+            std::partial_sort(idx.begin() + (long) sorted, idx.begin() + (long) m, idx.end(), by);
+            sorted = m;
+        }
+        p.resize(sorted);
+        for (size_t i = 0; i < sorted; ++i) p[i] = std::exp(((double) logits[idx[i]] - mx) * inv_t) / sum;
+        keep = sorted;
+        bool cut = sorted == idx.size();
+        if (pmin > 0.0)
+            for (size_t i = 1; i < sorted; ++i)
+                if (p[i] < pmin * p[0]) {
+                    keep = i;
+                    cut = true;
+                    break;
+                }
+        if (sp.top_p < 1.0f) {
+            double c = 0.0;
+            for (size_t i = 0; i < keep; ++i) {
+                c += p[i];
+                if (c >= sp.top_p) {
+                    keep = i + 1;
+                    cut = true;
+                    break;
+                }
             }
-    if (sp.top_p < 1.0f) {
-        double c = 0.0;
-        for (size_t i = 0; i < keep; ++i) {
-            c += p[i];
-            if (c >= sp.top_p) {
-                keep = i + 1;
-                break;
+        } else if (pmin <= 0.0) {
+            cut = true;   // (top_k alone: all of them)
+            if (sorted < idx.size()) {
+                std::sort(idx.begin() + (long) sorted, idx.end(), by);
+                sorted = idx.size();
+                continue;
             }
         }
+        if (cut) break;
     }
     double tot = 0.0;
     for (size_t i = 0; i < keep; ++i) tot += p[i];

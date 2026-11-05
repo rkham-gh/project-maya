@@ -1,31 +1,42 @@
 // src/ink/ink_cpu.cpp - maya-ink's CPU lane (ink_cpu.hpp).
 #include "ink_cpu.hpp"
 
-#include "../ds4/ds4_gguf_cpu.hpp"
-
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#define INK_PAUSE() _mm_pause()
+#else
+#define INK_PAUSE() std::this_thread::yield()
+#endif
 
 namespace ink {
 
 namespace dg = strata::ds4::gguf;
 
-// Each run is a generation every worker takes part in once: run() returns when all of them are through with it, so a
-// worker can never carry one run's job counter or function into the next.
+// Each run is a generation every worker takes part in once: start() hands it out (its function and count written
+// before the generation's number goes up), join() returns when all of them are through with it, so a worker can never
+// carry one run's job counter or function into the next.  A worker waits for the next generation spinning (a token's
+// layers come every few hundred microseconds; a sleeping thread takes tens of them to wake on Windows), and sleeps on
+// the condition variable once none has come for INK_POOL_SPIN_US.
 struct Pool::Impl {
     std::vector<std::thread> th;
     int workers = 0;
     std::mutex mu;
-    std::condition_variable cv, done_cv;
+    std::condition_variable cv;
     const std::function<void(int)>* f = nullptr;
-    std::atomic<int> next{0};
-    int n = 0, finished = 0;
-    unsigned gen = 0;
-    bool quit = false;
+    int n = 0;
+    std::atomic<int> next{0}, active{0}, sleepers{0};
+    std::atomic<unsigned> gen{0};
+    std::atomic<bool> quit{false};
+    std::chrono::microseconds spin{3000};
 
     void work(const std::function<void(int)>* fn, int count) {
         for (;;) {
@@ -37,27 +48,36 @@ struct Pool::Impl {
     void loop() {
         unsigned seen = 0;
         for (;;) {
-            const std::function<void(int)>* fn;
-            int count;
-            {
-                std::unique_lock<std::mutex> lk(mu);
-                cv.wait(lk, [&] { return quit || gen != seen; });
-                if (quit) return;
-                seen = gen;
-                fn = f;
-                count = n;
+            unsigned g = gen.load(std::memory_order_acquire);
+            if (g == seen) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int k = 0; (g = gen.load(std::memory_order_acquire)) == seen;) {
+                    if (quit.load(std::memory_order_relaxed)) return;
+                    INK_PAUSE();
+                    if (++k == 64) {
+                        k = 0;
+                        if (std::chrono::steady_clock::now() - t0 > spin) break;
+                    }
+                }
+                if (g == seen) {
+                    std::unique_lock<std::mutex> lk(mu);
+                    sleepers.fetch_add(1, std::memory_order_seq_cst);
+                    cv.wait(lk, [&] { return quit.load() || gen.load(std::memory_order_seq_cst) != seen; });
+                    sleepers.fetch_sub(1, std::memory_order_relaxed);
+                    if (quit.load()) return;
+                    g = gen.load(std::memory_order_acquire);
+                }
             }
-            work(fn, count);
-            {
-                std::lock_guard<std::mutex> lk(mu);
-                if (++finished == workers) done_cv.notify_all();
-            }
+            seen = g;
+            work(f, n);
+            active.fetch_sub(1, std::memory_order_acq_rel);
         }
     }
 };
 
 Pool::Pool(int workers) : p(new Impl) {
     p->workers = std::max(0, workers);
+    if (const char* v = std::getenv("INK_POOL_SPIN_US")) p->spin = std::chrono::microseconds(std::max(0, std::atoi(v)));
     for (int i = 0; i < p->workers; ++i) p->th.emplace_back([this] { p->loop(); });
 }
 Pool::~Pool() {
@@ -71,20 +91,27 @@ Pool::~Pool() {
 }
 int Pool::threads() const { return (int) p->th.size() + 1; }
 
+void Pool::start(int n, const std::function<void(int)>* f) {
+    p->f = f;
+    p->n = n;
+    p->next.store(0, std::memory_order_relaxed);
+    p->active.store(p->workers, std::memory_order_relaxed);
+    p->gen.fetch_add(1, std::memory_order_seq_cst);
+    if (p->sleepers.load(std::memory_order_seq_cst) > 0) {
+        std::lock_guard<std::mutex> lk(p->mu);
+        p->cv.notify_all();
+    }
+}
+
+void Pool::join() {
+    p->work(p->f, p->n);
+    while (p->active.load(std::memory_order_acquire) > 0) INK_PAUSE();
+}
+
 void Pool::run(int n, const std::function<void(int)>& f) {
     if (n <= 0) return;
-    {
-        std::lock_guard<std::mutex> lk(p->mu);
-        p->f = &f;
-        p->n = n;
-        p->finished = 0;
-        p->next.store(0, std::memory_order_relaxed);
-        ++p->gen;
-    }
-    p->cv.notify_all();
-    p->work(&f, n);
-    std::unique_lock<std::mutex> lk(p->mu);
-    p->done_cv.wait(lk, [&] { return p->finished == p->workers; });
+    start(n, &f);
+    join();
 }
 
 bool cpu_layer(int tg, int tu, int td, int n_embd, int n_ff, CpuLayer& L, std::string& err) {
@@ -103,44 +130,61 @@ bool cpu_layer(int tg, int tu, int td, int n_embd, int n_ff, CpuLayer& L, std::s
     L.ab_g = a.act_bytes;
     L.ab_u = b.act_bytes;
     L.ab_d = a.h_bytes;
+    L.fmt = a;
     return true;
 }
 
-void cpu_experts(Pool& pool, const CpuLayer& L, int n_embd, int n_ff, const int* experts, const float* w, int n,
-                 const float* x, float* out) {
-    constexpr int kRowsGU = 128, kRowsD = 256, kMax = 16;
-    n = std::min(n, kMax);
-    std::fill(out, out + n_embd, 0.0f);
-    if (n == 0) return;
-    // (the caller's buffers, by pointer: a lambda's [&] does not capture a thread_local - each worker would use its own)
-    thread_local std::vector<uint8_t> ag_v, au_v, hq_v;
-    thread_local std::vector<float> h_v, o_v;
-    ag_v.resize(L.ab_g);
-    au_v.resize(L.ab_u);
-    const bool same = L.tg == L.tu && L.act_g == L.act_u;
-    h_v.resize((size_t) n * n_ff * (same ? 1 : 2));
-    o_v.resize((size_t) n * n_embd);
-    hq_v.resize((size_t) n * L.ab_d);
-    uint8_t *const ag = ag_v.data(), *const au = au_v.data(), *const hq = hq_v.data();
-    float *const h = h_v.data(), *const o = o_v.data();
-    dg::iq_cpu_quant(L.act_g, x, n_embd, ag);
-    if (!same) dg::iq_cpu_quant(L.act_u, x, n_embd, au);
-    dg::IqCpu f;
-    std::string err;
-    dg::iq_cpu_fmt(L.tg, L.td, n_embd, n_ff, f, err);
+namespace {
+constexpr int kRowsGU = 64, kRowsD = 128;
+}
 
-    // gate / up: (expert, row band) jobs
-    const int bands_gu = (n_ff + kRowsGU - 1) / kRowsGU;
-    const std::function<void(int)> gu = [&](int j) {
-        const int i = j / bands_gu, r0 = (j % bands_gu) * kRowsGU, r1 = std::min(n_ff, r0 + kRowsGU);
-        const size_t e = (size_t) experts[i];
-        float* hi = h + (size_t) i * n_ff;
-        const void* act = ag;
-        if (same) {
-            dg::iq_cpu_gate_up(f, L.gate + e * n_ff * L.rg, L.up + e * n_ff * L.ru, &act, 1, &hi, r0, r1, 0.0f);
+void CpuLane::begin(Pool& pool, const CpuLayer& L, int n_embd, int n_ff, const int* experts, const float* w, int n,
+                    const float* x, float* out) {
+    pool_ = &pool;
+    L_ = &L;
+    n_embd_ = n_embd;
+    n_ff_ = n_ff;
+    n_ = std::min(n, kMax);
+    out_ = out;
+    if (n_ <= 0) {
+        std::fill(out, out + n_embd, 0.0f);
+        pool_ = nullptr;
+        return;
+    }
+    for (int i = 0; i < n_; ++i) {
+        experts_[i] = experts[i];
+        w_[i] = w[i];
+        done_gu_[i].store(0, std::memory_order_relaxed);
+    }
+    ready_.store(0, std::memory_order_relaxed);
+    same_ = L.tg == L.tu && L.act_g == L.act_u;
+    ag_.resize(L.ab_g);
+    au_.resize(L.ab_u);
+    h_.resize((size_t) kMax * n_ff * 2);
+    o_.resize((size_t) kMax * n_embd);
+    hq_.resize((size_t) kMax * L.ab_d);
+    dg::iq_cpu_quant(L.act_g, x, n_embd, ag_.data());
+    if (!same_) dg::iq_cpu_quant(L.act_u, x, n_embd, au_.data());
+    bands_gu_ = (n_ff + kRowsGU - 1) / kRowsGU;
+    bands_d_ = (n_embd + kRowsD - 1) / kRowsD;
+    if (!fn_) fn_ = [this](int j) { job(j); };
+    pool.start(n_ * bands_gu_ + bands_d_, &fn_);
+}
+
+void CpuLane::job(int j) {
+    const CpuLayer& L = *L_;
+    const int n_ff = n_ff_, n_embd = n_embd_;
+    if (j < n_ * bands_gu_) {
+        // gate / up: rows [r0, r1) of expert i, silu(gate) * up into h_i
+        const int i = j / bands_gu_, r0 = (j % bands_gu_) * kRowsGU, r1 = std::min(n_ff, r0 + kRowsGU);
+        const size_t e = (size_t) experts_[i];
+        float* hi = h_.data() + (size_t) i * n_ff;
+        const void* act = ag_.data();
+        if (same_) {
+            dg::iq_cpu_gate_up(L.fmt, L.gate + e * n_ff * L.rg, L.up + e * n_ff * L.ru, &act, 1, &hi, r0, r1, 0.0f);
         } else {
-            float* ui = h + (size_t) (n + i) * n_ff;
-            const void* actu = au;
+            float* ui = h_.data() + (size_t) (kMax + i) * n_ff;
+            const void* actu = au_.data();
             dg::iq_cpu_rows(L.tg, L.gate + e * n_ff * L.rg, L.rg, n_embd, &act, 1, &hi, r0, r1);
             dg::iq_cpu_rows(L.tu, L.up + e * n_ff * L.ru, L.ru, n_embd, &actu, 1, &ui, r0, r1);
             for (int r = r0; r < r1; ++r) {
@@ -148,24 +192,33 @@ void cpu_experts(Pool& pool, const CpuLayer& L, int n_embd, int n_ff, const int*
                 hi[r] = g / (1.0f + std::exp(-g)) * ui[r];
             }
         }
-    };
-    pool.run(n * bands_gu, gu);
-    for (int i = 0; i < n; ++i) dg::iq_cpu_quant(L.act_d, h + (size_t) i * n_ff, n_ff, hq + (size_t) i * L.ab_d);
-
-    // down: (expert, row band) jobs
-    const int bands_d = (n_embd + kRowsD - 1) / kRowsD;
-    const std::function<void(int)> dn = [&](int j) {
-        const int i = j / bands_d, r0 = (j % bands_d) * kRowsD, r1 = std::min(n_embd, r0 + kRowsD);
-        const size_t e = (size_t) experts[i];
-        const void* act = hq + (size_t) i * L.ab_d;
-        float* oi = o + (size_t) i * n_embd;
-        dg::iq_cpu_rows(L.td, L.down + e * n_embd * L.rd, L.rd, n_ff, &act, 1, &oi, r0, r1);
-    };
-    pool.run(n * bands_d, dn);
-    for (int i = 0; i < n; ++i) {
-        const float* oi = o + (size_t) i * n_embd;
-        for (int c = 0; c < n_embd; ++c) out[c] += w[i] * oi[c];
+        // the expert's last band: its h as the down rows' activation
+        if (done_gu_[i].fetch_add(1, std::memory_order_acq_rel) == bands_gu_ - 1) {
+            dg::iq_cpu_quant(L.act_d, hi, n_ff, hq_.data() + (size_t) i * L.ab_d);
+            ready_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        return;
     }
+    // down: rows [r0, r1) of every expert (once all their activations are made), then their weighted sum there
+    const int b = j - n_ * bands_gu_, r0 = b * kRowsD, r1 = std::min(n_embd, r0 + kRowsD);
+    while (ready_.load(std::memory_order_acquire) < n_) INK_PAUSE();
+    for (int i = 0; i < n_; ++i) {
+        const size_t e = (size_t) experts_[i];
+        const void* act = hq_.data() + (size_t) i * L.ab_d;
+        float* oi = o_.data() + (size_t) i * n_embd;
+        dg::iq_cpu_rows(L.td, L.down + e * n_embd * L.rd, L.rd, n_ff, &act, 1, &oi, r0, r1);
+    }
+    for (int c = r0; c < r1; ++c) out_[c] = 0.0f;
+    for (int i = 0; i < n_; ++i) {
+        const float* oi = o_.data() + (size_t) i * n_embd;
+        for (int c = r0; c < r1; ++c) out_[c] += w_[i] * oi[c];
+    }
+}
+
+void CpuLane::end() {
+    if (!pool_) return;
+    pool_->join();
+    pool_ = nullptr;
 }
 
 }  // namespace ink

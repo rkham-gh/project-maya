@@ -31,14 +31,52 @@ void rel_logits(const float* r, const float* proj, const float* tau, float* rel,
                 cudaStream_t s);
 /// One token's k / v (F32, kvw = n_head_kv x head_dim) into the caches' row `slot` (F16).
 void kv_store(const float* k, const float* v, __half* K, __half* V, int slot, int kvw, cudaStream_t s);
+/// The same at the row of the position read on the device: *dpos % ring (ring > 0), else *dpos.
+void kv_store_dev(const float* k, const float* v, __half* K, __half* V, const int* dpos, int ring, int kvw,
+                  cudaStream_t s);
+/// A MoE layer's end, n channels: fo = (flags[0] ? cpu (+ gpu when flags[1]) : gpu) + so[0 .. n) + so[n .. 2n), then
+/// the FFN's short convolution of fo (shortconv's arithmetic, state / kern as there) and x += it.
+void moe_tail(float* x, const float* cpu, const float* gpu, const float* so, const int* flags, float* state,
+              const float* kern, int n, int K, cudaStream_t s);
 
-/// One query position's attention (decode): q [H][hd] (normed, tau'd), keys / values in F16 rows of [Hkv][hd],
-/// n_kv of them; key j's distance to the query is dist(j) = (pos - slot_pos(j)), where slot j holds position
+/// One query position's attention (decode): q [H][hd] (normed, tau'd), keys / values in F16 rows of [Hkv][hd], the
+/// first n_kv of the cache's `rows` (ring == 0: pos + 1, ring > 0: min(pos + 1, ring)); key j's distance to the query is
+/// dist(j) = (pos - slot_pos(j)), where slot j holds position
 ///   ring == 0: j (a full cache, positions 0 .. pos);  ring > 0: pos - ((pos - j) mod ring) (a ring of ring rows).
-/// rel [H][E] (the query's band; distance >= E: no bias).  out [H][hd].  scratch: attn_scratch_floats(H, hd, n_kv).
-void attn_decode(const float* q, const __half* K, const __half* V, int n_kv, int pos, int ring, const float* rel, int E,
-                 int H, int Hkv, int hd, float scale, float* out, float* scratch, cudaStream_t s);
-size_t attn_scratch_floats(int H, int hd, int n_kv);
+/// rel [H][E] (the query's band; distance >= E: no bias).  out [H][hd].  scratch: attn_scratch_floats(H, hd,
+/// attn_nsp(ring, rows)).  dpos (when set): pos read on the device instead (the launches the same at every position).
+/// (fused, with the fields set) q's head norm done by the attention (qn: the weights, times *tau when set), the bias
+/// band computed from rr [H][d_rel] and proj [d_rel][E] (times *tau when set) instead of read from rel, and the
+/// output's int8 rows (oq, od: q8's) made by the combine - head_norm, rel_logits and q8 not launched, the same bits.
+struct AttnFuse {
+    const float* qn = nullptr;
+    const float* tau = nullptr;
+    float eps = 0.0f;
+    const float* rr = nullptr;
+    const float* proj = nullptr;
+    int d_rel = 0;
+    int8_t* oq = nullptr;
+    float* od = nullptr;
+};
+void attn_decode(const float* q, const __half* K, const __half* V, int rows, int pos, const int* dpos, int ring,
+                 const float* rel, int E, int H, int Hkv, int hd, float scale, float* out, float* scratch,
+                 cudaStream_t s, const AttnFuse* fz = nullptr);
+/// Whether the fused token kernels take this shape (n channels a row, head_dim, conv width, d_rel).
+bool fused_ok(int n, int hd, int K, int d_rel);
+/// y = rmsnorm(x) * w (y may be null) and its int8 rows (q, d: q8's), one block for the row of n channels: rmsnorm's
+/// arithmetic in its order, then q8's, the same bits as the two.
+void norm_q8(const float* x, const float* w, float eps, float* y, int8_t* q, float* d, int n, cudaStream_t s);
+/// mode 1: x += shortconv(in) (shortconv + add); mode 2: x += shortconv(moe_tail's sum of cpu / gpu / so by flags)
+/// (moe_tail); a thread a channel, the same bits as those.
+void conv_add(int mode, float* x, const float* in, const float* gpu, const float* so, const int* flags, float* state,
+              const float* kern, int K, int n, cudaStream_t s);
+/// A token's k and v: their short convolutions, k's head norm (k_norm), both into the caches' row at the position on
+/// the device (kv_store_dev's) - shortconv x 2 + head_norm + kv_store_dev, the same bits.
+void kv_conv_store(const float* kk, const float* vv, float* st_k, float* st_v, const float* sc_k, const float* sc_v,
+                   int K, const float* k_norm, float eps, __half* Kc, __half* Vc, const int* dpos, int ring, int Hkv,
+                   int hd, cudaStream_t s);
+int attn_nsp(int ring, int rows);
+size_t attn_scratch_floats(int H, int hd, int nsp);
 
 /// int8 rows with an F32 scale per 32 values (ds4_iq.cuh's MvJob / Args inputs): d = max|x| / 127, q = rint(x / d).
 void q8(const float* x, int rows, int k, int8_t* q, float* d, cudaStream_t s);
