@@ -916,6 +916,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     endif()
   endif()
 
+  # Ling-3.1-flash (inclusionAI; llama.cpp's "bailingmoe3" GGUF): its own engine (src/ling) - the KDA and gated MLA
+  # attention, the dense layers, the shared experts and the output head on one NVIDIA GPU, a token's routed experts in
+  # a VRAM cache or on the CPU lane, a prompt's streamed to the GPU in chunks (cuBLAS) - with maya-ds4's GGUF block-type
+  # kernels on the device and its CPU rows (ggml-cpu's dots).  CUDA only.  (maya-ink's structure: src/ink in the
+  # inkling branch.)
+  if(STRATA_ENABLE_CUDA)
+    add_executable(maya-ling src/ling/ling_main.cpp src/ling/ling_model.cu src/ling/ling_kernels.cu src/ling/ling_cpu.cpp
+                             src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
+    target_include_directories(maya-ling PRIVATE ${_strata_gpu_include_directories} include src/ling third_party/ggml)
+    target_link_libraries(maya-ling PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    target_compile_definitions(maya-ling PRIVATE MAYA_DS4_IQ_ONLY)
+  endif()
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)

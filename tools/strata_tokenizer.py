@@ -110,6 +110,22 @@ MINIMAX_PATTERN = (
     r"|\s+"
 )
 
+# The `bailingmoe2` pre-tokenizer (inclusionAI's Ling-2 / Ling-3: llama.cpp's LLAMA_VOCAB_PRE_TYPE_BAILINGMOE, which
+# reads `bailingmoe`, `bailingmoe2` and `llada-moe`), transcribed from llama-vocab.cpp: the tokenizer.json original has
+# possessive `?+` / `++` that llama.cpp spells greedy - the same splits either way, since neither class can give back a
+# character the pattern after it would take.  Single digits (`\p{N}`, not runs), one newline in `\s*[\r\n]`.  The GGUF
+# also names an NFC normalizer (tokenizer.ggml.normalizer.nfc, Hugging Face's tokenizer.json): applied to each plain
+# segment, as for MiniMax.
+BAILING_PATTERN = (
+    r"'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])"
+    r"|[^\r\n\p{L}\p{N}]?\p{L}+"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 class _IsolatedSplits:
     """findall() over a sequence of "Isolated" splits (see DEEPSEEK3_PATTERNS)."""
 
@@ -141,9 +157,9 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax"
-                             % pre)
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "bailingmoe2"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
+                             "bailingmoe2" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -165,8 +181,9 @@ class Tokenizer:
             self.ranks[(parts[0], parts[1])] = i
         self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre == "deepseek3" else
                     regex.compile(MINIMAX_PATTERN) if pre == "minimax" else
+                    regex.compile(BAILING_PATTERN) if pre == "bailingmoe2" else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
-        self._nfc = pre == "minimax"
+        self._nfc = pre in ("minimax", "bailingmoe2")
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
