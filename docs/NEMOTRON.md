@@ -58,7 +58,30 @@ through the token path alone (the other a near tie, 0.015 apart in llama.cpp); l
 within 0.067. The CUDA graphs give the same bits.
 
 Through the server (`nem-chat-test.py`): an answer with its thinking apart, thinking off, a tool call, the answer from
-the tool's result, streaming and JSON output - 6 of 6.
+the tool's result, streaming and JSON output - 6 of 6. `derail.py`: 0 of 20 rounds derailed.
+
+Speed, on a quiet machine, with `ab.py` (temperature 0, thinking off; six new prompts of 400 tokens, then a 34.2K-token
+prompt, then one prompt three times), at 256K context; maya-nem's runs each started from the same expert profile
+(`nem-ab.ps1`: the scores after the chat checks from an empty start), 4 runs of the defaults:
+
+| | llama.cpp, `-ngl 99 --cpu-moe` | llama.cpp's own fit, `-ub 2048 -b 2048` | maya-nem |
+|---|---|---|---|
+| Writing, new prompts | 11.2 tok/s | 13.0 tok/s | **26.6 tok/s** |
+| Writing after the 34.2K prompt | 11.4 tok/s | 13.5 tok/s | **21.6 tok/s** |
+| Reading the 34.2K prompt | 107 tok/s | 474 tok/s | **1,609 tok/s** with `--chunk 16384` (1,130 with 8,192) |
+| Its first token | 319 s | 72 s | **21 s** (30 s) |
+| The repeated prompt, 1st -> 3rd | 11.4 -> 11.4 | 13.5 -> 13.5 | 24.0 -> 29.6 tok/s |
+| VRAM | 12.2 GB | 30.3 GB | 29.9 GB |
+
+- The cache settings: maya-ink's tuned ones (0.99 / 16 swaps / every 2 / margin 1.5) against its earlier ones (0.998 / 4
+  / 8 / 1.25), 2 runs each, alternated: new prompts 26.6 against 22.1 tok/s, the repeated prompt's third answer 29.6
+  against 22.9, after the long prompt the same (21.5 against 21.5).
+- 16K chunks read the long prompt 42% faster (each expert crosses PCIe once for twice the tokens) and write at the
+  same speed (26.4 tok/s on new prompts): the prompt path's buffers are lent to the expert cache between prompts.
+- With llama.cpp's fit, `-ngl` must stay unset: given `-ngl 99` without `--cpu-moe`, it put the whole model "on" the
+  GPU, 32.0 GB of VRAM with the rest spilled to shared memory, and wrote 3.0 tok/s.
+- About 80% of a token is the CPU lane's share of the experts, read at the RAM's speed (~40 GB/s); the CUDA graphs
+  gained ~5%. More writing speed needs more of the experts in VRAM.
 
 ## The server
 
@@ -76,7 +99,7 @@ A run config (`--engine maya --config ...`):
 ```json
 {
   "exe": "<worktree>\\build-nem\\maya-nem.exe",
-  "args": ["--gguf", "<...-00001-of-00003.gguf>", "--max-context", "262144", "--profile", "<pack dir>\\expert-profile.bin"],
+  "args": ["--gguf", "<...-00001-of-00003.gguf>", "--max-context", "262144", "--chunk", "16384", "--profile", "<pack dir>\\expert-profile.bin"],
   "tokenizer": "<pack dir>\\tokenizer",
   "model_name": "nemotron-3.5-super",
   "gpu": [0],

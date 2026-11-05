@@ -243,6 +243,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: maya-nem --gguf <first shard> (--serve | --ids @file [--gen N])\n");
         return 2;
     }
+    // (for A/B runs through a fixed run config: NEM_CHUNK and NEM_THREADS override --chunk and --threads)
+    if (const char* v = std::getenv("NEM_CHUNK")) opt.chunk = std::max(64, std::atoi(v));
+    if (const char* v = std::getenv("NEM_THREADS")) opt.threads = std::max(1, std::atoi(v));
     nem::Engine eng;
     std::string err;
     if (!eng.load(opt, err)) {
