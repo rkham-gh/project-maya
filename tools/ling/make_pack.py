@@ -24,7 +24,7 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="the pack directory (tokenizer/ goes inside)")
     a = ap.parse_args()
     tok = pathlib.Path(a.out) / "tokenizer"
-    cfg = ST.extract(a.gguf, tok)
+    cfg = ST.extract(a.gguf, a.out)   # (it writes <out>/tokenizer/)
     if cfg["pre"] != "bailingmoe2":
         raise SystemExit(f"{a.gguf}: pre-tokenizer {cfg['pre']!r}, not Ling's 'bailingmoe2'")
     meta = json.loads((tok / "tokenizer.json").read_text(encoding="utf-8"))
