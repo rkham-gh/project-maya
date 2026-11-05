@@ -1857,16 +1857,20 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
         // the chunk's rows gathered from the mapping into the pinned staging (or one by one without it), then the
         // rows read in order
         const size_t rb = embd.rb;
-        if (stg.on && (size_t) T * rb <= stg.cap) {
-            CK(cudaEventSynchronize(stg.ev[stg.k]));
-            uint8_t* pin = stg.pin[stg.k];
-            pool->run((T + 255) / 256, [&](int j) {
-                for (int t = j * 256; t < std::min(T, j * 256 + 256); ++t)
-                    std::memcpy(pin + (size_t) t * rb, embd.w + (size_t) ids[t] * rb, rb);
-            });
-            CK(cudaMemcpyAsync(pf.Erows, pin, (size_t) T * rb, cudaMemcpyHostToDevice, s));
-            CK(cudaEventRecord(stg.ev[stg.k], s));
-            stg.k ^= 1;
+        if (stg.on && stg.cap >= rb) {
+            const int per = (int) std::min<size_t>((size_t) T, stg.cap / rb);   // (the rows a staging buffer holds)
+            for (int t0 = 0; t0 < T; t0 += per) {
+                const int n = std::min(per, T - t0);
+                CK(cudaEventSynchronize(stg.ev[stg.k]));
+                uint8_t* pin = stg.pin[stg.k];
+                pool->run((n + 255) / 256, [&](int j) {
+                    for (int t = j * 256; t < std::min(n, j * 256 + 256); ++t)
+                        std::memcpy(pin + (size_t) t * rb, embd.w + (size_t) ids[t0 + t] * rb, rb);
+                });
+                CK(cudaMemcpyAsync(pf.Erows + (size_t) t0 * rb, pin, (size_t) n * rb, cudaMemcpyHostToDevice, s));
+                CK(cudaEventRecord(stg.ev[stg.k], s));
+                stg.k ^= 1;
+            }
         } else {
             for (int t = 0; t < T; ++t)
                 CK(cudaMemcpyAsync(pf.Erows + (size_t) t * rb, embd.w + (size_t) ids[t] * rb, rb,
