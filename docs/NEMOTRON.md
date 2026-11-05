@@ -85,6 +85,32 @@ prompt, then one prompt three times), at 256K context; maya-nem's runs each star
 - About 80% of a token is the CPU lane's share of the experts, read at the RAM's speed (~40 GB/s); the CUDA graphs
   gained ~5%. More writing speed needs more of the experts in VRAM.
 
+Unsloth's UD-Q3_K_XL (65.8 GB; 2026-11-05) is mostly 4-bit IQ formats despite the name. Its routed experts are IQ4_NL
+28.5 GB, IQ4_XS 15.7, IQ3_XXS 8.1, IQ2_XS 1.6 and Q2_0 1.6: 55.6 GB against Q4's 75.8. Q2_0 is ggml's type 42, blocks of
+64 with 2-bit codes, value (q - 1) d, the 2-bit fallback for the down rows of 2688. src/ds4/ds4_iq now has it in the
+GEMVs, FP16 rows and decode_values; the CPU lane reads it through ggml-cpu's dot, which has no x86 SIMD version.
+Measured the same way, 3 runs:
+
+| UD-Q3_K_XL, 16K chunks | maya-nem |
+|---|---|
+| Writing, new prompts | **37.7 tok/s** (37.7 / 37.6 / 37.7), +43% |
+| Writing after the 34.2K prompt | **30.6 tok/s** (30.9 / 30.7 / 30.3), +41% |
+| Reading the 34.2K prompt | **1,981 tok/s**, +23% |
+| Its first token | 17.3 s |
+| The repeated prompt, 1st -> 3rd | 35.0 -> 41.1 tok/s |
+| VRAM | 29.9 GB: 6,555 expert slots + 1,283 in the prompt path's buffers + 688 in K / V rows (8,526 against Q4's 6,119) |
+
+- Against llama.cpp on the same file (`nem-ref.py --ref q3`): the top token is the same at 86 of 88 positions. The
+  other two are near ties: at each, two tokens were around -0.66 to -0.81, and the order flipped. llama.cpp's token's
+  log-probability is within 0.141.
+- Against Q4 (`test-results\2026-11-04-nemotron\q3-agree.py`): Q3 was fed Q4's greedy continuations of 3 prompts. Its
+  top token was Q4's at 949 of 976 positions (97.2%). Q4's token's log-probability was 0.026-0.030 apart on average,
+  and 1.07 at worst.
+- The chat checks passed 6 of 6, and `derail.py` found 0 of 20 rounds derailed. The text was the same on all 3 runs.
+- Q4 is unchanged by the Q2_0 build. With the earlier cache settings (`NEM_CACHE_DECAY=0.998`, `_EVERY=8`,
+  `_SWAPS=4`, `_MARGIN=1.25`), it gives the earlier build's log-probabilities bit for bit. With the current settings
+  it differs slightly at the token path's positions, as the cache settings change which experts run on the GPU.
+
 ## The server
 
 - `serve/frontend.py` knows the template by its `medium_effort`: the server's `low` / `medium` (and `minimal`) turn it
