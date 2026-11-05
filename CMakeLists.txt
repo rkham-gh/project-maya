@@ -916,6 +916,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     endif()
   endif()
 
+  # Inkling-Small (Thinking Machines; llama.cpp's "inkling" GGUF, ggml-org/llama.cpp#25731): its own engine (src/ink) -
+  # the attention, the dense layers, the shared experts and the output head on one NVIDIA GPU, a token's routed experts
+  # on the CPU lane, a prompt's streamed to the GPU in chunks (cuBLAS) - with maya-ds4's GGUF block-type kernels on the
+  # device and its CPU rows (ggml-cpu's dots).  CUDA only.
+  if(STRATA_ENABLE_CUDA)
+    add_executable(maya-ink src/ink/ink_main.cpp src/ink/ink_model.cu src/ink/ink_kernels.cu src/ink/ink_cpu.cpp
+                            src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
+    target_include_directories(maya-ink PRIVATE ${_strata_gpu_include_directories} include src/ink third_party/ggml)
+    target_link_libraries(maya-ink PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    target_compile_definitions(maya-ink PRIVATE MAYA_DS4_IQ_ONLY)
+  endif()
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)

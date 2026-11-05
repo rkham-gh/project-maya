@@ -59,6 +59,11 @@ class ChatTemplate:
         # MiniMax-M3.1 (tools/mm3/chat_template.jinja: MiniMax's own plus thinking_mode "disabled"): reasoning_effort
         # low .. max; <mm:think> reasoning and ]<]minimax[>[-tagged tool calls (OutputParser(minimax=True) reads them)
         self.minimax = MINIMAX_NS in self.source
+        # Inkling-Small (Thinking Machines): typed content blocks - <|content_thinking|> / <|content_text|> /
+        # <|content_invoke_tool_json|> between <|message_model|> and <|end_message|> (OutputParser(inkling=True) reads
+        # them); reasoning_effort none / minimal / low / medium / high / xhigh / max or a number in [0, 0.99], the
+        # template's default high (0.9)
+        self.inkling = INK_THINK in self.source
         # CYBER-FROST-3.8-PS (a Qwen3.8 template that sets enable_thinking = true itself): it opens <think> whatever it
         # is told.  Thinking off (a client's, or a forced tool call's) closes the block the way its Qwen base's template
         # writes thinking off - <think>\n\n</think>\n\n - so the prompt and the server's parser agree
@@ -114,6 +119,18 @@ class ChatTemplate:
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
+        if self.inkling:
+            # its own words for the levels, a client's OpenAI ones included (Qwen's "xhigh" too); thinking off is "none"
+            off = kwargs.pop("enable_thinking", None) is False
+            level = name or kwargs.pop("reasoning_effort", None)
+            kwargs.pop("reasoning_effort", None)
+            if off:
+                kwargs["reasoning_effort"] = "none"
+            elif isinstance(level, (int, float)) and not isinstance(level, bool) or level in INK_EFFORTS:
+                kwargs["reasoning_effort"] = level
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
+            return self.template.render(messages=ink_tool_names(messages), tools=tools,
+                                        add_generation_prompt=add_generation_prompt, **kwargs)
         off = False
         if self.glm_effort:
             off = kwargs.pop("enable_thinking", True) is False
@@ -134,6 +151,27 @@ class ChatTemplate:
                 out.endswith("<think>\n"):
             out += "\n</think>\n\n"
         return out
+
+
+def ink_tool_names(messages: list[dict]) -> list[dict]:
+    """Inkling's template writes each tool result as its tool's own message (<|message_tool|>NAME<|content_text|>..):
+    a result without a name gets its call's - by the call's id, else by its place among the calls before it (the
+    server's messages keep neither the ids nor the names, openai_to_messages)."""
+    out, calls, k = [], [], 0
+    for m in messages:
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            calls = [((c.get("function") or {}).get("name"), c.get("id")) for c in m["tool_calls"]]
+            k = 0
+        elif m.get("role") == "tool":
+            if not m.get("name"):
+                name = next((n for n, i in calls if i and i == m.get("tool_call_id")), None)
+                if name is None and k < len(calls):
+                    name = calls[k][0]
+                if isinstance(name, str) and name:
+                    m = {**m, "name": name}
+            k += 1
+        out.append(m)
+    return out
 
 
 # ------------------------------------------------------------------------------------------------ requests
@@ -984,6 +1022,10 @@ class DsmlRewriter:
 MINIMAX_NS = "]<]minimax[>["
 MM_THINK, MM_THINK_END = "<mm:think>", "</mm:think>"
 THINK_AGAIN = "\x00think\x00"   # MinimaxRewriter -> OutputParser: a reasoning block opens (never in model text)
+# Inkling-Small's block markers (special tokens; llama.cpp's common/parsers/inkling.cpp, ggml-org/llama.cpp#25731)
+INK_MODEL, INK_THINK, INK_TEXT = "<|message_model|>", "<|content_thinking|>", "<|content_text|>"
+INK_END, INK_TOOL, INK_STOP = "<|end_message|>", "<|content_invoke_tool_json|>", "<|content_model_end_sampling|>"
+INK_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def may_be_string(schema, defs: dict | None = None, seen: frozenset = frozenset()) -> bool:
@@ -1184,13 +1226,135 @@ class MinimaxRewriter:
         return {n: v for n, v in items}
 
 
+class InklingRewriter:
+    """Inkling-Small's typed content blocks rewritten, as they stream, into what OutputParser reads (as DeepSeek's and
+    MiniMax's: GLM's tool-call form with JSON values).  A turn is blocks, each opened by <|message_model|> (the
+    template's generation prompt opens the first): <|content_thinking|> ... <|end_message|> is reasoning (THINK_AGAIN,
+    then </think>); <|content_text|> ... <|end_message|> answer text; a tool call is the tool's name echoed,
+    <|content_invoke_tool_json|>, {"name": N, "args": {...}} and <|end_message|> - written out once its JSON is whole
+    as <tool_call>N<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>, V JSON.  <|content_model_end_sampling|>
+    ends the turn.  Text after <|message_model|> with no type marker is held until the next marker tells what it is:
+    a call's name echo (dropped) or answer text (llama.cpp's reading of it, common/parsers/inkling.cpp)."""
+
+    MARKS = (INK_MODEL, INK_THINK, INK_TEXT, INK_END, INK_TOOL, INK_STOP)
+
+    def __init__(self, thinking: bool = True):
+        self.buf = ""
+        self.block = "open"        # open (kind not known yet), think, text, tool, done
+        self.held = ""             # (open) text not known yet as answer text or a call's name echo
+        self.json = ""             # (tool) the call's JSON so far
+        self.reasoning = thinking  # the parser is in its reasoning state (OutputParser(thinking=...) starts there)
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while self.buf:
+            hits = [i for i in (self.buf.find(m) for m in self.MARKS) if i >= 0]
+            if not hits:
+                keep = max((n for m in self.MARKS for n in range(1, len(m)) if self.buf.endswith(m[:n])), default=0)
+                out.append(self._plain(self.buf[:len(self.buf) - keep]))
+                self.buf = self.buf[len(self.buf) - keep:]
+                break
+            i = min(hits)
+            if i:
+                out.append(self._plain(self.buf[:i]))
+                self.buf = self.buf[i:]
+            mark = next(m for m in self.MARKS if self.buf.startswith(m))
+            self.buf = self.buf[len(mark):]
+            out.append(self._mark(mark))
+        return "".join(out)
+
+    def finish(self) -> str:
+        rest, self.buf = self.buf, ""
+        return self._plain(rest) + self._close()
+
+    def _content(self) -> str:   # what puts the parser into its answer state
+        if self.reasoning:
+            self.reasoning = False
+            return "</think>"
+        return ""
+
+    def _plain(self, s: str) -> str:
+        if not s or self.block == "done":
+            return ""
+        if self.block == "open":
+            self.held += s
+            return ""
+        if self.block == "tool":
+            self.json += s
+            return ""
+        return s   # think: reasoning text; text: answer text
+
+    def _close(self) -> str:
+        """The open block ends: its </think>, its held text as answer text, or its call."""
+        out = ""
+        if self.block == "think":
+            out = self._content()
+        elif self.block == "open" and self.held.strip():
+            out = self._content() + self.held
+        elif self.block == "tool":
+            out = self._call()
+        self.block, self.held, self.json = "open", "", ""
+        return out
+
+    def _call(self) -> str:
+        try:
+            call = json.loads(self.json)
+        except ValueError:
+            call = None
+        out = self._content()
+        if not isinstance(call, dict) or not isinstance(call.get("name"), str):
+            return out + INK_TOOL + self.json   # (not a call: shown as it came, the parser keeps it as text)
+        args = call.get("args", call.get("arguments", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = {"value": args}
+        parts = [f"<tool_call>{call['name']}"]
+        for k, v in (args.items() if isinstance(args, dict) else ()):
+            parts.append(f"<arg_key>{k}</arg_key><arg_value>"
+                         f"{json.dumps(v, ensure_ascii=False).replace('<', chr(92) + 'u003c')}</arg_value>")
+        parts.append("</tool_call>")
+        return out + "".join(parts)
+
+    def _mark(self, m: str) -> str:
+        if self.block == "done":
+            return ""
+        if m == INK_STOP:
+            out = self._close()
+            self.block = "done"
+            return out
+        if m == INK_END:
+            return self._close()
+        if m == INK_MODEL:
+            return self._close()
+        if m == INK_THINK:
+            out = self._close()
+            self.block = "think"
+            if self.reasoning:
+                return out
+            self.reasoning = True
+            return out + THINK_AGAIN
+        if m == INK_TEXT:
+            out = self._close() if self.block != "open" else ""
+            self.held = ""   # (a text block's opener: what was held before it was whitespace or a name never used)
+            self.block = "text"
+            return out + self._content()
+        # INK_TOOL: what was held is the call's name echo
+        out = self._close() if self.block not in ("open",) else ""
+        self.held = ""
+        self.block, self.json = "tool", ""
+        return out
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
-                 token_only_end: bool = False):
+                 token_only_end: bool = False, inkling: bool = False):
         self.state = "reasoning" if thinking else "content"
         # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
         # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
@@ -1200,11 +1364,13 @@ class OutputParser:
         self.token_only_end = token_only_end
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
-        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
+        # Inkling-Small's typed blocks the same way (InklingRewriter)
+        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else \
+            InklingRewriter(thinking) if inkling else None
         self.buf = ""
         self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
-        self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
+        self.schemas = {} if dsml or minimax or inkling else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees

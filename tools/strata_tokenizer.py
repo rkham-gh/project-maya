@@ -141,9 +141,9 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax"
-                             % pre)
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "inkling"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
+                             "inkling" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -163,8 +163,10 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
+        # (Inkling-Small's `inkling`: the same o200k split with \p{M} in its letter classes - llama.cpp's
+        #  LLAMA_VOCAB_PRE_TYPE_INKLING, ggml-org/llama.cpp#25731 - and no normalizer: MiniMax's regex without its NFC)
         self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre == "deepseek3" else
-                    regex.compile(MINIMAX_PATTERN) if pre == "minimax" else
+                    regex.compile(MINIMAX_PATTERN) if pre in ("minimax", "inkling") else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
         self._nfc = pre == "minimax"
 

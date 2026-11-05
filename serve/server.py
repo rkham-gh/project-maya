@@ -57,7 +57,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
-from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
+from serve.frontend import (CALL_END, CALL_START, INK_TOOL, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
                             EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
                             deepseek_images,
                             effort_kwargs,
@@ -2377,7 +2377,10 @@ class Service:
                             # DeepSeek-V4.1 ends a turn with its EOS (and would start the next with <｜User｜>)
                             _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>") +
                             # MiniMax-M3.1 with [e~[ (and would start the next turn with ]~b])
-                            _special_ids("[e~[") + _special_ids("]~b]"))
+                            _special_ids("[e~[") + _special_ids("]~b]") +
+                            # Inkling-Small with <|content_model_end_sampling|> (the next turn: its role's opener)
+                            _special_ids("<|content_model_end_sampling|>") + _special_ids("<|message_user|>") +
+                            _special_ids("<|message_system|>") + _special_ids("<|message_tool|>"))
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
@@ -2390,7 +2393,10 @@ class Service:
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
-        end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else _special_ids("</think>")
+        # (Inkling-Small: its reasoning is a block that <|end_message|> closes, as it closes every other block - no
+        # token of its own ends the thinking, so it has no thinking budget)
+        end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else \
+            [] if getattr(template, "inkling", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
         # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
         # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the
@@ -3415,6 +3421,10 @@ class Service:
                 prefill = "\n\n<｜DSML｜ calls>\n" + (f'<｜DSML｜ invoke name="{force}">\n' if force else "")
             elif getattr(self.template, "minimax", False):
                 prefill = MINIMAX_NS + "<tool_call>\n" + (MINIMAX_NS + f'<invoke name="{force}">' if force else "")
+            elif getattr(self.template, "inkling", False):
+                # Inkling's call opens with the tool's name: "required" (no name) has no opening to write
+                prefill = (force + INK_TOOL + '{"name":' + json.dumps(force, ensure_ascii=False) + ',"args":'
+                           if force else "")
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
@@ -4013,6 +4023,7 @@ class Service:
                                 stream_tools=True, dsml=getattr(self.template, "deepseek", False),
                                 token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
                                 minimax=getattr(self.template, "minimax", False),
+                                inkling=getattr(self.template, "inkling", False),
                                 strict_tools=responses, single_tool=single_tool)
         parser = new_parser()
         # calls the loop guard blocks in this answer (prepare, _block_suffixes): {(name, args): (ToolRepeat, ids)}.
@@ -5645,7 +5656,8 @@ def make_handler(svc: Service):
                 # the run config's recommended settings: the web app's Chat defaults until its user picks their own
                 rec = {k: v for k, v in svc.sampling_defaults.items() if k in ("temperature", "top_p", "top_k", "min_p")}
                 if svc.default_effort:   # (MiniMax's by its own five names, CYBER-FROST's by Qwen's three)
-                    rec["reasoning_effort"] = (effort_name if getattr(svc.template, "minimax", False) else effort_level)(
+                    rec["reasoning_effort"] = (effort_name if getattr(svc.template, "minimax", False) or
+                                               getattr(svc.template, "inkling", False) else effort_level)(
                         svc.default_effort) or svc.default_effort
                     if getattr(svc.template, "forced_thinking", False):
                         rec["reasoning_effort"] = QWEN_EFFORT.get(rec["reasoning_effort"], rec["reasoning_effort"])
@@ -6818,7 +6830,7 @@ def main() -> int:
     if cfg.get("reasoning_effort") or (svc.template.deepseek and cfg.get("reasoning_effort") is not None):
         svc.default_effort = cfg["reasoning_effort"]    # (checked before the load: checked_config_effort)
         # (#363: DeepSeek's 1..100 budget is a level of its own - it was shown as "none")
-        level = (effort_name if svc.template.minimax else effort_level)(svc.default_effort) or \
+        level = (effort_name if svc.template.minimax or svc.template.inkling else effort_level)(svc.default_effort) or \
             (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
                                                      else "none")
         if getattr(svc.template, "forced_thinking", False):   # (CYBER-FROST: Qwen's words, low / medium / xhigh)
