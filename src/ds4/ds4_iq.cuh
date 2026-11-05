@@ -28,6 +28,10 @@ constexpr int kQ8_0 = 8, kQ6_K = 14;
 // Q5_0 (a block of 32: d, the values' 5th bits as a u32, then IQ4_NL's nibbles; value = q - 16): the GEMVs, FP16 rows
 // and decode_values as the dense types (maya-nem: Nemotron's latent experts' down rows of 2688 take it in UD-Q4_K_XL)
 constexpr int kQ5_0 = 6;
+// Q2_0 (a block of 64: d, then 16 bytes of 2-bit codes, value j in bits 2 (j % 4) of byte j / 4, value (q - 1) d -
+// ggml's dequantize_row_q2_0): the GEMVs, FP16 rows and decode_values as the dense types (maya-nem: Nemotron's
+// UD-Q3_K_XL takes it for some layers' latent experts)
+constexpr int kQ2_0 = 42;
 
 /// The routed experts' activation between gate / up and down (Args::act, SetArgs::act):
 ///   kActSwiglu  DeepSeek's clamped SwiGLU: g = min(g, limit), u = clamp(u, -limit, limit), silu(g) u (limit 0: none)
@@ -40,8 +44,10 @@ constexpr float kOaiAlpha = 1.702f;
 bool supported(int type);
 /// Whether the GEMVs and FP16 rows take it (the experts' types and the dense ones: Q8_0, Q6_K).
 bool mv_supported(int type);
-/// Values a block of the type (32: Q8_0, IQ4_NL, Q5_0; 256: the others).
-inline int block_values(int type) { return type == kQ8_0 || type == kIQ4_NL || type == kQ5_0 ? 32 : 256; }
+/// Values a block of the type (32: Q8_0, IQ4_NL, Q5_0; 64: Q2_0; 256: the others).
+inline int block_values(int type) {
+    return type == kQ8_0 || type == kIQ4_NL || type == kQ5_0 ? 32 : type == kQ2_0 ? 64 : 256;
+}
 /// Bytes of a block of the type (0: not one of these).
 int block_bytes(int type);
 /// Bytes of a row of k values (k a multiple of the type's block).

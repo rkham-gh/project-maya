@@ -81,11 +81,17 @@ template <> struct Ty<kIQ1_M> { static constexpr int B = 56, TAB = 2048, MIN = 0
 template <> struct Ty<kQ6_K> { static constexpr int B = 210, TAB = 0, MIN = 0; };
 template <> struct Ty<kQ8_0> { static constexpr int B = 34, TAB = 0, MIN = 0; };
 template <> struct Ty<kQ5_0> { static constexpr int B = 22, TAB = 0, MIN = 0; };   // (d, qh u32, 16 nibble bytes)
+template <> struct Ty<kQ2_0> { static constexpr int B = 18, TAB = 0, MIN = 0; };   // (64 values: d, 16 code bytes)
 // MXFP4 (ds4_gguf.cu's own kernels everywhere else): a block of 32 values, an E8M0 scale then 16 code bytes; the light
 // sets take it too
 constexpr int kMXFP4 = 39;
 template <> struct Ty<kMXFP4> { static constexpr int B = 17, TAB = 0, MIN = 0; };
-template <int T> constexpr int kQK = T == kMXFP4 || T == kQ8_0 || T == kIQ4_NL || T == kQ5_0 ? 32 : 256;   // values a block
+template <int T> constexpr int kQK = T == kMXFP4 || T == kQ8_0 || T == kIQ4_NL || T == kQ5_0 ? 32 : T == kQ2_0 ? 64 : 256;   // values a block
+// the block that holds 32-value sub-block kb
+template <int T>
+__device__ __forceinline__ const uint8_t* sub_block(const uint8_t* row, int kb) {
+    return row + (size_t) (kQK<T> == 32 ? kb : kQK<T> == 64 ? kb >> 1 : kb >> 3) * Ty<T>::B;
+}
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_s) == 82 && sizeof(block_iq3_xxs) == 98 &&
                   sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 && sizeof(block_q4_K) == 144 &&
                   sizeof(block_q2_K) == 84 && sizeof(block_q3_K) == 110 && sizeof(block_iq1_s) == 50 &&
@@ -242,7 +248,7 @@ __device__ __forceinline__ void iq1_decode(const Raw1& r, int kb, const uint32_t
 template <int T, bool CT = false>
 __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, const uint32_t* tab, Sub& s) {
     const int ib = kb & 7;
-    const uint8_t* b = row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B;
+    const uint8_t* b = sub_block<T>(row, kb);
     if constexpr (T == kMXFP4) {   // codes: value j in byte j's low nibble, j + 16 in its high one (any alignment)
         const uint32_t t[4] = {0x03020100u, 0x0C080604u, 0xFDFEFF00u, 0xF4F8FAFCu};   // ggml's kvalues_mxfp4
 #pragma unroll
@@ -437,6 +443,20 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.d = h2f(b);
         (void) ib;
         (void) tab;
+    } else if constexpr (T == kQ2_0) {   // half kb & 1 of a block of 64 (b: block kb >> 1): its 8 code bytes, 4 values each
+        const uint8_t* qs = b + 2 + 8 * (kb & 1);
+        const uint32_t w0 = ld2(qs), w1 = ld2(qs + 4);
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            const uint32_t x = ((t < 4 ? w0 : w1) >> (8 * (t & 3))) & 0xffu;
+            // code i of the byte (bits 2 i, 2 i + 1) into byte i, then q - 1 in each byte without a borrow
+            const uint32_t v = (x | (x << 6) | (x << 12) | (x << 18)) & 0x03030303u;
+            s.q[t] = (int) (((v | 0x80808080u) - 0x01010101u) ^ 0x80808080u);
+        }
+        s.s0 = s.s1 = 1;
+        s.d = h2f(b);
+        (void) ib;
+        (void) tab;
     } else {   // Q3_K
         const int n = ib >> 2, j = ib & 3;
         const uint8_t* qs = b + 32 + 32 * n;
@@ -524,7 +544,7 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
 template <int T>
 __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, int p, const uint32_t* tab, float* w) {
     const int ib = kb & 7;
-    const uint8_t* b = row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B;
+    const uint8_t* b = sub_block<T>(row, kb);
     if constexpr (T == kIQ2_XXS) {
         const uint8_t* q = b + 2 + 8 * ib;
         const uint32_t a1 = ld2(q + 4);
@@ -659,6 +679,12 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
             const int lo = p < 2 ? qs[j] & 15 : qs[j] >> 4;
             w[j] = dl * (float) ((lo | (int) (((qh >> (v0 + j)) & 1u) << 4)) - 16);
         }
+        (void) ib;
+    } else if constexpr (T == kQ2_0) {   // values 8 p .. 8 p + 7 of half kb & 1: bytes 2 p, 2 p + 1 of its codes
+        const float d = h2f(b);
+        const uint8_t* qs = b + 2 + 8 * (kb & 1) + 2 * p;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = (float) ((int) ((qs[j >> 2] >> (2 * (j & 3))) & 3) - 1) * d;
         (void) ib;
     } else {   // Q3_K
         const int n = ib >> 2, jj = ib & 3;
@@ -1400,6 +1426,7 @@ bool tc_ok() {
         case kQ6_K: F(kQ6_K); break;       \
         case kQ8_0: F(kQ8_0); break;       \
         case kQ5_0: F(kQ5_0); break;       \
+        case kQ2_0: F(kQ2_0); break;       \
         default: DS4_IQ_SWITCH(t, F)       \
     }
 
@@ -1675,7 +1702,7 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
 
 }  // namespace
 
-bool supported(int t) { return t != kQ6_K && t != kQ8_0 && t != kQ5_0 && block_bytes(t) > 0; }
+bool supported(int t) { return t != kQ6_K && t != kQ8_0 && t != kQ5_0 && t != kQ2_0 && block_bytes(t) > 0; }
 bool mv_supported(int t) { return block_bytes(t) > 0; }
 
 int block_bytes(int t) {
@@ -1683,6 +1710,7 @@ int block_bytes(int t) {
         case kQ6_K: return Ty<kQ6_K>::B;
         case kQ8_0: return Ty<kQ8_0>::B;
         case kQ5_0: return Ty<kQ5_0>::B;
+        case kQ2_0: return Ty<kQ2_0>::B;
         case kIQ2_XXS: return Ty<kIQ2_XXS>::B;
         case kIQ2_XS: return Ty<kIQ2_XS>::B;
         case kQ5_K: return Ty<kQ5_K>::B;
@@ -1705,6 +1733,7 @@ const char* name(int t) {
         case kQ6_K: return "Q6_K";
         case kQ8_0: return "Q8_0";
         case kQ5_0: return "Q5_0";
+        case kQ2_0: return "Q2_0";
         case kIQ2_XXS: return "IQ2_XXS";
         case kIQ2_XS: return "IQ2_XS";
         case kQ5_K: return "Q5_K";
