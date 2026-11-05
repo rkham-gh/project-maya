@@ -88,8 +88,8 @@ prompt, then one prompt three times), at 256K context; maya-nem's runs each star
 Unsloth's UD-Q3_K_XL (65.8 GB; 2026-11-05) is mostly 4-bit IQ formats despite the name. Its routed experts are IQ4_NL
 28.5 GB, IQ4_XS 15.7, IQ3_XXS 8.1, IQ2_XS 1.6 and Q2_0 1.6: 55.6 GB against Q4's 75.8. Q2_0 is ggml's type 42, blocks of
 64 with 2-bit codes, value (q - 1) d, the 2-bit fallback for the down rows of 2688. src/ds4/ds4_iq now has it in the
-GEMVs, FP16 rows and decode_values; the CPU lane reads it through ggml-cpu's dot, which has no x86 SIMD version.
-Measured the same way, 3 runs:
+GEMVs, FP16 rows and decode_values; the CPU lane reads it through ggml-cpu's dot, which has no x86 SIMD version (the
+AVX2 rows below replace it). Measured the same way, 3 runs:
 
 | UD-Q3_K_XL, 16K chunks | maya-nem |
 |---|---|
@@ -118,6 +118,29 @@ tokens at 40 tok/s on average. Every task outside coding came out right, though 
 block the prompt asks for, so it scores as wrong. The repair job passed 10 of 10. None of the 7 coding tasks passed:
 each answer stopped by itself after 9K-48K tokens with a bug in its own code. Flash-Next on Strata scores 22 in 51
 minutes, Qwen3.8-27B 20 in 130.
+
+The AVX2 Q2_0 rows (2026-11-05), taken from a Codex session's `codex/nemotron-mtp`: `src/ds4/ds4_q2_0_avx2.hpp` is an
+AVX2 Q2_0 x Q8_0 dot (adapted from llama.cpp's x86 kernels, MIT) that the CPU lane uses for the Q2_0 down rows when
+`DS4_Q2_0_AVX2=1` and the CPU has AVX2. Otherwise nothing changes. The Q3 pack's run config sets it. It was measured
+in Codex's build, which was the same code with the variable set, against the build before it on Q3, the same way as
+above:
+
+| UD-Q3_K_XL, 16K chunks | Before | AVX2 rows |
+|---|---|---|
+| Writing, new prompts | 37.6 / 37.7 tok/s | **41.2 / 41.4 / 41.3 tok/s** |
+| Writing after the 34.2K prompt | 30.3 / 31.9 | **34.5 / 34.4 / 33.5** |
+| Reading the 34.2K prompt | ~1,995 tok/s | ~1,973 tok/s |
+| Thinking on, the card's sampling (`spec-sweep.py`) | 38.8 / 38.7 | **41.7 / 42.4** |
+
+- The top token was the earlier build's at 88 of 88 positions and llama.cpp's at 86 of 88. The chat checks passed 6
+  of 6, and `derail.py` found 0 of 20 rounds derailed. This build wasn't measured again after the change.
+- `tests/ds4_q2_0_rows_test.cpp` checks the rows against a scalar reference (ctest `ds4_q2_0_avx2`). With
+  `DS4_Q2_0_AVX2=0` the earlier scalar path misses its tolerance in 15 of 3,960 checks. That path is unchanged, and
+  this hasn't been looked into.
+- The rest of that branch is left out: decoding with the model's MTP head (`--mtp N`). It was exact in every check,
+  but 22-31% slower: 28.4 tok/s with 4 drafts, 32.0 with 2 and 32.3 with 1, against 41.3, at 95% accepted with 1. Each
+  drafted token still reads its own experts from RAM, the head takes ~4 GB of VRAM from the expert cache, and the
+  drafts are checked one token at a time.
 
 ## The server
 

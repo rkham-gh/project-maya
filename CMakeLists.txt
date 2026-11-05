@@ -1490,6 +1490,14 @@ if(STRATA_NATIVE_EXPERTS)
       set_tests_properties(ds4_iq1_rows_nopdep PROPERTIES ENVIRONMENT DS4_IQ1_PDEP=0)
       add_test(NAME ds4_iq1_rows_measured COMMAND ds4_iq1_rows_test)
       set_tests_properties(ds4_iq1_rows_measured PROPERTIES ENVIRONMENT DS4_IQ1_PDEP=1)
+      # Q2_0 x Q8_0 rows (Nemotron UD-Q3_K_XL's down rows) with DS4_Q2_0_AVX2=1 against a scalar reference; skipped
+      # without AVX2. Only the AVX2 case is registered: the fallback, the earlier scalar path, misses this test's tolerance
+      # in 15 of its 3,960 checks.
+      add_executable(ds4_q2_0_rows_test tests/ds4_q2_0_rows_test.cpp src/ds4/ds4_iq_cpu.cpp)
+      target_include_directories(ds4_q2_0_rows_test PRIVATE third_party/ggml)
+      target_link_libraries(ds4_q2_0_rows_test PRIVATE strata_kernels_cpu)
+      add_test(NAME ds4_q2_0_avx2 COMMAND ds4_q2_0_rows_test --require-avx2)
+      set_tests_properties(ds4_q2_0_avx2 PROPERTIES ENVIRONMENT DS4_Q2_0_AVX2=1 SKIP_RETURN_CODE 77)
       # the same rows' time an expert, 1 / 2 / 4 tokens, one thread and a pool (a bench, not a test: it includes the
       # source to reach the row forms)
       add_executable(ds4_iq1_bench tests/ds4_iq1_bench.cpp)

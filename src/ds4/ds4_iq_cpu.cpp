@@ -114,6 +114,8 @@ const IqCpuIsa& isa() {
     return c;
 }
 
+#include "ds4_q2_0_avx2.hpp"
+
 // ---- the CPU's vendor (AMD or Hygon) and family (0x17 Zen / Zen+ / Zen 2, 0x19 Zen 3 / Zen 4, 0x1A Zen 5); fam 0 on
 // any other vendor
 struct CpuFam {
@@ -1127,6 +1129,7 @@ void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
 }
 
 void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1) {
+    if (q20_dispatch(f.td, down, f.d_row, f.n_ff, hq, nt, out, r0, r1)) return;
     if (r1 > r0 && own_nt(f.td, nt)) {
         thread_local std::vector<float*> o;
         o.resize((size_t) nt);
@@ -1152,7 +1155,7 @@ void iq_cpu_rows(int type, const uint8_t* w, size_t rb, int k, const void* const
     iq_cpu_down(f, w, act, nt, out, r0, r1);
 }
 
-bool iq_cpu_own_rows(int type) { return own(type); }
+bool iq_cpu_own_rows(int type) { return type == 42 ? q20_enabled() : own(type); }
 void iq_cpu_iq1s_rows(bool on) { g_iq1_on.store(on, std::memory_order_relaxed); }
 
 bool dense_requant(const uint8_t* q8, int n, int k, int type, std::vector<uint8_t>& out, std::string& err) {
