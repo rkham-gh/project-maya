@@ -110,6 +110,19 @@ MINIMAX_PATTERN = (
     r"|\s+"
 )
 
+# The `tekken` pre-tokenizer (Mistral's Tekken, NVIDIA Nemotron 3.5's GGUFs): its tokenizer.json regex verbatim - the
+# o200k letter classes with \p{M}, no contractions, one digit a piece - and llama.cpp's LLAMA_VOCAB_PRE_TYPE_TEKKEN
+# semantics: ignore_merges (an exact vocabulary hit is emitted whole, as glm4 / glm5 here), no space cleanup.
+TEKKEN_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 class _IsolatedSplits:
     """findall() over a sequence of "Isolated" splits (see DEEPSEEK3_PATTERNS)."""
 
@@ -141,11 +154,11 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax"
-                             % pre)
-        # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
-        self.ignore_merges = pre in ("glm4", "glm5")
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "tekken"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
+                             "tekken" % pre)
+        # glm4/glm5 (and tekken) set ignore_merges: an exact vocab hit emits the whole pre-token piece
+        self.ignore_merges = pre in ("glm4", "glm5", "tekken")
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}
@@ -165,6 +178,7 @@ class Tokenizer:
             self.ranks[(parts[0], parts[1])] = i
         self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre == "deepseek3" else
                     regex.compile(MINIMAX_PATTERN) if pre == "minimax" else
+                    regex.compile(TEKKEN_PATTERN) if pre == "tekken" else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
         self._nfc = pre == "minimax"
 

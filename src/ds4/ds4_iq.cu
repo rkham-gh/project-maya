@@ -80,11 +80,12 @@ template <> struct Ty<kIQ1_M> { static constexpr int B = 56, TAB = 2048, MIN = 0
 // (d, then 32 int8: a block of 32 values) - the GEMVs, the FP16 rows and decode_values (maya-mm3's MiniMax quants)
 template <> struct Ty<kQ6_K> { static constexpr int B = 210, TAB = 0, MIN = 0; };
 template <> struct Ty<kQ8_0> { static constexpr int B = 34, TAB = 0, MIN = 0; };
+template <> struct Ty<kQ5_0> { static constexpr int B = 22, TAB = 0, MIN = 0; };   // (d, qh u32, 16 nibble bytes)
 // MXFP4 (ds4_gguf.cu's own kernels everywhere else): a block of 32 values, an E8M0 scale then 16 code bytes; the light
 // sets take it too
 constexpr int kMXFP4 = 39;
 template <> struct Ty<kMXFP4> { static constexpr int B = 17, TAB = 0, MIN = 0; };
-template <int T> constexpr int kQK = T == kMXFP4 || T == kQ8_0 || T == kIQ4_NL ? 32 : 256;   // values a block
+template <int T> constexpr int kQK = T == kMXFP4 || T == kQ8_0 || T == kIQ4_NL || T == kQ5_0 ? 32 : 256;   // values a block
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_s) == 82 && sizeof(block_iq3_xxs) == 98 &&
                   sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 && sizeof(block_q4_K) == 144 &&
                   sizeof(block_q2_K) == 84 && sizeof(block_q3_K) == 110 && sizeof(block_iq1_s) == 50 &&
@@ -417,6 +418,25 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.d = h2f(b);
         (void) ib;
         (void) tab;
+    } else if constexpr (T == kQ5_0) {   // a block of 32 (b: block kb): d, qh (bit j: value j's 5th), IQ4_NL's nibbles
+        const uint32_t qh = ld2(b + 2);
+        const uint8_t* qs = b + 6;
+        // value q - 16 in a byte without a borrow between them: ((q | 0x80) - 0x10) ^ 0x80 for q in 0..31
+        auto spread = [](uint32_t n4) {   // bits 0..3 -> bit 4 of bytes 0..3
+            return ((n4 & 1u) << 4) | ((n4 & 2u) << 11) | ((n4 & 4u) << 18) | ((n4 & 8u) << 25);
+        };
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const uint32_t w = ld2(qs + 4 * t);
+            const uint32_t lo = (w & 0x0f0f0f0fu) | spread((qh >> (4 * t)) & 15u);
+            const uint32_t hi = ((w >> 4) & 0x0f0f0f0fu) | spread((qh >> (16 + 4 * t)) & 15u);
+            s.q[t] = (int) (((lo | 0x80808080u) - 0x10101010u) ^ 0x80808080u);
+            s.q[4 + t] = (int) (((hi | 0x80808080u) - 0x10101010u) ^ 0x80808080u);
+        }
+        s.s0 = s.s1 = 1;
+        s.d = h2f(b);
+        (void) ib;
+        (void) tab;
     } else {   // Q3_K
         const int n = ib >> 2, j = ib & 3;
         const uint8_t* qs = b + 32 + 32 * n;
@@ -629,6 +649,17 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
 #pragma unroll
         for (int j = 0; j < 8; ++j) w[j] = d * (float) (int8_t) q8[2 + 8 * p + j];
         (void) b;
+    } else if constexpr (T == kQ5_0) {   // (block kb: 32 values, IQ4_NL's nibble order, the 5th bits in qh)
+        const float dl = h2f(b);
+        const uint32_t qh = ld2(b + 2);
+        const uint8_t* qs = b + 6 + 8 * (p & 1);
+        const int v0 = (p < 2 ? 0 : 16) + 8 * (p & 1);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int lo = p < 2 ? qs[j] & 15 : qs[j] >> 4;
+            w[j] = dl * (float) ((lo | (int) (((qh >> (v0 + j)) & 1u) << 4)) - 16);
+        }
+        (void) ib;
     } else {   // Q3_K
         const int n = ib >> 2, jj = ib & 3;
         const float dl = h2f(b + 108) * (float) q3k_scale(b + 96, 8 * n + 2 * jj + (p >> 1));
@@ -1368,6 +1399,7 @@ bool tc_ok() {
     switch (t) {                           \
         case kQ6_K: F(kQ6_K); break;       \
         case kQ8_0: F(kQ8_0); break;       \
+        case kQ5_0: F(kQ5_0); break;       \
         default: DS4_IQ_SWITCH(t, F)       \
     }
 
@@ -1643,13 +1675,14 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
 
 }  // namespace
 
-bool supported(int t) { return t != kQ6_K && t != kQ8_0 && block_bytes(t) > 0; }
+bool supported(int t) { return t != kQ6_K && t != kQ8_0 && t != kQ5_0 && block_bytes(t) > 0; }
 bool mv_supported(int t) { return block_bytes(t) > 0; }
 
 int block_bytes(int t) {
     switch (t) {
         case kQ6_K: return Ty<kQ6_K>::B;
         case kQ8_0: return Ty<kQ8_0>::B;
+        case kQ5_0: return Ty<kQ5_0>::B;
         case kIQ2_XXS: return Ty<kIQ2_XXS>::B;
         case kIQ2_XS: return Ty<kIQ2_XS>::B;
         case kQ5_K: return Ty<kQ5_K>::B;
@@ -1671,6 +1704,7 @@ const char* name(int t) {
     switch (t) {
         case kQ6_K: return "Q6_K";
         case kQ8_0: return "Q8_0";
+        case kQ5_0: return "Q5_0";
         case kIQ2_XXS: return "IQ2_XXS";
         case kIQ2_XS: return "IQ2_XS";
         case kQ5_K: return "Q5_K";

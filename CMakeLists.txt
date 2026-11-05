@@ -916,6 +916,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     endif()
   endif()
 
+  # maya-nem: NVIDIA Nemotron 3.5 Super (llama.cpp's nemotron_h_moe: Mamba-2, attention and latent-MoE layers) from a
+  # GGUF on one GPU and the CPU (src/nem, docs/NEMOTRON.md): the dense weights and the experts used most in VRAM, the
+  # rest on the CPU lane, a prompt streamed to the GPU in chunks (cuBLAS) - with maya-ds4's GGUF block-type kernels on
+  # the device and its CPU rows (ggml-cpu's dots).  CUDA only.
+  if(STRATA_ENABLE_CUDA)
+    add_executable(maya-nem src/nem/nem_main.cpp src/nem/nem_model.cu src/nem/nem_kernels.cu src/nem/nem_ext.cu
+                            src/nem/nem_cpu.cpp
+                            src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
+    target_include_directories(maya-nem PRIVATE ${_strata_gpu_include_directories} include src/nem third_party/ggml)
+    target_link_libraries(maya-nem PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    target_compile_definitions(maya-nem PRIVATE MAYA_DS4_IQ_ONLY)
+  endif()
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)
