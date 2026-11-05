@@ -419,8 +419,10 @@ struct Engine::Impl {
         std::vector<int> owner, where;   // slot -> key (layer x n_expert + expert) or -1; key -> slot, -1, or -2
         std::vector<float> score;
         long lookups = 0, hits = 0, copies = 0, tok = 0;
-        float decay = 0.998f, margin = 1.25f;
-        int every = 8, per = 4;
+        // (maya-ink's settings after its 2026-11-04 tuning: decay 0.99, up to 16 swaps every 2 tokens, margin 1.5;
+        // NEM_CACHE_DECAY / _EVERY / _SWAPS / _MARGIN change them)
+        float decay = 0.99f, margin = 1.5f;
+        int every = 2, per = 16;
         float *u = nullptr, *routed = nullptr, *hd = nullptr, *y = nullptr;
         int8_t* hq = nullptr;
         cudaEvent_t copied = nullptr;
