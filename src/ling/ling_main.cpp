@@ -366,6 +366,11 @@ int main(int argc, char** argv) {
     in.start();
     std::vector<int> hist;   // the tokens the state holds (prompt and generated, the last sampled one not fed)
     std::vector<float> last; // the logits after hist
+    // the last prompt's end (Engine::snapshot): its tokens and the logits after them - a request that continues those
+    // but not hist (the last answer re-rendered differently) goes on from there instead of from the start
+    std::vector<int> snap_hist;
+    std::vector<float> snap_last;
+    bool have_snap = false;
     std::mt19937_64 rng(std::random_device{}());
     std::string line;
     while (in.next(line)) {
@@ -394,10 +399,18 @@ int main(int argc, char** argv) {
             else if (k == "seed") sp.seed = std::atoll(v.c_str());
         }
         if (sp.seed >= 0) rng.seed((uint64_t) sp.seed);
-        // the prompt: what continues hist is read on from there, anything else from the start
+        // the prompt: what continues hist is read on from there, what continues the last prompt's end from there,
+        // anything else from the start
         size_t reuse = 0;
         if (ids.size() > hist.size() && std::equal(hist.begin(), hist.end(), ids.begin())) reuse = hist.size();
         else if (ids.size() == hist.size() && ids == hist && !last.empty()) reuse = hist.size();
+        else if (have_snap && !snap_hist.empty() && ids.size() >= snap_hist.size() &&
+                 std::equal(snap_hist.begin(), snap_hist.end(), ids.begin()) &&
+                 (ids.size() > snap_hist.size() || !snap_last.empty()) && eng.restore()) {
+            hist = snap_hist;
+            last = snap_last;
+            reuse = hist.size();
+        }
         if (reuse < hist.size() || (reuse == 0 && !hist.empty())) {
             eng.reset();
             hist.clear();
@@ -424,6 +437,13 @@ int main(int argc, char** argv) {
             std::printf("PP %zu %zu %.0f %.1f %zu\n", i + m, todo, ms, (i + m) * 1000.0 / std::max(ms, 1.0), reuse);
             std::fflush(stdout);
             if (!lg || in.stop.load()) break;
+        }
+        // the prompt read whole: its end kept (the next turn's prompt holds this one and the answer, perhaps rendered
+        // apart from the tokens written now)
+        if (lg && hist.size() == ids.size() && !in.stop.load() && eng.snapshot()) {
+            snap_hist = hist;
+            snap_last.assign(lg, lg + V);
+            have_snap = true;
         }
         const double p1 = now_ms();
         int generated = 0;

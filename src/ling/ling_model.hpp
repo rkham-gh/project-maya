@@ -56,6 +56,14 @@ public:
     /// logits after the last one (as step()), pos + n.  nullptr when they do not fit before max_ctx().  progress (when
     /// set) is called as the chunks go, with the tokens read so far.
     const float* prefill(const int* ids, int n, void (*progress)(void*, int) = nullptr, void* ctx = nullptr);
+    /// The recurrent state at pos() (every KDA layer's state and convolutions) copied aside in VRAM; restore() puts it
+    /// back and the position with it - the MLA caches' rows below that position are as they were (a row is only ever
+    /// written at the position).  The KDA state cannot go back otherwise: a conversation's next turn that does not
+    /// continue the tokens so far (its last answer rendered a little differently) goes on from the last prompt's end
+    /// instead of from the start.  false: no room was kept for it (LING_SNAPSHOT=0) or nothing taken yet.
+    bool snapshot();
+    bool restore();
+
 
     struct Stats {
         double ms_total = 0, ms_cpu = 0;   // step()'s time, and the CPU lane's part of it

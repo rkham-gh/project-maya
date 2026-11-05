@@ -195,6 +195,10 @@ struct Engine::Impl {
     FILE* route_log = nullptr;
     std::vector<uint16_t> route_tok;
     bool pf_open = false;   // a prompt read through the prompt path, no token written since (its buffers not lent)
+    // (Engine::snapshot) the KDA layers' states and convolutions at snap_pos, one buffer in VRAM (-1: none taken)
+    uint8_t* snap = nullptr;
+    size_t snap_bytes = 0;
+    int snap_pos = -1;
 
     template <class T> T* dalloc(size_t n) {
         void* p = nullptr;
@@ -507,6 +511,40 @@ const float* Engine::prefill(const int* ids, int n, void (*progress)(void*, int)
     return p->prefill(ids, n, progress, ctx);
 }
 
+bool Engine::snapshot() {
+    Impl& m = *p;
+    if (!m.snap) return false;
+    const size_t conv = (size_t) 3 * m.C * (m.g.conv_k - 1) * sizeof(float),
+                 state = (size_t) m.g.n_head * 128 * 128 * sizeof(float);
+    uint8_t* at = m.snap;
+    for (const Layer& l : m.L)
+        if (!l.mla) {
+            CK(cudaMemcpyAsync(at, l.conv, conv, cudaMemcpyDeviceToDevice, m.s));
+            CK(cudaMemcpyAsync(at + conv, l.S, state, cudaMemcpyDeviceToDevice, m.s));
+            at += conv + state;
+        }
+    CK(cudaStreamSynchronize(m.s));
+    m.snap_pos = m.pos;
+    return true;
+}
+
+bool Engine::restore() {
+    Impl& m = *p;
+    if (!m.snap || m.snap_pos < 0) return false;
+    const size_t conv = (size_t) 3 * m.C * (m.g.conv_k - 1) * sizeof(float),
+                 state = (size_t) m.g.n_head * 128 * 128 * sizeof(float);
+    const uint8_t* at = m.snap;
+    for (Layer& l : m.L)
+        if (!l.mla) {
+            CK(cudaMemcpyAsync(l.conv, at, conv, cudaMemcpyDeviceToDevice, m.s));
+            CK(cudaMemcpyAsync(l.S, at + conv, state, cudaMemcpyDeviceToDevice, m.s));
+            at += conv + state;
+        }
+    CK(cudaStreamSynchronize(m.s));
+    m.pos = m.snap_pos;
+    return true;
+}
+
 void Engine::reset() {
     p->pos = 0;
     p->ec.kv_hi = 0;   // (the MLA caches' slots usable again: empty, the next fill or swaps take them)
@@ -760,6 +798,14 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
             l.cl.up = tu->data;
             l.cl.down = td->data;
             l.cl.limit = l.clamp_exp;
+            // (the CPU rows' choice between ggml-cpu's dots and ds4's own, timed and checked now rather than in the
+            // first token's lane)
+            static std::vector<int> prepared;
+            for (int ty : {l.cl.tg, l.cl.tu, l.cl.td})
+                if (std::find(prepared.begin(), prepared.end(), ty) == prepared.end()) {
+                    strata::ds4::gguf::iq_cpu_prepare_rows(ty);
+                    prepared.push_back(ty);
+                }
         }
         if (o.verbose && (il % 8 == 7 || il == g.n_layer - 1))
             std::fprintf(stderr, "maya-ling: layers 0..%d placed (%.1f GB of VRAM so far)\n", il, dev_bytes / 1e9);
@@ -809,6 +855,12 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     h_tail = halloc<float>((size_t) 4 + E);
     h_logits = halloc<float>((size_t) g.vocab);
     h_pos = halloc<int>(2);
+    // the room for Engine::snapshot: every KDA layer's state and convolutions (~283 MB)
+    if (!std::getenv("LING_SNAPSHOT") || std::atoi(std::getenv("LING_SNAPSHOT")) != 0) {
+        for (const Layer& l : L)
+            if (!l.mla) snap_bytes += (size_t) 3 * C * (K - 1) * sizeof(float) + (size_t) H * 128 * 128 * sizeof(float);
+        snap = dalloc<uint8_t>(snap_bytes);
+    }
 
     int threads = o.threads > 0 ? o.threads : (int) std::max(1u, std::thread::hardware_concurrency() / 2);
     pool.reset(new Pool(threads - 1));

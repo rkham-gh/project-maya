@@ -52,6 +52,11 @@ layer (Q4_0, 4.6 GB) is not loaded.
   before the SiLU: used only where there is no clamp).
 - The mapping's pages of the weights copied to VRAM leave the working set after the copy (`LING_TRIM=0`: kept); the
   routed experts' 160 GB are touched once at the start (`LING_PREFAULT=0`: not).
+- **A conversation's next turn**: the KDA state cannot go back, so a request is read on from the engine's state only
+  when it continues the tokens so far. The state at each prompt's end is also kept aside (`Engine::snapshot`: the KDA
+  layers' states and convolutions, 283 MB of VRAM; `LING_SNAPSHOT=0`: not), so a next turn whose last answer the
+  template renders differently from the tokens written (its whitespace, its thinking) goes on from the last prompt's
+  end - only the answer and the new message are read - instead of the whole conversation from the start.
 
 ## Use
 
