@@ -19,9 +19,31 @@ reference the arithmetic follows; mainline llama.cpp (build 12017) is what the m
 | SwiGLU clamp | min(silu(g), 10) clamp(u, -10, 10) for the routed experts of layers 65-71 and the shared experts of 64-71 (the GGUF's swiglu_clamp_exp / _shexp): without it layer 64 blows up |
 | Context | 262,144 native; the cache is 9 x 576 x 2 bytes = 10.4 KB a token, the KDA state 252 MiB a sequence |
 
-IQ2_XS is 177.4 GB: the routed experts IQ2_XS (up IQ3_XXS / IQ3_S in some layers), 160 GB; attention and the dense
-layers Q5_K mostly, 10.2 GB; the shared experts Q8_0, 1.1 GB; output head and embedding Q8_0, 0.7 GB each; the MTP
-layer (Q4_0, 4.6 GB) is not loaded.
+IQ2_XS is 177.4 GB: the routed experts IQ2_XS in 64 layers (the ups IQ3_XXS in layers 4, 7 and 15; layer 71's experts
+IQ3_XXS / IQ3_S), 160 GB; attention and the dense layers Q5_K mostly, 10.2 GB; the shared experts Q8_0 (19 gates
+Q6_K), 1.1 GB; output head and embedding Q8_0, 0.7 GB each; the MTP layer (Q4_0, 4.6 GB) is not loaded.
+
+## Correctness
+
+Measured 2026-11-05 on an RTX 5090 (PCIe 5.0 x8), Ryzen 9 9950X, 192 GB DDR5-3600, CUDA 13.4, IQ2_XS, with
+`test-results\2026-11-04-ling\` (on the machine, outside the repository):
+
+- **Against llama.cpp** (mainline build 12017, `--cpu-moe`, `ling-ref.py`): the chat template's text and the
+  tokenizer's ids are the same as llama.cpp's on all 5 prompts (33 to 3,771 tokens; thinking on and off, a tool, a long
+  ledger). The same ids fed to both, llama.cpp's greedy tokens fed to maya-ling (`--runs` / `--follow`), each step's top
+  5 compared: the top token agrees at **90 of 90** positions; llama.cpp's token's log-probability differs by at most
+  0.244 (the 3,771-token prompt through the prompt path; the other prompts at most 0.102). The same long prompt through
+  the token path (`--step`, every one of its 3,771 tokens a step): 16 of 16, at most 0.444.
+- **Against an independent reference** (`ref-np.py`: numpy, float64, the weights dequantized by llama.cpp's gguf-py,
+  the math written from the graph and HF's modeling code) on a 33-token prompt, layers 0-7 (KDA, the dense FFN, the MoE
+  with its group-limited routing and shared expert, the gated MLA layer 7), the residual stream of the last token after
+  every attention and FFN: the prompt path within 0.003% in RMS and 0.03% on single values at every layer; the token
+  path (int8 activations) within 0.07% in RMS, 0.5% on single values.
+- `--selftest` (19 checks: the KDA recurrence chunk and token by token, its prep and output norm, the MLA decode
+  attention, cache rows and RoPE, the routing) against host references: all pass.
+- Through the server (`ling-chat-test.py`, port 8086): an answer with its thinking apart, thinking off, a tool call
+  (GLM-style, parsed), the answer from the tool's result, a second turn (its prompt's 39 tokens reused), streaming and
+  JSON output - 7 of 7. A thinking-on second turn read 21 of its 363 tokens (342 reused).
 
 ## The engine
 
@@ -93,5 +115,10 @@ A run config (`--engine maya --config ...`):
 
 ## Status
 
-- Written and compiling (CUDA 13.4, sm_120); not yet run on the model. Correctness against llama.cpp and speed: to be
-  measured.
+- Correct (above). Speed not measured yet on a quiet machine: what the correctness runs showed in passing (a cold cache,
+  no expert profile, 16K context) was 15-24 tok/s writing with 17-55% of a token's experts in VRAM (3,898 slots), the
+  3,771-token prompt read in 8.6 s through the prompt path (88 GB of experts copied) and 112 s through the token path;
+  a load of 16 s with the GGUF in the file cache (the routed experts' 160 GB touched in 11 s).
+- Not done: the expert cache's settings re-tuned for Ling (maya-ink's for now; `ec-sim.py` in the test folder replays a
+  `LING_ROUTE_LOG` trace), `LING_PF_PREFETCH` measured, the chunk size (8,192; 16,384 should nearly halve a long
+  prompt's time a token), the MTP layer (blk.72) for drafting.
