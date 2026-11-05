@@ -308,7 +308,7 @@ struct Engine::Impl {
         CK(cudaMemcpy(v.data(), dev, v.size() * sizeof(float), cudaMemcpyDeviceToHost));
         double ss = 0;
         for (float x0 : v) ss += (double) x0 * x0;
-        std::fprintf(stderr, "[dump] pos %d %s %2d rms %.6g  %.5g %.5g %.5g %.5g\n", pos, what, il,
+        std::fprintf(stderr, "[dump] pos %d %s %2d rms %.6g  %.5g %.5g %.5g %.5g\n", at, what, il,
                      std::sqrt(ss / v.size()), v[0], v[1], v[2], v[3]);
     }
 
