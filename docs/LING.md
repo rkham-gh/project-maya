@@ -52,16 +52,24 @@ prompt read and answered, then one prompt three times) at 131K context, 2026-11-
 file cache warmed first; maya-ling's runs each from the same expert profile (`ling-ab.ps1` restores
 `work\profile-P0.bin`, the profile after the first chat checks and derail.py):
 
-| | llama.cpp `--cpu-moe` | llama.cpp's fit (no `-ngl`) | maya-ling, 8K chunks (3 runs) | maya-ling, 16K chunks |
-|---|---|---|---|---|
-| Writing, new prompts | 12.0 tok/s | 12.0 tok/s | **23.0** (23.0 / 23.0 / 22.9) | 22.8 |
-| Writing after the 35.5K prompt | 12.5 | 12.8 | 16.6 (16.9 / 16.7 / 16.3) | 16.6 |
-| Reading the 35.5K prompt | 75.6 tok/s | 86.5 tok/s | 548 tok/s | **733 tok/s** |
-| Its first token | 470 s | 410 s | 64.7 s | **48.5 s** |
-| The same prompt three times | 12.7 -> 12.9 | 12.9 -> 12.9 | 22.4 -> 26.0 | 22.0 -> 25.1 |
-| VRAM | 15.8 GB | 30.7 GB | 29.9 GB | 29.9 GB |
+| | llama.cpp `--cpu-moe` | llama.cpp's fit (no `-ngl`) | maya-ling, 8K chunks | 16K chunks | 16K + `LING_PF_PREFETCH=1` |
+|---|---|---|---|---|---|
+| Writing, new prompts | 12.0 tok/s | 12.0 tok/s | **23.0** (23.0 / 23.0 / 22.9) | 22.5 (22.8 / 22.7 / 22.1) | 22.4 (22.0 / 22.4 / 22.7) |
+| Writing after the 35.5K prompt | 12.5 | 12.8 | **16.6** (16.9 / 16.7 / 16.3) | 16.2 (16.6 / 16.5 / 15.6) | 16.2 (16.1 / 16.1 / 16.4) |
+| Reading the 35.5K prompt | 75.6 tok/s | 86.5 tok/s | 548 tok/s | 738 tok/s | **876 tok/s** |
+| Its first token | 470 s | 410 s | 64.7 s | 48.1 s | **40.6 s** |
+| The same prompt three times | 12.7 -> 12.9 | 12.9 -> 12.9 | 22.4 -> 26.0 | 20.5 -> 25.2 | 22.0 -> 25.4 |
+| VRAM | 15.8 GB | 30.7 GB | 29.9 GB | 29.9 GB | 29.9 GB |
 
-The run config takes `--chunk 16384` (C:\llm\models\Ling-3.1-flash-maya-ling\maya-ling.json; derail.py 0 of 20 on it).
+maya-ling's columns are 3 runs each. The run config takes `--chunk 16384` and `"env": {"LING_PF_PREFETCH": "1"}`
+(C:\llm\models\Ling-3.1-flash-maya-ling\maya-ling.json; derail.py 0 of 20 on each). 16K chunks read the long prompt
+35% faster than 8K and the prefetch another 19%; together they cost about 2% of the writing speed on new prompts, the
+16K chunks' share (the prefetch's runs write as the plain 16K ones). The prefetch's three runs gave the same text, and
+its prompt path the plain path's logits at the comparison's first position (`work\compare-prefetch.json`; the later
+positions, the token path's, moved within the tolerance against llama.cpp, worst 0.28). With the prefetch, the prompt
+path's buffers are 10.37 GB (3.70 without), so the cache's own slots drop to 1,350 and those lent from the buffers
+between prompts rise to 2,281: 3,919 in all, against 3,902. A run started from the run config alone (no `-Env`) read
+the prompt at 883 tok/s with the prefetch runs' text.
 About half of a token's 544 routed experts are found in the VRAM cache (ec-sim.py's replay of a run's routing: 49.9%);
 the CPU lane, ~0.11 ms an IQ2_XS expert (~41 GB/s of the RAM), is ~65-75% of a token. Writing after a long prompt is
 slower: the cache is refilled from the prompt's experts, and the MLA layers attend over the 35K positions. Replaying the
@@ -88,7 +96,7 @@ on ab.py's own routing, so not taken (held-out prompts not run).
   multiplied; then each is decoded, multiplied for its tokens and added to theirs times their weights, in id order,
   then the shared expert: the same sums every run. Prompts under 256 new tokens (`LING_MIN_CHUNK`) take the token path:
   a chunk of a few hundred tokens already touches nearly every one of a layer's 512 experts, ~150 GB to copy.
-  `LING_PF_PREFETCH=1` (off until measured): a chunk of `LING_PF_PREFETCH_MIN` (4,096) tokens or more uses nearly every
+  `LING_PF_PREFETCH=1` (off by default; on in the run config: 876 tok/s against 738 on the 35.5K prompt): a chunk of `LING_PF_PREFETCH_MIN` (4,096) tokens or more uses nearly every
   expert, so a copier thread (its own pinned staging, pool and copy stream) stages each MoE layer's experts that are not
   in the VRAM cache into one of two layer buffers (2 x 3.3 GB in the arena) while the GPU computes the layers before:
   the copies no longer wait for the attention's compute, nor the attention for them. The GEMMs read the same weights in
@@ -129,7 +137,9 @@ A run config (`--engine maya --config ...`):
 ```json
 {
   "exe": "<fork>\\build-ling\\maya-ling.exe",
-  "args": ["--gguf", "<...-00001-of-00005.gguf>", "--max-context", "131072", "--profile", "<pack dir>\\expert-profile.bin"],
+  "args": ["--gguf", "<...-00001-of-00005.gguf>", "--max-context", "131072", "--profile", "<pack dir>\\expert-profile.bin",
+           "--chunk", "16384"],
+  "env": {"LING_PF_PREFETCH": "1"},
   "tokenizer": "<pack dir>\\tokenizer",
   "model_name": "ling-3.1-flash",
   "gpu": [0],
@@ -142,5 +152,5 @@ A run config (`--engine maya --config ...`):
 - Correct and measured (above); runs as `switch-model.ps1 ling` (port 8086, 128K context; a start of ~17 s with the
   GGUF in the file cache, the routed experts' 160 GB touched in 11 s; ~24 GB of the RAM left free while it runs).
 - Not done: the cache's settings for Ling confirmed on held-out prompts (maya-ink's for now: decay 0.99, adapting every
-  2 tokens); `LING_PF_PREFETCH` timed against the plain prompt path from the same cache state (it reproduces its
-  logits); the writing after a long prompt (16.6 tok/s against 23 on new ones); the MTP layer (blk.72) for drafting.
+  2 tokens); the writing after a long prompt (16.2 tok/s against 22.4 on new ones, where llama.cpp doesn't slow down);
+  the MTP layer (blk.72) for drafting; 256K context (the run config's is 128K).
