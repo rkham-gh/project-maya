@@ -62,22 +62,24 @@ the tool's result, streaming and JSON output - 6 of 6. `derail.py`: 0 of 20 roun
 
 Speed, on a quiet machine, with `ab.py` (temperature 0, thinking off; six new prompts of 400 tokens, then a 34.2K-token
 prompt, then one prompt three times), at 256K context; maya-nem's runs each started from the same expert profile
-(`nem-ab.ps1`: the scores after the chat checks from an empty start), 4 runs of the defaults:
+(`nem-ab.ps1`: the scores after the chat checks from an empty start), 4 runs of the defaults (8K chunks) and 3 of
+`--chunk 16384`, the run config's:
 
-| | llama.cpp, `-ngl 99 --cpu-moe` | llama.cpp's own fit, `-ub 2048 -b 2048` | maya-nem |
-|---|---|---|---|
-| Writing, new prompts | 11.2 tok/s | 13.0 tok/s | **26.6 tok/s** |
-| Writing after the 34.2K prompt | 11.4 tok/s | 13.5 tok/s | **21.6 tok/s** |
-| Reading the 34.2K prompt | 107 tok/s | 474 tok/s | **1,609 tok/s** with `--chunk 16384` (1,130 with 8,192) |
-| Its first token | 319 s | 72 s | **21 s** (30 s) |
-| The repeated prompt, 1st -> 3rd | 11.4 -> 11.4 | 13.5 -> 13.5 | 24.0 -> 29.6 tok/s |
-| VRAM | 12.2 GB | 30.3 GB | 29.9 GB |
+| | llama.cpp, `-ngl 99 --cpu-moe` | llama.cpp's own fit, `-ub 2048 -b 2048` | maya-nem, 8K chunks | maya-nem, 16K chunks |
+|---|---|---|---|---|
+| Writing, new prompts | 11.2 tok/s | 13.0 tok/s | **26.6 tok/s** | 26.3 tok/s |
+| Writing after the 34.2K prompt | 11.4 tok/s | 13.5 tok/s | 21.6 tok/s | **21.7 tok/s** |
+| Reading the 34.2K prompt | 107 tok/s | 474 tok/s | 1,130 tok/s | **1,607 tok/s** |
+| Its first token | 319 s | 72 s | 30 s | **21 s** |
+| The repeated prompt, 1st -> 3rd | 11.4 -> 11.4 | 13.5 -> 13.5 | 24.0 -> 29.6 tok/s | 23.9 -> 29.3 tok/s |
+| VRAM | 12.2 GB | 30.3 GB | 29.9 GB | 29.9 GB |
 
 - The cache settings: maya-ink's tuned ones (0.99 / 16 swaps / every 2 / margin 1.5) against its earlier ones (0.998 / 4
   / 8 / 1.25), 2 runs each, alternated: new prompts 26.6 against 22.1 tok/s, the repeated prompt's third answer 29.6
   against 22.9, after the long prompt the same (21.5 against 21.5).
-- 16K chunks read the long prompt 42% faster (each expert crosses PCIe once for twice the tokens) and write at the
-  same speed (26.4 tok/s on new prompts): the prompt path's buffers are lent to the expert cache between prompts.
+- 16K chunks read the long prompt 42% faster (each expert crosses PCIe once for twice the tokens) and write about 1%
+  slower on new prompts (26.2-26.4 against 26.5-26.6 tok/s): the prompt path's buffers are lent to the expert cache
+  between prompts, 1,059 slots of the 6,119 at 16K against 753 at 8K.
 - With llama.cpp's fit, `-ngl` must stay unset: given `-ngl 99` without `--cpu-moe`, it put the whole model "on" the
   GPU, 32.0 GB of VRAM with the rest spilled to shared memory, and wrote 3.0 tok/s.
 - About 80% of a token is the CPU lane's share of the experts, read at the RAM's speed (~40 GB/s); the CUDA graphs
@@ -87,6 +89,14 @@ prompt, then one prompt three times), at 256K context; maya-nem's runs each star
 
 - `serve/frontend.py` knows the template by its `medium_effort`: the server's `low` / `medium` (and `minimal`) turn it
   on, the other levels keep the full default; `"chat_template_kwargs": {"enable_thinking": false}` turns thinking off.
+- The server's thinking budget (32,768 tokens unless the run config sets `thinking_budget`) applies: `_sliced` closes
+  the reasoning at the first sentence or line end past it. maya-nem ignores the `think_budget` / `think_end` keys of
+  `GEN`, the engine's own close for reasoning with no such end.
+- A prompt is read on from the engine's state only when it continues the tokens so far (the Mamba-2 state can't be
+  rewound). A tool's result does (`test-results\2026-11-04-nemotron\nem-turns.py`: 473 of 511 tokens read on); a new
+  user message doesn't, because the template drops the earlier thinking (`truncate_history_thinking`), so the
+  conversation is read again from the start. Keeping the state from before each prompt's generation prompt (where the
+  next turn's rendering first differs) would save that; not done.
 - `tools/strata_tokenizer.py` has the `tekken` pre-tokenizer; `tools/nem/make_pack.py` writes the tokenizer folder
   the server reads (with the template the GGUF carries):
 
