@@ -63,6 +63,11 @@ class ChatTemplate:
         # is told.  Thinking off (a client's, or a forced tool call's) closes the block the way its Qwen base's template
         # writes thinking off - <think>\n\n</think>\n\n - so the prompt and the server's parser agree
         self.forced_thinking = bool(re.search(r"set\s+enable_thinking\s*=\s*true", self.source))
+        # Ling-3 (inclusionAI's "Bailing V3" template, tools/ling/chat_template.jinja): <role>SYSTEM / HUMAN / ASSISTANT /
+        # OBSERVATION</role> turns closed by <|role_end|>, thinking on or off (enable_thinking; no levels: the system
+        # turn says "detailed thinking on / off"), GLM's <arg_key> tool calls.  Its tools are written as the client's
+        # OpenAI objects (tojson of each, as Hugging Face's and llama.cpp's renderings give them)
+        self.ling = "<role>HUMAN</role>" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -114,6 +119,11 @@ class ChatTemplate:
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
+        if self.ling:
+            # (the server's flat tools back into OpenAI's form; the effort words mean nothing to it: thinking is on or
+            # off - "none" / "minimal" turned it off in effort_kwargs already)
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
+            kwargs.pop("reasoning_effort", None)
         off = False
         if self.glm_effort:
             off = kwargs.pop("enable_thinking", True) is False
