@@ -323,7 +323,25 @@ struct Engine::Impl {
     const float* step(int token);
     void tok_mamba(Layer& l);
     void tok_attention(Layer& l);
-    void tok_moe(Layer& l, int il, double& cpu_ms);
+    // The token path in segments between the host's syncs (one a MoE layer: its routing is done on the host): segment
+    // 0 the embedding, the layers before the first MoE layer and that one's router; segment j the MoE layer j - 1's end,
+    // the layers up to the next MoE layer and its router (the last: the head).  The GPU's part of a segment has the
+    // same launches every token (the position read on the device), so each is a CUDA graph (NEM_GRAPHS=0: launched one
+    // by one); the routed experts in VRAM, the shared expert and the CPU lane go between segments.
+    void tok_embed();
+    void moe_pre(Layer& l);
+    void moe_mid(Layer& l, int il, double& cpu_ms);
+    void moe_tail(Layer& l);
+    void tok_head();
+    void seg(int j);
+    void run_seg(int j) {
+        if (graphs > 0) CK(cudaGraphLaunch(gx[(size_t) j], s));
+        else seg(j);
+    }
+    void tok_graphs();
+    std::vector<int> moes;            // the MoE layers' indices
+    std::vector<cudaGraphExec_t> gx;  // a segment's graph
+    int graphs = -1;                  // -1: not made yet, 0: none, 1: made
 
     // ---------------------------------------------------------------- the prompt path (prefill)
     // A chunk of up to C tokens a layer at a time on the GPU: the dense matrices decoded to F16 and multiplied by
@@ -1709,10 +1727,10 @@ void Engine::Impl::tok_attention(Layer& l) {
     k::add(x, ao, E, s);
 }
 
-// A MoE layer: the router's logits and the latent to the host, the routing there; the chosen experts in VRAM on the
-// GPU, the others on the CPU lane, both at once; then the latent sum up, the shared expert, x += both.
-void Engine::Impl::tok_moe(Layer& l, int il, double& cpu_ms) {
-    const int E = g.n_embd, ne = g.n_expert, nu = g.n_used, NL = g.n_lat, ff = g.n_ff_exp;
+// A MoE layer's first part: a's norm and int8 rows, the router's logits and the latent to the host, the latent's int8
+// rows (for the experts in VRAM).
+void Engine::Impl::moe_pre(Layer& l) {
+    const int E = g.n_embd, ne = g.n_expert, NL = g.n_lat;
     k::rmsnorm(x, l.norm, a, 1, E, g.eps, s);
     quant(qa, a, 1, E);
     mv(l.gate_inp, qa, a, 0, rlog);   // (F32: read as F32)
@@ -1720,9 +1738,23 @@ void Engine::Impl::tok_moe(Layer& l, int il, double& cpu_ms) {
     CK(cudaMemcpyAsync(h_rlog, rlog, (size_t) ne * sizeof(float), cudaMemcpyDeviceToHost, s));
     CK(cudaMemcpyAsync(h_lat, lat, (size_t) NL * sizeof(float), cudaMemcpyDeviceToHost, s));
     quant(ql, lat, 1, NL);
-    const bool staging = ec_stage_begin(ec.piece);   // (a piece of the swaps' copies while the GPU works)
-    CK(cudaStreamSynchronize(s));
-    if (staging) ec_stage_end();
+}
+
+// A MoE layer's end: the CPU lane's sum (and which lanes ran) up to the device, the latent sum up to the model's width,
+// x += it and the shared expert's.
+void Engine::Impl::moe_tail(Layer& l) {
+    const int E = g.n_embd, NL = g.n_lat;
+    CK(cudaMemcpyAsync(d_tail, h_tail, ((size_t) 4 + NL) * sizeof(float), cudaMemcpyHostToDevice, s));
+    k::lat_sum(d_tail + 4, ec.routed, (const int*) d_tail, lat_s, NL, s);
+    quant(ql, lat_s, 1, NL);
+    mv(l.lat_up, ql, lat_s, 0, mo);
+    k::add2(x, mo, sho, E, s);
+}
+
+// The routing on the host (the logits there after the sync); the chosen experts in VRAM on the GPU and the shared
+// expert, the others on the CPU lane, both at once; the CPU lane's sum and the lanes' flags in h_tail.
+void Engine::Impl::moe_mid(Layer& l, int il, double& cpu_ms) {
+    const int ne = g.n_expert, nu = g.n_used, NL = g.n_lat, ff = g.n_ff_exp;
     const double c0 = now_ms();
     // routing: the top n_used of sigmoid(logit) + bias, ties to the lower id; weights their sigmoids, normalized, x scale
     int sel[32];
@@ -1776,28 +1808,11 @@ void Engine::Impl::tok_moe(Layer& l, int il, double& cpu_ms) {
     int* flags = (int*) h_tail;
     flags[0] = nc > 0;
     flags[1] = ng > 0;
-    CK(cudaMemcpyAsync(d_tail, h_tail, ((size_t) 4 + NL) * sizeof(float), cudaMemcpyHostToDevice, s));
-    k::lat_sum(d_tail + 4, ec.routed, (const int*) d_tail, lat_s, NL, s);
-    quant(ql, lat_s, 1, NL);
-    mv(l.lat_up, ql, lat_s, 0, mo);
-    k::add2(x, mo, sho, E, s);
 }
 
-const float* Engine::Impl::step(int token) {
-    if (pos >= max_ctx || token < 0 || token >= g.vocab) return nullptr;
-    const double t0 = now_ms();
-    double cpu_ms = 0.0;
+// the token's row (h_erow, written by the host) and its position (h_pos) up; x = the row
+void Engine::Impl::tok_embed() {
     const int E = g.n_embd;
-    if (pf_open) {   // the first token after a prompt: the prompt path's buffers lent to the cache again, and filled
-        pf_open = false;
-        if (ec.arena_end > ec.own) {
-            ec.lent = true;
-            ec_fill();
-        }
-    }
-    ec_kv_reserve(pos + 1);
-    // the token's row
-    std::memcpy(h_erow, embd.w + (size_t) token * embd.rb, embd.rb);
     CK(cudaMemcpyAsync(d_erow, h_erow, embd.rb, cudaMemcpyHostToDevice, s));
     if (is_float(embd.type)) {
         k::row_to_f32(d_erow, embd.type, x, E, s);
@@ -1808,25 +1823,95 @@ const float* Engine::Impl::step(int token) {
         }
         k::f16_to_f32((const __half*) e16, x, E, s);
     }
-    h_pos[0] = pos;
     CK(cudaMemcpyAsync(dpos, h_pos, sizeof(int), cudaMemcpyHostToDevice, s));
-    static const bool trace = std::getenv("NEM_TRACE") != nullptr;
-    for (int il = 0; il < g.n_layer; ++il) {
-        Layer& l = L[(size_t) il];
-        if (trace) {
-            CK(cudaStreamSynchronize(s));
-            std::fprintf(stderr, "[trace] pos %d layer %d kind %d\n", pos, il, (int) l.kind);
-            std::fflush(stderr);
-        }
-        if (l.kind == kMamba) tok_mamba(l);
-        else if (l.kind == kAttn) tok_attention(l);
-        else tok_moe(l, il, cpu_ms);
-    }
-    // the output head
+}
+
+void Engine::Impl::tok_head() {
+    const int E = g.n_embd;
     k::rmsnorm(x, out_norm, a, 1, E, g.eps, s);
     quant(qa, a, 1, E);
     mv(output, qa, a, 0, logits);
     CK(cudaMemcpyAsync(h_logits, logits, (size_t) g.vocab * sizeof(float), cudaMemcpyDeviceToHost, s));
+}
+
+void Engine::Impl::seg(int j) {
+    const int M = (int) moes.size();
+    int from = 0;
+    if (j == 0) {
+        tok_embed();
+    } else {
+        moe_tail(L[(size_t) moes[(size_t) j - 1]]);
+        from = moes[(size_t) j - 1] + 1;
+    }
+    const int to = j < M ? moes[(size_t) j] : g.n_layer;
+    for (int il = from; il < to; ++il) {
+        Layer& l = L[(size_t) il];
+        if (l.kind == kMamba) tok_mamba(l);
+        else tok_attention(l);
+    }
+    if (j < M) moe_pre(L[(size_t) moes[(size_t) j]]);
+    else tok_head();
+}
+
+void Engine::Impl::tok_graphs() {
+    graphs = 0;
+    const char* v = std::getenv("NEM_GRAPHS");
+    if ((v && std::atoi(v) == 0) || std::getenv("NEM_TRACE")) return;
+    const int n = (int) moes.size() + 1;
+    gx.assign((size_t) n, nullptr);
+    bool ok = true;
+    for (int j = 0; j < n && ok; ++j) {
+        cudaGraph_t gr = nullptr;
+        ok = cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+        if (!ok) break;
+        seg(j);
+        ok = cudaStreamEndCapture(s, &gr) == cudaSuccess && gr;
+        ok = ok && cudaGraphInstantiate(&gx[(size_t) j], gr, 0) == cudaSuccess;
+        if (gr) cudaGraphDestroy(gr);
+    }
+    if (!ok) {
+        cudaGetLastError();
+        std::fprintf(stderr, "maya-nem: the token path's CUDA graphs could not be made; it launches its kernels one by one\n");
+        for (auto& e : gx)
+            if (e) cudaGraphExecDestroy(e);
+        gx.clear();
+        return;
+    }
+    graphs = 1;
+}
+
+const float* Engine::Impl::step(int token) {
+    if (pos >= max_ctx || token < 0 || token >= g.vocab) return nullptr;
+    const double t0 = now_ms();
+    double cpu_ms = 0.0;
+    if (pf_open) {   // the first token after a prompt: the prompt path's buffers lent to the cache again, and filled
+        pf_open = false;
+        if (ec.arena_end > ec.own) {
+            ec.lent = true;
+            ec_fill();
+        }
+    }
+    if (moes.empty())
+        for (int il = 0; il < g.n_layer; ++il)
+            if (L[(size_t) il].kind == kMoe) moes.push_back(il);
+    if (graphs < 0) tok_graphs();
+    ec_kv_reserve(pos + 1);
+    // the token's row and position, for segment 0
+    std::memcpy(h_erow, embd.w + (size_t) token * embd.rb, embd.rb);
+    h_pos[0] = pos;
+    static const bool trace = std::getenv("NEM_TRACE") != nullptr;
+    run_seg(0);
+    for (size_t j = 0; j < moes.size(); ++j) {
+        const bool staging = ec_stage_begin(ec.piece);   // (a piece of the swaps' copies while the GPU works)
+        CK(cudaStreamSynchronize(s));
+        if (staging) ec_stage_end();
+        if (trace) {
+            std::fprintf(stderr, "[trace] pos %d MoE layer %d\n", pos, moes[j]);
+            std::fflush(stderr);
+        }
+        moe_mid(L[(size_t) moes[j]], moes[j], cpu_ms);
+        run_seg((int) j + 1);
+    }
     const bool staging = ec_stage_begin(4 * ec.piece);   // (the head's GEMV is the token's longest wait)
     CK(cudaStreamSynchronize(s));
     if (staging) ec_stage_end();
