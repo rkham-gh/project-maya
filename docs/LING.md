@@ -42,6 +42,11 @@ layer (Q4_0, 4.6 GB) is not loaded.
   multiplied; then each is decoded, multiplied for its tokens and added to theirs times their weights, in id order,
   then the shared expert: the same sums every run. Prompts under 256 new tokens (`LING_MIN_CHUNK`) take the token path:
   a chunk of a few hundred tokens already touches nearly every one of a layer's 512 experts, ~150 GB to copy.
+  `LING_PF_PREFETCH=1` (off until measured): a chunk of `LING_PF_PREFETCH_MIN` (4,096) tokens or more uses nearly every
+  expert, so a copier thread (its own pinned staging, pool and copy stream) stages each MoE layer's experts that are not
+  in the VRAM cache into one of two layer buffers (2 x 3.3 GB in the arena) while the GPU computes the layers before:
+  the copies no longer wait for the attention's compute, nor the attention for them. The GEMMs read the same weights in
+  the same order (the same bits).
 - **The VRAM expert cache**: maya-ink's (slots sized per class of layers' expert bytes, the prompt path's arena lent
   between prompts, the MLA caches' rows past the position lent too; scores decaying 0.99 a token, up to 16 swaps every
   2 tokens at a margin of 1.5, each swap's copy staged in 2 MB pieces while the CPU waits for the GPU; `--profile FILE`
