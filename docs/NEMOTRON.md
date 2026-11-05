@@ -111,6 +111,14 @@ Measured the same way, 3 runs:
   `_SWAPS=4`, `_MARGIN=1.25`), it gives the earlier build's log-probabilities bit for bit. With the current settings
   it differs slightly at the token path's positions, as the cache settings change which experts run on the GPU.
 
+The hard test (`test-results\2026-11-01-hard\hard-test.py`, 25 tasks) on UD-Q3_K_XL at its best, 2026-11-05: the
+card's sampling (temperature 1.0, top-p 0.95), a 262,144-token budget trimmed to the context (`fit_max_tokens`), the
+thinking cap off (`thinking_budget` 0), `--loop-guard` and `--tool-thinking`. It scored 17 of 25 in 195 minutes, 472K
+tokens at 40 tok/s on average. Every task outside coding came out right, though trace-3's line came without the code
+block the prompt asks for, so it scores as wrong. The repair job passed 10 of 10. None of the 7 coding tasks passed:
+each answer stopped by itself after 9K-48K tokens with a bug in its own code. Flash-Next on Strata scores 22 in 51
+minutes, Qwen3.8-27B 20 in 130.
+
 ## The server
 
 - `serve/frontend.py` knows the template by its `medium_effort`: the server's `low` / `medium` (and `minimal`) turn it
