@@ -573,20 +573,29 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
         if (const strata::MetaValue* v = f0.get("tokenizer.ggml.tokens")) g.vocab = (int) v->items.size();
     g.ctx_train = meta_int(f0, A + "context_length");
     g.eos = meta_int(f0, "tokenizer.ggml.eos_token_id", -1);
+    // Each layer's kind from its tensors, not the per-layer metadata arrays: strata's GGUF reader keeps only the first
+    // 64 items of an array (gguf_reader.hpp's read_value), and Nemotron's have 89.
     g.kind.assign((size_t) g.n_layer, kMamba);
     for (int il = 0; il < g.n_layer; ++il) {
-        const int hkv = meta_layer(f0, A + "attention.head_count_kv", il, 0), ff = meta_layer(f0, A + "feed_forward_length", il, 0);
-        if (hkv > 0) {
+        const std::string b = "blk." + std::to_string(il) + ".";
+        if (find(b + "ssm_in.weight")) {
+            g.kind[(size_t) il] = kMamba;
+        } else if (const Tensor* tk = find(b + "attn_k.weight")) {
             g.kind[(size_t) il] = kAttn;
+            const int hkv = g.head_dim > 0 && tk->info->shape.size() >= 2 ? (int) (tk->info->shape[1] / g.head_dim) : 0;
             if (g.n_head_kv == 0) g.n_head_kv = hkv;
             if (hkv != g.n_head_kv) {
                 err = "attention layers with different KV head counts";
                 return false;
             }
-        } else if (ff > 0) {
+        } else if (find(b + "ffn_up_exps.weight")) {
             g.kind[(size_t) il] = kMoe;
+        } else {
+            err = b + "*: neither a Mamba-2, an attention nor a MoE layer's tensors";
+            return false;
         }
     }
+    (void) meta_layer;
     ssm_P = g.n_ssm_head > 0 ? g.d_inner / g.n_ssm_head : 0;
     if (g.n_layer <= 0 || g.n_embd <= 0 || g.n_head_kv <= 0 || g.head_dim % 32 != 0 || g.head_dim > 256 ||
         g.n_head % g.n_head_kv != 0 || g.n_head / g.n_head_kv > 16 || g.n_used > CpuLane::kMax || g.n_used > 32 ||

@@ -25,7 +25,7 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="the pack directory (tokenizer/ goes inside)")
     a = ap.parse_args()
     tok = pathlib.Path(a.out) / "tokenizer"
-    cfg = ST.extract(a.gguf, tok)
+    cfg = ST.extract(a.gguf, a.out)   # (writes <out>/tokenizer)
     if cfg["pre"] != "tekken":
         raise SystemExit(f"{a.gguf}: pre-tokenizer {cfg['pre']!r}, not Nemotron 3.5's 'tekken'")
     meta = json.loads((tok / "tokenizer.json").read_text(encoding="utf-8"))

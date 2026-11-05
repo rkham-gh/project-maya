@@ -63,6 +63,10 @@ class ChatTemplate:
         # is told.  Thinking off (a client's, or a forced tool call's) closes the block the way its Qwen base's template
         # writes thinking off - <think>\n\n</think>\n\n - so the prompt and the server's parser agree
         self.forced_thinking = bool(re.search(r"set\s+enable_thinking\s*=\s*true", self.source))
+        # NVIDIA Nemotron 3.5 (its GGUF's template): ChatML with <think>; thinking on by default, and one lighter level,
+        # medium_effort - "{reasoning effort: efficient}" after the last user message, ~2.2x fewer tokens for ~9% lower
+        # accuracy in NVIDIA's report
+        self.nemotron = "medium_effort" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -114,6 +118,12 @@ class ChatTemplate:
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                         **kwargs)
+        if self.nemotron:
+            # the server's low / medium (and minimal) are Nemotron's medium_effort, the others its full default
+            level = name or kwargs.get("reasoning_effort")
+            kwargs.pop("reasoning_effort", None)
+            if level in ("minimal", "low", "medium"):
+                kwargs["medium_effort"] = True
         off = False
         if self.glm_effort:
             off = kwargs.pop("enable_thinking", True) is False
