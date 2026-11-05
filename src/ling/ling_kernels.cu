@@ -1066,6 +1066,164 @@ bool selftest() {
         cudaFree(dw);
         cudaFree(dsel);
     }
+    // KDA's prep: a chunk of T tokens (kda_conv + kda_conv_state + kda_norm_gate) against the host's arithmetic, and
+    // against the token path's kda_prep1 a token at a time; kda_out against the host
+    {
+        const int H = 4, hd = 128, Cc = H * hd, K = 4, T = 9;
+        std::vector<float> wq((size_t) Cc * K), wk((size_t) Cc * K), wv((size_t) Cc * K), dtb(Cc), av(H);
+        std::vector<float> qr((size_t) T * Cc), kr((size_t) T * Cc), vr((size_t) T * Cc), fr((size_t) T * Cc), br((size_t) T * H);
+        std::vector<float> st0((size_t) 3 * Cc * (K - 1));
+        for (auto* v : {&wq, &wk, &wv, &dtb, &qr, &kr, &vr, &fr, &br, &st0})
+            for (auto& x : *v) x = N(rng);
+        for (auto& x : av) x = 1.0f + 15.0f * U(rng);
+        // host: the chunk's conv (state, then the inputs), silu, the heads' L2 norms, the gates, beta
+        auto in_at = [&](const std::vector<float>& raw, int which, int tt, int c) {
+            return tt >= 0 ? raw[(size_t) tt * Cc + c] : st0[(size_t) which * Cc * (K - 1) + (size_t) c * (K - 1) + (tt + K - 1)];
+        };
+        std::vector<float> hq((size_t) T * Cc), hk((size_t) T * Cc), hv((size_t) T * Cc), hge((size_t) T * Cc), hb((size_t) T * H);
+        for (int which = 0; which < 3; ++which) {
+            const auto& raw = which == 0 ? qr : which == 1 ? kr : vr;
+            const auto& w = which == 0 ? wq : which == 1 ? wk : wv;
+            auto& out = which == 0 ? hq : which == 1 ? hk : hv;
+            for (int t = 0; t < T; ++t)
+                for (int c = 0; c < Cc; ++c) {
+                    double acc = 0;
+                    for (int j = 0; j < K; ++j) acc += (double) in_at(raw, which, t - (K - 1) + j, c) * w[(size_t) c * K + j];
+                    out[(size_t) t * Cc + c] = (float) (acc / (1.0 + std::exp(-acc)));
+                }
+        }
+        for (int t = 0; t < T; ++t)
+            for (int h = 0; h < H; ++h) {
+                for (auto* v : {&hq, &hk}) {
+                    double ss = 0;
+                    for (int i = 0; i < hd; ++i) ss += (double) (*v)[(size_t) t * Cc + h * hd + i] * (*v)[(size_t) t * Cc + h * hd + i];
+                    for (int i = 0; i < hd; ++i) (*v)[(size_t) t * Cc + h * hd + i] = (float) ((*v)[(size_t) t * Cc + h * hd + i] / std::sqrt(ss + 1e-6));
+                }
+                for (int i = 0; i < hd; ++i) {
+                    const size_t at = (size_t) t * Cc + h * hd + i;
+                    const double sg = 1.0 / (1.0 + std::exp(-(double) av[h] * (fr[at] + dtb[(size_t) h * hd + i])));
+                    hge[at] = (float) std::exp(-5.0 * sg);
+                }
+                hb[(size_t) t * H + h] = (float) (1.0 / (1.0 + std::exp(-(double) br[(size_t) t * H + h])));
+            }
+        float *dwq = up(wq), *dwk = up(wk), *dwv = up(wv), *ddt = up(dtb), *da = up(av), *dqr = up(qr), *dkr = up(kr),
+              *dvr = up(vr), *dfr = up(fr), *dbr = up(br), *dst = up(st0);
+        float *dqc = nullptr, *dkc = nullptr, *dvc = nullptr, *dbt = nullptr;
+        for (float** p : {&dqc, &dkc, &dvc}) cudaMalloc(p, (size_t) T * Cc * sizeof(float));
+        cudaMalloc(&dbt, (size_t) T * H * sizeof(float));
+        Kda kw;
+        kw.wq = dwq;
+        kw.wk = dwk;
+        kw.wv = dwv;
+        kw.dt_bias = ddt;
+        kw.a = da;
+        kw.H = H;
+        kw.hd = hd;
+        kw.K = K;
+        kw.lb = -5.0f;
+        kw.eps = 1e-6f;
+        float *sq = dst, *sk = dst + (size_t) Cc * (K - 1), *sv = dst + (size_t) 2 * Cc * (K - 1);
+        kda_conv(kw, dqr, dkr, dvr, sq, sk, sv, dqc, dkc, dvc, T, nullptr);
+        kda_conv_state(kw, dqr, dkr, dvr, sq, sk, sv, T, nullptr);
+        kda_norm_gate(kw, dqc, dkc, dfr, dbr, dbt, T, nullptr);
+        cudaDeviceSynchronize();
+        ok = check("KDA chunk prep: q", down(dqc, hq.size()), hq, 1e-4) && ok;
+        ok = check("KDA chunk prep: k", down(dkc, hk.size()), hk, 1e-4) && ok;
+        ok = check("KDA chunk prep: v", down(dvc, hv.size()), hv, 1e-4) && ok;
+        ok = check("KDA chunk prep: exp(gate)", down(dfr, hge.size()), hge, 1e-4) && ok;
+        ok = check("KDA chunk prep: beta", down(dbt, hb.size()), hb, 1e-5) && ok;
+        // the states after the chunk: the last K - 1 raw inputs
+        {
+            std::vector<float> want(st0.size());
+            for (int which = 0; which < 3; ++which) {
+                const auto& raw = which == 0 ? qr : which == 1 ? kr : vr;
+                for (int c = 0; c < Cc; ++c)
+                    for (int j = 0; j < K - 1; ++j)
+                        want[(size_t) which * Cc * (K - 1) + (size_t) c * (K - 1) + j] = raw[(size_t) (T - (K - 1) + j) * Cc + c];
+            }
+            ok = check("KDA chunk prep: conv states", down(dst, st0.size()), want, 0.0) && ok;
+        }
+        // the token path's prep, a token at a time from the same start
+        cudaMemcpy(dst, st0.data(), st0.size() * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(dfr, fr.data(), fr.size() * sizeof(float), cudaMemcpyHostToDevice);
+        float *tq = nullptr, *tk = nullptr, *tv = nullptr, *tg = nullptr, *tb = nullptr;
+        for (float** p : {&tq, &tk, &tv, &tg}) cudaMalloc(p, (size_t) T * Cc * sizeof(float));
+        cudaMalloc(&tb, (size_t) T * H * sizeof(float));
+        for (int t = 0; t < T; ++t)
+            kda_prep1(kw, dqr + (size_t) t * Cc, dkr + (size_t) t * Cc, dvr + (size_t) t * Cc, dfr + (size_t) t * Cc,
+                      dbr + (size_t) t * H, sq, sk, sv, tq + (size_t) t * Cc, tk + (size_t) t * Cc, tv + (size_t) t * Cc,
+                      tg + (size_t) t * Cc, tb + (size_t) t * H, nullptr);
+        cudaDeviceSynchronize();
+        ok = check("KDA token prep: q", down(tq, hq.size()), hq, 1e-4) && ok;
+        ok = check("KDA token prep: k", down(tk, hk.size()), hk, 1e-4) && ok;
+        ok = check("KDA token prep: v", down(tv, hv.size()), hv, 1e-4) && ok;
+        ok = check("KDA token prep: exp(gate)", down(tg, hge.size()), hge, 1e-4) && ok;
+        ok = check("KDA token prep: beta", down(tb, hb.size()), hb, 1e-5) && ok;
+        // kda_out: rmsnorm(o) w sigmoid(g) a head, and its int8 rows' scales
+        {
+            std::vector<float> o((size_t) T * Cc), gr((size_t) T * Cc), wn(hd), want((size_t) T * Cc);
+            for (auto* v : {&o, &gr, &wn})
+                for (auto& x : *v) x = N(rng);
+            for (int t = 0; t < T; ++t)
+                for (int h = 0; h < H; ++h) {
+                    double ss = 0;
+                    for (int i = 0; i < hd; ++i) ss += (double) o[(size_t) t * Cc + h * hd + i] * o[(size_t) t * Cc + h * hd + i];
+                    const double sc = 1.0 / std::sqrt(ss / hd + 1e-6);
+                    for (int i = 0; i < hd; ++i) {
+                        const size_t at = (size_t) t * Cc + h * hd + i;
+                        want[at] = (float) (o[at] * sc * wn[i] / (1.0 + std::exp(-(double) gr[at])));
+                    }
+                }
+            float *dO = up(o), *dG = up(gr), *dW = up(wn), *dY = nullptr;
+            cudaMalloc(&dY, want.size() * sizeof(float));
+            kda_out(dO, dG, dW, 1e-6f, T, H, dY, nullptr, nullptr, nullptr, nullptr);
+            cudaDeviceSynchronize();
+            ok = check("KDA out (norm x gate)", down(dY, want.size()), want, 1e-4) && ok;
+            for (float* p : {dO, dG, dW, dY}) cudaFree(p);
+        }
+        for (float* p : {dwq, dwk, dwv, ddt, da, dqr, dkr, dvr, dfr, dbr, dst, dqc, dkc, dvc, dbt, tq, tk, tv, tg, tb})
+            cudaFree(p);
+    }
+    // MLA's cache rows (rmsnorm of 512, rope of 64) and q's rope, at positions 5 .. 7, against the host
+    {
+        const int T = 3, H = 2, p0 = 5;
+        const float ts = std::pow(6.0e6f, -2.0f / 64.0f);
+        std::vector<float> kva((size_t) T * 576), wn(512), q((size_t) T * H * 192);
+        for (auto* v : {&kva, &wn, &q})
+            for (auto& x : *v) x = N(rng);
+        std::vector<float> want_row((size_t) T * 576), want_q = q;
+        for (int t = 0; t < T; ++t) {
+            double ss = 0;
+            for (int d = 0; d < 512; ++d) ss += (double) kva[(size_t) t * 576 + d] * kva[(size_t) t * 576 + d];
+            const double sc = 1.0 / std::sqrt(ss / 512 + 1e-6);
+            for (int d = 0; d < 512; ++d) want_row[(size_t) t * 576 + d] = h2f(__float2half((float) (kva[(size_t) t * 576 + d] * sc * wn[d])));
+            for (int i = 0; i < 32; ++i) {
+                const double th = (double) (p0 + t) * std::pow((double) ts, (double) i);
+                const double x0 = kva[(size_t) t * 576 + 512 + 2 * i], x1 = kva[(size_t) t * 576 + 512 + 2 * i + 1];
+                want_row[(size_t) t * 576 + 512 + 2 * i] = h2f(__float2half((float) (x0 * std::cos(th) - x1 * std::sin(th))));
+                want_row[(size_t) t * 576 + 512 + 2 * i + 1] = h2f(__float2half((float) (x0 * std::sin(th) + x1 * std::cos(th))));
+                for (int h = 0; h < H; ++h) {
+                    const size_t at = ((size_t) t * H + h) * 192 + 128 + 2 * i;
+                    want_q[at] = (float) (q[at] * std::cos(th) - q[at + 1] * std::sin(th));
+                    want_q[at + 1] = (float) (q[at] * std::sin(th) + q[at + 1] * std::cos(th));
+                }
+            }
+        }
+        float *dk = up(kva), *dw = up(wn), *dq = up(q);
+        __half* dc = nullptr;
+        cudaMalloc(&dc, (size_t) (p0 + T) * 576 * sizeof(__half));
+        mla_kv_store(dk, dw, 1e-6f, dc, T, p0, nullptr, ts, nullptr);
+        mla_rope_q(dq, T, H, p0, nullptr, ts, nullptr);
+        cudaDeviceSynchronize();
+        std::vector<__half> rows((size_t) T * 576);
+        cudaMemcpy(rows.data(), dc + (size_t) p0 * 576, rows.size() * sizeof(__half), cudaMemcpyDeviceToHost);
+        std::vector<float> got(rows.size());
+        for (size_t i = 0; i < rows.size(); ++i) got[i] = h2f(rows[i]);
+        ok = check("MLA cache rows (norm, rope)", got, want_row, 2e-3) && ok;
+        ok = check("MLA q rope", down(dq, q.size()), want_q, 1e-4) && ok;
+        for (float* p : {dk, dw, dq}) cudaFree(p);
+        cudaFree(dc);
+    }
     return ok;
 }
 
