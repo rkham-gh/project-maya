@@ -20,7 +20,11 @@
 // given tokens fed instead of the greedy ones, each line ending with that token's own log-probability, so another
 // engine's continuation is scored position by position.  --dump-logits: the logits after the prompt (float32, vocab).
 //
-//   maya-ling --selftest       the KDA recurrence, the MLA decode attention and the routing against host references
+//   maya-ling --gguf <...> --runs runs.txt    several such runs with one load: a line a run, "NAME pf|step @ids.txt
+//                                             (@follow.txt | N)", the state reset before each, its lines between
+//                                             "RUN NAME" and "END NAME ok|failed"
+//
+//   maya-ling --selftest      the KDA recurrence, the MLA decode attention and the routing against host references
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -208,7 +212,7 @@ struct Input {
 
 int main(int argc, char** argv) {
     ling::Options opt;
-    std::string ids_arg, dump, follow_arg;
+    std::string ids_arg, dump, follow_arg, runs_arg;
     int gen = 0, top = 5;
     bool serve = false, by_step = false, selftest = false;
     for (int i = 1; i < argc; ++i) {
@@ -229,6 +233,7 @@ int main(int argc, char** argv) {
         else if (a == "--gen") gen = std::atoi(val().c_str());
         else if (a == "--top") top = std::max(1, std::atoi(val().c_str()));
         else if (a == "--follow") follow_arg = val();
+        else if (a == "--runs") runs_arg = val();
         else if (a == "--step") by_step = true;
         else if (a == "--chunk") opt.chunk = std::max(64, std::atoi(val().c_str()));
         else if (a == "--sub") opt.sub = std::max(16, std::atoi(val().c_str()));
@@ -264,15 +269,13 @@ int main(int argc, char** argv) {
     const int V = g.vocab;
     const int eos = g.eos;   // <|role_end|> (the GGUF's tokenizer.ggml.eos_token_id)
 
-    if (!serve) {
-        const std::vector<int> ids = parse_ids(ids_arg);
-        if (ids.empty()) {
-            std::fprintf(stderr, "maya-ling: no prompt ids\n");
-            return 2;
-        }
+    // One test run: the prompt (the prompt path, or the token path with by_step), then greedy tokens or the follow's,
+    // each step's line "pick id:lp ..." (and " | pick:lp" when following); false: the prompt did not fit.
+    auto run_one = [&](const std::vector<int>& ids, bool step_path, const std::vector<int>& follow, int n_gen,
+                       const std::string& dump_to) -> bool {
         const double t0 = now_ms();
         const float* lg = nullptr;
-        if (by_step)
+        if (step_path)
             for (int id : ids) lg = eng.step(id);
         else
             for (size_t i = 0; i < ids.size(); i += (size_t) opt.chunk)
@@ -281,19 +284,17 @@ int main(int argc, char** argv) {
         const auto ps = eng.stats();
         std::fprintf(stderr, "maya-ling: prompt %zu tokens in %.1f s (%.1f tok/s; %s, %.1f GB of experts copied)\n",
                      ids.size(), (t1 - t0) / 1000.0, ids.size() * 1000.0 / (t1 - t0),
-                     by_step ? "the token path" : "the prompt path", ps.pf_copy_gb);
+                     step_path || (int) ids.size() < 256 ? "the token path" : "the prompt path", ps.pf_copy_gb);
         if (!lg) {
             std::fprintf(stderr, "maya-ling: the prompt did not fit\n");
-            return 1;
+            return false;
         }
-        if (!dump.empty()) {
-            std::ofstream f(dump, std::ios::binary);
+        if (!dump_to.empty()) {
+            std::ofstream f(dump_to, std::ios::binary);
             f.write((const char*) lg, (std::streamsize) V * sizeof(float));
         }
         eng.clear_stats();
-        // each step: the token chosen (greedy, or --follow's next one), then the top ones as id:log-probability
-        const std::vector<int> follow = follow_arg.empty() ? std::vector<int>() : parse_ids(follow_arg);
-        const int steps = follow.empty() ? gen : (int) follow.size();
+        const int steps = follow.empty() ? n_gen : (int) follow.size();
         for (int n = 0; n < steps && lg; ++n) {
             std::vector<int> idx((size_t) V);
             for (int i = 0; i < V; ++i) idx[(size_t) i] = i;
@@ -319,8 +320,41 @@ int main(int argc, char** argv) {
                          "VRAM, %ld slots, %ld copies)\n",
                          st.tokens, st.tokens * 1000.0 / st.ms_total, 100.0 * st.ms_cpu / st.ms_total,
                          st.lookups ? 100.0 * st.hits / st.lookups : 0.0, st.cache_slots, st.cache_copies);
+        return true;
+    };
+
+    if (!runs_arg.empty()) {
+        // --runs FILE: a line a run, "NAME pf|step @ids.txt (@follow.txt | N)" - the model loaded once, the state reset
+        // before each; the runs' lines between "RUN NAME" and "END NAME"
+        std::ifstream rf(runs_arg);
+        std::string ln;
+        while (std::getline(rf, ln)) {
+            std::stringstream ls(ln);
+            std::string name, mode, ids_f, last_f;
+            if (!(ls >> name >> mode >> ids_f >> last_f)) continue;
+            const std::vector<int> ids = parse_ids(ids_f);
+            const bool fol = !last_f.empty() && last_f[0] == '@';
+            const std::vector<int> follow = fol ? parse_ids(last_f) : std::vector<int>();
+            eng.reset();
+            std::printf("RUN %s\n", name.c_str());
+            std::fflush(stdout);
+            const bool ok = !ids.empty() && run_one(ids, mode == "step", follow, fol ? 0 : std::atoi(last_f.c_str()), "");
+            std::printf("END %s %s\n", name.c_str(), ok ? "ok" : "failed");
+            std::fflush(stdout);
+        }
         eng.save_profile();
         return 0;
+    }
+    if (!serve) {
+        const std::vector<int> ids = parse_ids(ids_arg);
+        if (ids.empty()) {
+            std::fprintf(stderr, "maya-ling: no prompt ids\n");
+            return 2;
+        }
+        const std::vector<int> follow = follow_arg.empty() ? std::vector<int>() : parse_ids(follow_arg);
+        const bool ok = run_one(ids, by_step, follow, gen, dump);
+        eng.save_profile();
+        return ok ? 0 : 1;
     }
 
     // --serve

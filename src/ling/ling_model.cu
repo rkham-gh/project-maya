@@ -248,7 +248,20 @@ struct Engine::Impl {
         uint8_t* d = dalloc<uint8_t>(bytes);
         CK(cudaMemcpy(d, t->data, bytes, cudaMemcpyHostToDevice));
         m.w = d;
+        trim(t->data, bytes);
         return true;
+    }
+    // The mapping's pages of a tensor now in VRAM out of the working set (they stay in the file cache, available to
+    // the system): ~12 GB of RAM the routed experts' 160 GB would otherwise share the machine's 192 with.
+    // LING_TRIM=0: kept.
+    static void trim(const void* p, size_t n) {
+#ifdef _WIN32
+        static const bool on = !std::getenv("LING_TRIM") || std::atoi(std::getenv("LING_TRIM")) != 0;
+        if (on && n >= ((size_t) 1 << 20)) VirtualUnlock((LPVOID) p, n);   // (not locked: "fails", the pages leave)
+#else
+        (void) p;
+        (void) n;
+#endif
     }
     // a small tensor of `count` values as F32 (host copy in hv when asked)
     float* f32(const std::string& name, size_t count, std::string& err, std::vector<float>* hv = nullptr) {
