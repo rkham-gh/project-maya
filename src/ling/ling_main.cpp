@@ -383,6 +383,7 @@ int main(int argc, char** argv) {
         int max_new = 0;
         ss >> max_new;
         Sampling sp;
+        int think_budget = 0, think_end = -1;   // (the server's thinking budget: </think> forced after that many)
         std::vector<std::string> fields;
         while (ss >> w) fields.push_back(w);
         if (fields.empty()) continue;
@@ -397,7 +398,10 @@ int main(int argc, char** argv) {
             else if (k == "top_k") sp.top_k = std::atoi(v.c_str());
             else if (k == "min_p") sp.min_p = std::stof(v);
             else if (k == "seed") sp.seed = std::atoll(v.c_str());
+            else if (k == "think_budget") think_budget = std::atoi(v.c_str());
+            else if (k == "think_end") think_end = std::atoi(v.c_str());
         }
+        bool in_think = think_budget > 0 && think_end >= 0 && think_end < V;
         if (sp.seed >= 0) rng.seed((uint64_t) sp.seed);
         // the prompt: what continues hist is read on from there, what continues the last prompt's end from there,
         // anything else from the start
@@ -450,7 +454,11 @@ int main(int argc, char** argv) {
         std::string finish = "length";
         if (in.stop.load()) finish = "cancel";
         while (finish != "cancel" && generated < max_new && lg) {
-            const int t = sample(lg, V, sp, rng);
+            int t = sample(lg, V, sp, rng);
+            if (in_think) {   // (the reasoning closed by the model, or at the budget by the engine)
+                if (t != think_end && generated >= think_budget) t = think_end;
+                if (t == think_end) in_think = false;
+            }
             std::printf("T %d\n", t);
             std::fflush(stdout);
             ++generated;
