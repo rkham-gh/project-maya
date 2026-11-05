@@ -338,6 +338,7 @@ int main(int argc, char** argv) {
             eng.reset();
             std::printf("RUN %s\n", name.c_str());
             std::fflush(stdout);
+            std::fprintf(stderr, "RUN %s\n", name.c_str());   // (the LING_DUMP lines' run)
             const bool ok = !ids.empty() && run_one(ids, mode == "step", follow, fol ? 0 : std::atoi(last_f.c_str()), "");
             std::printf("END %s %s\n", name.c_str(), ok ? "ok" : "failed");
             std::fflush(stdout);
