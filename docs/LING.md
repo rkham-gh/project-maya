@@ -45,6 +45,30 @@ Measured 2026-11-05 on an RTX 5090 (PCIe 5.0 x8), Ryzen 9 9950X, 192 GB DDR5-360
   (GLM-style, parsed), the answer from the tool's result, a second turn (its prompt's 39 tokens reused), streaming and
   JSON output - 7 of 7. A thinking-on second turn read 21 of its 363 tokens (342 reused).
 
+## Speed
+
+ab.py (test-results\2026-11-01-tuning: thinking off, temperature 0; six new prompts of 400 tokens, then a 35.5K-token
+prompt read and answered, then one prompt three times) at 131K context, 2026-11-05 02:55-04:07, the machine quiet, the
+file cache warmed first; maya-ling's runs each from the same expert profile (`ling-ab.ps1` restores
+`work\profile-P0.bin`, the profile after the first chat checks and derail.py):
+
+| | llama.cpp `--cpu-moe` | llama.cpp's fit (no `-ngl`) | maya-ling, 8K chunks (3 runs) | maya-ling, 16K chunks |
+|---|---|---|---|---|
+| Writing, new prompts | 12.0 tok/s | 12.0 tok/s | **23.0** (23.0 / 23.0 / 22.9) | 22.8 |
+| Writing after the 35.5K prompt | 12.5 | 12.8 | 16.6 (16.9 / 16.7 / 16.3) | 16.6 |
+| Reading the 35.5K prompt | 75.6 tok/s | 86.5 tok/s | 548 tok/s | **733 tok/s** |
+| Its first token | 470 s | 410 s | 64.7 s | **48.5 s** |
+| The same prompt three times | 12.7 -> 12.9 | 12.9 -> 12.9 | 22.4 -> 26.0 | 22.0 -> 25.1 |
+| VRAM | 15.8 GB | 30.7 GB | 29.9 GB | 29.9 GB |
+
+The run config takes `--chunk 16384` (C:\llm\models\Ling-3.1-flash-maya-ling\maya-ling.json; derail.py 0 of 20 on it).
+About half of a token's 544 routed experts are found in the VRAM cache (ec-sim.py's replay of a run's routing: 49.9%);
+the CPU lane, ~0.11 ms an IQ2_XS expert (~41 GB/s of the RAM), is ~65-75% of a token. Writing after a long prompt is
+slower: the cache is refilled from the prompt's experts, and the MLA layers attend over the 35K positions. Replaying the
+routing, adapting the cache every token (`LING_CACHE_EVERY=1`, decay 0.97) instead of every 2 found 58% where 50% was;
+in the engine it wrote 24.1 tok/s on the new prompts but 15.8 after the long one and 23.9 on the repeats - mixed, tuned
+on ab.py's own routing, so not taken (held-out prompts not run).
+
 ## The engine
 
 - **The token path** (`Engine::step`): everything but the routed experts on the GPU, int8-activation GEMVs from
@@ -115,10 +139,8 @@ A run config (`--engine maya --config ...`):
 
 ## Status
 
-- Correct (above). Speed not measured yet on a quiet machine: what the correctness runs showed in passing (a cold cache,
-  no expert profile, 16K context) was 15-24 tok/s writing with 17-55% of a token's experts in VRAM (3,898 slots), the
-  3,771-token prompt read in 8.6 s through the prompt path (88 GB of experts copied) and 112 s through the token path;
-  a load of 16 s with the GGUF in the file cache (the routed experts' 160 GB touched in 11 s).
-- Not done: the expert cache's settings re-tuned for Ling (maya-ink's for now; `ec-sim.py` in the test folder replays a
-  `LING_ROUTE_LOG` trace), `LING_PF_PREFETCH` measured, the chunk size (8,192; 16,384 should nearly halve a long
-  prompt's time a token), the MTP layer (blk.72) for drafting.
+- Correct and measured (above); runs as `switch-model.ps1 ling` (port 8086, 128K context; a start of ~17 s with the
+  GGUF in the file cache, the routed experts' 160 GB touched in 11 s; ~24 GB of the RAM left free while it runs).
+- Not done: the cache's settings for Ling confirmed on held-out prompts (maya-ink's for now: decay 0.99, adapting every
+  2 tokens); `LING_PF_PREFETCH` timed against the plain prompt path from the same cache state (it reproduces its
+  logits); the writing after a long prompt (16.6 tok/s against 23 on new ones); the MTP layer (blk.72) for drafting.
