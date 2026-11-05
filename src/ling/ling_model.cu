@@ -33,11 +33,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <type_traits>
 
@@ -422,6 +424,35 @@ struct Engine::Impl {
     void pf_moe(const Layer& l, int T);
     void chunk(const int* ids, int T, bool want_logits);
     const float* prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx);
+    // (LING_PF_PREFETCH=1) A chunk of LING_PF_PREFETCH_MIN tokens (4096) or more uses nearly every expert of every
+    // layer, so a copier thread stages each MoE layer's experts that are not in the VRAM cache into one of two layer
+    // buffers ([the gates | the ups | the downs] of the layer's experts, as the GGUF holds them) while the GPU computes
+    // the layers before - the copies (the prompt path's bound: ~150 GB a chunk at what the RAM gives three passes) no
+    // longer wait for the attention's compute, nor it for them.  Its own pinned staging, pool and copy stream; the
+    // layer's GEMMs read the same weights in the same order as the group path's (the same bits).
+    struct Prefetch {
+        bool on = false;
+        int min_T = 4096;
+        size_t bytes = 0;                          // a layer buffer's
+        uint8_t* buf[2] = {nullptr, nullptr};      // (in the arena)
+        cudaStream_t cs = nullptr;
+        cudaEvent_t ready[2] = {nullptr, nullptr}, freed[2] = {nullptr, nullptr};
+        uint8_t* pin[2] = {nullptr, nullptr};
+        cudaEvent_t pev[2] = {nullptr, nullptr};
+        size_t pcap = 0;
+        int pk = 0;
+        std::unique_ptr<Pool> pool;
+        std::thread th;
+        std::mutex mu;
+        std::condition_variable cv;
+        int staged = -1, freed_upto = -1;          // (layer numbers: the copier's last staged, the GPU's last done)
+        double bytes_copied = 0, ms = 0;
+        bool active = false;                       // a chunk's copier running
+    } pre;
+    void pre_stage(uint8_t* dst, const uint8_t* src, size_t len);   // (the copier's stage_copy)
+    void pre_run();                                                // (the copier's loop over a chunk's MoE layers)
+    void pre_start();
+    void pre_join();
 
     // ---------------------------------------------------------------- the VRAM expert cache
     // Slots of VRAM, each one routed expert's gate | up | down as the GGUF holds them, for the experts used most
@@ -1490,6 +1521,30 @@ bool Engine::Impl::pf_alloc(std::string& err) {
         if (!l.dense) pf.slot_bytes = std::max(pf.slot_bytes, expert_bytes((int) (&l - L.data())));
     pf.GE = std::max(1, std::min(ne, o.stage));
     pf.u_bytes = std::max(u_kda_bytes(), u_mla_bytes());
+    if (const char* v = std::getenv("LING_PF_PREFETCH")) pre.on = std::atoi(v) != 0;
+    if (const char* v = std::getenv("LING_PF_PREFETCH_MIN")) pre.min_T = std::max(1, std::atoi(v));
+    if (pre.on) {
+        for (int il = g.n_dense; il < g.n_layer; ++il)
+            pre.bytes = std::max(pre.bytes, ((size_t) ne * expert_bytes(il) + 255) & ~(size_t) 255);
+        pre.pcap = (size_t) 64 << 20;
+        bool ok = true;
+        for (int i = 0; i < 2 && ok; ++i) {
+            ok = cudaHostAlloc((void**) &pre.pin[i], pre.pcap, cudaHostAllocPortable) == cudaSuccess;
+            if (ok) {
+                CK(cudaEventCreateWithFlags(&pre.pev[i], cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&pre.ready[i], cudaEventDisableTiming));
+                CK(cudaEventCreateWithFlags(&pre.freed[i], cudaEventDisableTiming));
+            }
+        }
+        if (!ok) {
+            cudaGetLastError();
+            pre.on = false;
+            std::fprintf(stderr, "maya-ling: no pinned staging for the prompt path's prefetch (off)\n");
+        } else {
+            CK(cudaStreamCreateWithFlags(&pre.cs, cudaStreamNonBlocking));
+            pre.pool.reset(new Pool(7));
+        }
+    }
     const size_t gu_cols = (size_t) std::max(ffe, ffs) * 2;
     // Every buffer in one arena (none holds anything from one prompt to the next, so the expert cache can borrow it,
     // and each is written before it is read): the same list twice, first its size, then its pointers, 256-byte aligned.
@@ -1524,6 +1579,10 @@ bool Engine::Impl::pf_alloc(std::string& err) {
         // two group buffers in turn, `stage` experts each (the copy of one group while the other's are multiplied)
         carve(pf.gbuf[0], (size_t) pf.GE * pf.slot_bytes);
         carve(pf.gbuf[1], (size_t) pf.GE * pf.slot_bytes);
+        if (pre.on) {   // (the prefetch's two layer buffers)
+            carve(pre.buf[0], pre.bytes);
+            carve(pre.buf[1], pre.bytes);
+        }
         if (embd_host) carve(pf.Erows, (size_t) Cn * embd.rb);   // (a chunk's embedding rows)
         if (pass == 0) {
             pf.arena_bytes = at;
@@ -1575,6 +1634,83 @@ void Engine::Impl::stage_copy(uint8_t* dst, const uint8_t* src, size_t len) {
         src += n;
         len -= n;
     }
+}
+
+// The copier's staging: stage_copy's, with its own pinned buffers, pool and copy stream
+void Engine::Impl::pre_stage(uint8_t* dst, const uint8_t* src, size_t len) {
+    const int nt = pre.pool->threads();
+    while (len) {
+        const size_t n = std::min(len, pre.pcap);
+        CK(cudaEventSynchronize(pre.pev[pre.pk]));   // (that buffer's last DMA is done)
+        uint8_t* pin = pre.pin[pre.pk];
+        const size_t per = ((n + (size_t) nt - 1) / (size_t) nt + 4095) & ~(size_t) 4095;
+        pre.pool->run(nt, [&](int j) {
+            const size_t a0 = (size_t) j * per;
+            if (a0 < n) std::memcpy(pin + a0, src + a0, std::min(per, n - a0));
+        });
+        CK(cudaMemcpyAsync(dst, pin, n, cudaMemcpyHostToDevice, pre.cs));
+        CK(cudaEventRecord(pre.pev[pre.pk], pre.cs));
+        pre.pk ^= 1;
+        dst += n;
+        src += n;
+        len -= n;
+    }
+}
+
+// The copier's loop over a chunk's MoE layers: layer j's experts not in the VRAM cache into buffer j & 1, once the GPU
+// is through with the layer two before (its `freed` event, recorded after that layer's GEMMs); then the layer's `ready`
+void Engine::Impl::pre_run() {
+    CK(cudaSetDevice(o.gpu));
+    const int ne = g.n_expert, E = g.n_embd, ff = g.n_ff_exp;
+    const double t0 = now_ms();
+    for (int il = g.n_dense, j = 0; il < g.n_layer; ++il, ++j) {
+        const int b = j & 1;
+        if (j >= 2) {
+            {
+                std::unique_lock<std::mutex> lk(pre.mu);
+                pre.cv.wait(lk, [&] { return pre.freed_upto >= il - 2; });
+            }
+            CK(cudaEventSynchronize(pre.freed[b]));
+        }
+        const CpuLayer& c = L[(size_t) il].cl;
+        const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru, db = (size_t) E * c.rd;
+        uint8_t* B = pre.buf[b];
+        for (int e = 0; e < ne;) {
+            if (ec_blob(il, e)) {
+                ++e;
+                continue;
+            }
+            int r = e;
+            while (r < ne && !ec_blob(il, r)) ++r;
+            const size_t n = (size_t) (r - e);
+            pre_stage(B + (size_t) e * gb, c.gate + (size_t) e * gb, n * gb);
+            pre_stage(B + (size_t) ne * gb + (size_t) e * ub, c.up + (size_t) e * ub, n * ub);
+            pre_stage(B + (size_t) ne * (gb + ub) + (size_t) e * db, c.down + (size_t) e * db, n * db);
+            pre.bytes_copied += (double) (n * (gb + ub + db));
+            e = r;
+        }
+        CK(cudaEventRecord(pre.ready[b], pre.cs));
+        {
+            std::lock_guard<std::mutex> lk(pre.mu);
+            pre.staged = il;
+        }
+        pre.cv.notify_all();
+    }
+    pre.ms += now_ms() - t0;
+}
+
+void Engine::Impl::pre_start() {
+    pre.staged = pre.freed_upto = -1;
+    pre.bytes_copied = 0;
+    pre.active = true;
+    pre.th = std::thread([this] { pre_run(); });
+}
+
+void Engine::Impl::pre_join() {
+    if (!pre.active) return;
+    pre.th.join();
+    pre.active = false;
+    pf.copy_bytes += pre.bytes_copied;
 }
 
 void Engine::Impl::f16w(const DMat& m, __half* dst) {
@@ -1778,9 +1914,45 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
         std::fwrite(hdr, 1, 2, route_log);
         std::fwrite(c16.data(), 2, c16.size(), route_log);
     }
+    // The prefetch's way (a copier running for this chunk): every expert not in VRAM already on its way into the
+    // layer's buffer; once it is there, each used expert's GEMMs as below, in id order
+    if (pre.active) {
+        const int b = (il - g.n_dense) & 1;
+        {
+            std::unique_lock<std::mutex> lk(pre.mu);
+            pre.cv.wait(lk, [&] { return pre.staged >= il; });
+        }
+        CK(cudaStreamWaitEvent(s, pre.ready[b], 0));
+        const uint8_t* B = pre.buf[b];
+        for (int e = 0; e < ne; ++e) {
+            const int rows = pf.h_cnt[e], o0 = pf.h_off[e];
+            if (rows == 0) continue;
+            const uint8_t* blob = ec_blob(il, e);
+            const uint8_t* wg = blob ? blob : B + (size_t) e * gb;
+            const uint8_t* wu = blob ? blob + gb : B + (size_t) ne * gb + (size_t) e * ub;
+            const uint8_t* wd = blob ? blob + gb + ub : B + (size_t) ne * (gb + ub) + (size_t) e * db;
+            if (!iq::f16_rows(c.tg, wg, E, ff, (uint16_t*) pf.W1, E, s) ||
+                !iq::f16_rows(c.tu, wu, E, ff, (uint16_t*) (pf.W1 + (size_t) ff * E), E, s) ||
+                !iq::f16_rows(c.td, wd, ff, E, (uint16_t*) pf.W2, ff, s)) {
+                std::fprintf(stderr, "maya-ling: no F16 rows for the experts' types %d / %d / %d\n", c.tg, c.tu, c.td);
+                std::abort();
+            }
+            iq::gather_f16((const uint16_t*) pf.Ah, E, pf.list + o0, rows, E, (uint16_t*) pf.Xe, s);
+            gemm(pf.Xe, E, pf.W1, E, pf.GU, 2 * ff, rows, 2 * ff, E);
+            k::swiglu_rows(pf.GU, rows, ff, l.clamp_exp, pf.He, s);
+            gemm(pf.He, ff, pf.W2, ff, pf.Ye, E, rows, E, ff);
+            k::scatter_add(pf.Ye, pf.list + o0, pf.wl + o0, rows, E, pf.Y, s);
+        }
+        CK(cudaEventRecord(pre.freed[b], s));
+        {
+            std::lock_guard<std::mutex> lk(pre.mu);
+            pre.freed_upto = il;
+        }
+        pre.cv.notify_all();
+    }
     // The experts in groups of GE: a group's used experts that are not in VRAM copied into one of two group buffers
     // (each run of consecutive ones in one copy a tensor), laid out as [the gates | the ups | the downs] of the group.
-    for (int e0 = 0; e0 < ne; e0 += GE) {
+    for (int e0 = 0; e0 < ne && !pre.active; e0 += GE) {
         const int e1 = std::min(ne, e0 + GE);
         bool any = false, copy = false;
         for (int e = e0; e < e1; ++e)
@@ -1888,6 +2060,7 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
     }
     static const bool times = std::getenv("LING_PF_TIMES") != nullptr;
     if (times) CK(cudaStreamSynchronize(s));
+    if (pre.on && T >= pre.min_T) pre_start();   // (the copier: every MoE layer's experts, while the GPU computes)
     double tl0 = now_ms();
     for (int il = 0; il < g.n_layer; ++il) {
         Layer& l = L[(size_t) il];
@@ -1922,11 +2095,12 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
             tl0 = t1;
         }
     }
+    pre_join();
     if (times)
         std::fprintf(stderr,
-                     "maya-ling: prompt path so far: attention %.0f ms, FFN %.0f ms (blocked in copies %.0f ms); %llu "
-                     "page faults, working set %.1f GB\n",
-                     pf.attn_ms, pf.moe_ms, pf.copy_ms, page_faults(), working_set_gb());
+                     "maya-ling: prompt path so far: attention %.0f ms, FFN %.0f ms (blocked in copies %.0f ms; the "
+                     "prefetch's copier %.0f ms); %llu page faults, working set %.1f GB\n",
+                     pf.attn_ms, pf.moe_ms, pf.copy_ms, pre.ms, page_faults(), working_set_gb());
     pos = pos0 + T;
     if (want_logits) {
         k::norm_q8(pf.X + (size_t) (T - 1) * E, out_norm, g.eps, a, xq_a, xd_a, E, s);
