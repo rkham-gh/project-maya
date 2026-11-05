@@ -298,6 +298,20 @@ struct Engine::Impl {
         return d;
     }
 
+    // (LING_DUMP=1) a row of the residual stream after a layer's attention or FFN: its RMS and first values, to stderr -
+    // the token path's (after each segment) and the prompt path's last token (after each part) compared line by line
+    void dump(const char* what, int il, const float* dev, int at) {
+        static const bool on = std::getenv("LING_DUMP") != nullptr;
+        if (!on) return;
+        std::vector<float> v((size_t) g.n_embd);
+        CK(cudaStreamSynchronize(s));
+        CK(cudaMemcpy(v.data(), dev, v.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        double ss = 0;
+        for (float x0 : v) ss += (double) x0 * x0;
+        std::fprintf(stderr, "[dump] pos %d %s %2d rms %.6g  %.5g %.5g %.5g %.5g\n", pos, what, il,
+                     std::sqrt(ss / v.size()), v[0], v[1], v[2], v[3]);
+    }
+
     // ---------------------------------------------------------------- the GPU's products (the token path)
     static iq::MvJob job(const DMat& m, int row0, int rows, const int8_t* xq, const float* xd, float* y,
                          float alpha = 1.0f) {
@@ -1883,6 +1897,7 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
             else pf_kda(l, Ts);
             k::axpy(Xs, pf.Y, nullptr, (size_t) Ts * E, s);
         }
+        dump("attn", il, pf.X + (size_t) (T - 1) * E, pos0 + T - 1);
         if (times) {
             CK(cudaStreamSynchronize(s));
             const double t1 = now_ms();
@@ -1895,6 +1910,7 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
         if (l.dense) pf_dense(l, T);
         else pf_moe(l, T);
         k::axpy(pf.X, pf.Y, nullptr, (size_t) T * E, s);
+        dump("ffn ", il, pf.X + (size_t) (T - 1) * E, pos0 + T - 1);
         if (times) {
             CK(cudaStreamSynchronize(s));
             const double t1 = now_ms();
@@ -2220,6 +2236,7 @@ const float* Engine::Impl::step(int token) {
         const bool staging = ec_stage_begin(ec.piece);   // (a piece of the swaps' copies while the GPU works)
         CK(cudaStreamSynchronize(s));
         if (staging) ec_stage_end();
+        dump("attn", il, x, pos);
         phase(pt.att);
         const double c0 = now_ms();
         int sel[16];
