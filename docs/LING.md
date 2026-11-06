@@ -77,6 +77,17 @@ routing, adapting the cache every token (`LING_CACHE_EVERY=1`, decay 0.97) inste
 in the engine it wrote 24.1 tok/s on the new prompts but 15.8 after the long one and 23.9 on the repeats - mixed, tuned
 on ab.py's own routing, so not taken (held-out prompts not run).
 
+The hard test (`C:\llm\test-results\2026-11-01-hard\hard-test.py`, 25 tasks) at its best, 2026-11-05/06: the
+recommended sampling (temperature 1.0, top-p 0.95, top-k 20), thinking on, a 262,144-token budget trimmed to the 128K
+context, the server's thinking cap off (`thinking_budget` 0 and `fit_max_tokens` in the run config for that start
+only), `--loop-guard` and `--tool-thinking`. It scored 21 of 25 in 744 minutes, 992K tokens at 22 tok/s on average.
+Every task outside coding came out right, and the repair job passed 10 of 10. Coding was 3 of 7: the Scheme
+interpreter, the ordered multiset and the JSON parser (only MiMo's 128K run had passed that one). The diff and the
+Sudoku solver were still thinking when they reached the 128K context, after 131K tokens each. 256K, the model's own
+context, would give them room for about 1.4 GB more of VRAM, but hasn't been tried. The SAT solver ended at 126K
+tokens calling a satisfiable formula unsatisfiable, and the regex engine rejects a valid `?`. Inkling-Small on maya-ink
+also scores 21, in 279 minutes, and Flash-Next on Strata 22 in 51.
+
 ## The engine
 
 - **The token path** (`Engine::step`): everything but the routed experts on the GPU, int8-activation GEMVs from
