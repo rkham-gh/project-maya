@@ -84,6 +84,16 @@ Where the time went, and what fixed it:
   fusing their 22 nodes into 13 about 1%, and a single block doing 4,096 channels' convolutions was slower than the
   kernels it replaced. More speed now needs more of the experts in VRAM.
 
+The hard test (`C:\llm\test-results\2026-11-01-hard\hard-test.py`, 25 tasks) at its best, 2026-11-05: the card's
+sampling (temperature 1.0, top-p 1.0), `reasoning_effort` `max`, a 262,144-token budget trimmed to the 128K context
+(`fit_max_tokens`; maya-ink has no thinking cap), `--loop-guard` and `--tool-thinking`. It scored 21 of 25 in 279
+minutes, 671K tokens at 40 tok/s on average. That's above ab.py's 30, likely because the cache adapts over a long
+answer. Every task outside coding came out right, and the repair job passed 10 of 10. Coding was 3 of 7: the Scheme
+interpreter (the first of any model's runs there), the ordered multiset and the diff. The regex engine calls its own
+helper with an extra argument, and the JSON parser refuses the valid `1e400`. The Sudoku solver took 19.6 s against a
+10 s limit, and the SAT solver ran past its 90 s. Both did the same in two more runs, and the engine uses no CPU
+between requests. Flash-Next on Strata scores 22 in 51 minutes, Qwen3.8-27B 20 in 130.
+
 ## The engine
 
 - **The token path** (`Engine::step`): everything but the routed experts on the GPU, int8-activation GEMVs from
