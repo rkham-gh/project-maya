@@ -32,6 +32,11 @@ struct Options {
     int chunk = 8192;     // the prompt path's tokens a chunk (prefill): every expert a chunk routes to crosses PCIe once
     int stage = 64;       // the prompt path copies the routed experts in groups of this many (two VRAM buffers in turn)
     double cache_gb = -1; // VRAM for the most-used routed experts (-1: what is free, less NEM_VRAM_RESERVE_MIB)
+    // A second card that only holds routed experts (the next most used after the main card's): a token's experts found
+    // there are multiplied on it while the main card and the CPU lane do theirs.  The layers, the states and the prompt
+    // path stay on `gpu`.  -1: none.
+    int helper_gpu = -1;
+    double helper_gb = -1; // its VRAM for them (-1: what is free, less NEM_HELPER_RESERVE_MIB)
     std::string profile;  // the experts' use scores: read at the start (the cache filled from them), save_profile()
     bool verbose = true;
 };
@@ -64,6 +69,11 @@ public:
         long pf_tokens = 0;
         long lookups = 0, hits = 0;        // step()'s routed experts, and those it found in VRAM
         long cache_slots = 0, cache_copies = 0;
+        long hits_helper = 0;              // ... and those it found on the helper card
+        long helper_slots = 0, helper_copies = 0;
+        double ms_lane = 0, ms_helper = 0, ms_update = 0;   // in ms_cpu: the CPU lane's part; the wait for the helper
+                                                            // after it; and the helper's swaps between tokens
+        long lane_layers = 0, helper_layers = 0;            // the MoE layers that used each
     };
     Stats stats() const;
     void clear_stats();

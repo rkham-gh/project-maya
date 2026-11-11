@@ -44,6 +44,24 @@ output head and the embedding Q8_0, the NextN block Q8_0 (3.1 GB).
   attention layers' K / V rows past the position lent to it between prompts, scores that count every choice and decay
   0.99 a token, up to 16 swaps every 2 tokens (margin 1.5; `NEM_CACHE_*`), the swaps' copies staged while the CPU
   waits for the GPU. `--profile FILE` keeps the scores for the next start.
+- **The helper card** (`--helper-gpu N`, branch `nemotron-2gpu`): a second card that holds routed experts only, in a
+  cache of its own (slots by class, as the main cache's; its free VRAM less `NEM_HELPER_RESERVE_MIB`, 1024). It is
+  filled with the best-scored experts the main card does not hold. A token's chosen experts are then split three
+  ways: the main card's, the helper's, and the CPU lane's. The helper gets the latent from the host (it is there
+  after the MoE layer's sync), runs the same up / relu^2 / down launches on its own stream while the main card and
+  the CPU lane do theirs, and returns its sum to the host, which adds it to the CPU lane's before the main card's
+  next segment reads both. No state of the model lives on the helper, so the prompt path, `reset()` and the CUDA
+  graphs are as before, and without `--helper-gpu` the engine runs exactly as it did.
+  - The main cache decides first and leaves the helper's experts alone: its swaps take only experts that are on
+    neither card (`NEM_HELPER_STEAL=1` lets it take the helper's too: 41 tok/s instead of 55 on one 800-token run,
+    because every such swap empties a helper slot and sends the main card's evicted expert to the CPU).
+  - The helper follows: up to 16 swaps every 2 tokens (`NEM_HELPER_SWAPS`, `NEM_HELPER_EVERY`), an expert the main
+    card took dropped, a better-scored one from outside both taken in place of its worst (the main cache's margin);
+    after a prompt, up to an eighth of the prompt's tokens (64 .. 4,096, `NEM_HELPER_FILL`).
+  - Maya's server adds `--layer-split auto` when a config's `"gpu"` names two cards; this engine reads that as
+    `--helper-gpu 1` (the second visible card), so `"gpu": [0, 1]` in the run config is all it takes.
+  - The kernels it launches there (ds4_iq's GEMVs, nem's q8 / relu^2 / row sums) keep no device state, so they run
+    on whichever device is current; the build needs both cards' architectures (`-DCMAKE_CUDA_ARCHITECTURES=86;120`).
 - At start the engine touches every routed expert's pages (75.8 GB, ~5 s from a warm file cache), as maya-ink does:
   on Windows a page's first touch costs a fault even with the file cached.
 
@@ -141,6 +159,34 @@ above:
   but 22-31% slower: 28.4 tok/s with 4 drafts, 32.0 with 2 and 32.3 with 1, against 41.3, at 95% accepted with 1. Each
   drafted token still reads its own experts from RAM, the head takes ~4 GB of VRAM from the expert cache, and the
   drafts are checked one token at a time.
+
+### Two cards: an RTX 3090 as the helper card (2026-11-11)
+
+The RTX 5090 (PCIe 5.0 x8) with an RTX 3090 (PCIe 4.0 x8, limited to 320 W) as `--helper-gpu`, UD-Q3_K_XL, 256K
+context, the AVX2 Q2_0 rows on. `ab.py` through Maya's server, every run from the same expert profile
+(`test-results\2026-11-11-two-gpu\nem-2gpu.ps1`); the one-card column is the same build without the helper.
+
+| | The 5090 alone | With the helper card | llama.cpp, both cards |
+|---|---|---|---|
+| Writing, new prompts | 41.0 tok/s (39.1 on the serving build the same day) | **48.2 tok/s** | 23.0 tok/s |
+| Writing after a 34.2K-token prompt | 33.9 tok/s | **43.8 tok/s** | 25.7 tok/s |
+| Reading that prompt | 1,925 tok/s | 1,829 tok/s | 1,079 tok/s |
+| A repeated prompt, 1st and 3rd time | 36.8, 44.9 tok/s | 53.7, 50.7 tok/s | 23.9, 23.7 tok/s |
+| First token, short prompts | 1.91 s | 2.24 s | 0.52 s |
+
+- **The same answers.** Fed llama.cpp's own tokens for this quant (`nem-ref.py compare ... --ref q3`), the helper
+  build's top token was llama.cpp's at 87 of 88 positions (24/24, 23/24, 24/24, 16/16), log-probabilities within
+  0.11. The chat checks pass 6 of 6 and `derail.py` finds 0 of 20 derailed (325 s). Greedy text parts ways with the
+  one-card run after a few dozen tokens, because the helper's sum joins the CPU lane's in another order.
+- **What it buys.** The helper holds 8,620 experts beside the main card's 8,569 (of 20,480). On one 800-token
+  answer 94.7% of the routed experts were then in VRAM instead of 74%, and the CPU lane ran in 23.5 of the 40 MoE
+  layers a token instead of 38.3: 55.3 tok/s against 39.9.
+- **Where a token's 18.1 ms goes there:** the CPU lane 6.7 ms, the wait for the helper after it 1.8, the helper's
+  swaps 0.4, and 9.2 ms for the main card's own layers and its 40 syncs, which no second card shortens. So this
+  design tops out near 100 tok/s; the next gain is in the main card's token path, not in more VRAM.
+- **New prompts gain less than long answers** (48 against 55 tok/s): each new topic needs other experts, and the
+  helper takes them in at 8 a token. Faster swaps cost their copies (0.19 ms each over this link).
+- The first token of a short turn comes 0.3 s later (the helper's refill after the prompt).
 
 ## The server
 

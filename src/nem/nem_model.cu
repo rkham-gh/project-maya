@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -467,6 +468,35 @@ struct Engine::Impl {
         return sl >= 0 ? ec.ptr[(size_t) sl] : nullptr;
     }
     void gpu_experts(const Layer& l, const int* slot, const float* w, int n);
+
+    // ---------------------------------------------------------------- the helper card's expert cache
+    // A second card (Options::helper_gpu) that holds routed experts only: slots sized by class as the main cache's,
+    // filled with the best-scored experts the main card does not hold.  A token's experts found there get the latent
+    // from the host (h_lat, there after the MoE layer's sync), are multiplied on the helper's own stream while the main
+    // card and the CPU lane do theirs, and their sum comes back to the host, where it is added to the CPU lane's.  The
+    // main cache decides first (it adapts as before); the helper follows it: every `every` tokens up to `per` experts
+    // change places (an expert the main card took is dropped, a better-scored one outside both comes in), and after a
+    // prompt up to `fill_cap`.  Nothing of the model's state lives there, so the prompt path and reset() ignore it.
+    struct HC {
+        int dev = -1, slots = 0;
+        cudaStream_t s = nullptr;
+        std::vector<uint8_t*> ptr;
+        std::vector<int> cls, owner, where;   // slot -> class; slot -> key or -1; key -> slot or -1
+        float *lat = nullptr, *qd = nullptr, *u = nullptr, *hd = nullptr, *y = nullptr, *routed = nullptr;
+        int8_t *qq = nullptr, *hq = nullptr;
+        float* h_out = nullptr;               // (pinned) the helper's sum
+        long hits = 0, copies = 0, tok = 0;
+        // (measured 2026-11-11 on ab.py, RTX 5090 + RTX 3090: 16 swaps every 2 tokens wrote 48.2 tok/s on new prompts
+        //  and 44.7 after a 34K prompt; every 8 tokens 45.6-47.8 and 33-40; every 4 46.7 and 42.0)
+        int every = 2, per = 16, fill_cap = 4096;
+        size_t bytes = 0;
+    } hc;
+    bool hc_steal = false;
+    long pf_tokens_open = 0;   // the tokens read through the prompt path since the last written token
+    void hc_alloc();
+    void hc_update(int max_copies, bool hysteresis);
+    void hc_experts(const Layer& l, const int* slot, const float* w, int n);
+
     bool save_profile(const std::string& path) const;
     bool load_profile(const std::string& path);
 };
@@ -482,11 +512,15 @@ Engine::Stats Engine::stats() const {
     r.hits = p->ec.hits;
     r.cache_slots = p->ec.slots;
     r.cache_copies = p->ec.copies;
+    r.hits_helper = p->hc.hits;
+    r.helper_slots = p->hc.slots;
+    r.helper_copies = p->hc.copies;
     return r;
 }
 void Engine::clear_stats() {
     p->st = Stats{};
     p->ec.lookups = p->ec.hits = 0;
+    p->hc.hits = 0;
 }
 bool Engine::save_profile() const { return !p->o.profile.empty() && p->save_profile(p->o.profile); }
 bool Engine::load(const Options& o, std::string& err) { return p->load(o, err); }
@@ -793,6 +827,18 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
             std::fprintf(stderr, "maya-nem: the expert profile %s: %ld experts into VRAM in %.1f s\n", o.profile.c_str(),
                          ec.copies, (now_ms() - tf) / 1000.0);
     }
+    if (o.helper_gpu >= 0) {
+        const double th = now_ms();
+        hc_alloc();
+        if (hc.slots) {
+            hc_update(INT_MAX, false);
+            if (o.verbose)
+                std::fprintf(stderr,
+                             "maya-nem: helper card CUDA%d: %d expert slots, %.2f GB of its VRAM; %ld experts into them in "
+                             "%.1f s\n",
+                             hc.dev, hc.slots, hc.bytes / 1e9, hc.copies, (now_ms() - th) / 1000.0);
+        }
+    }
     if (o.verbose) {
         std::string cls;
         for (size_t c = 0; c < ec.cls_bytes.size(); ++c) {
@@ -1061,6 +1107,9 @@ void Engine::Impl::ec_adapt() {
             for (int e = 0; e < ec.ne; ++e) {
                 const int key = il * ec.ne + e;
                 if (ec.where[(size_t) key] != -1 || ec.score[(size_t) key] <= 0.0f) continue;
+                // (an expert the helper card holds is off the CPU already: the main card's swaps go to the ones that
+                //  are not, and the helper's slots stay as they are; NEM_HELPER_STEAL=1: the main card takes them too)
+                if (hc.slots && !hc_steal && hc.where[(size_t) key] >= 0) continue;
                 best.push_back(key);
                 std::push_heap(best.begin(), best.end(), by_score);
                 if ((int) best.size() > per) {
@@ -1282,6 +1331,234 @@ void Engine::Impl::gpu_experts(const Layer& l, const int* slot, const float* w, 
         std::abort();
     }
     k::sum_rows(ec.y, n, NL, ec.routed, s);
+}
+
+// ------------------------------------------------------------------------------------------------ the helper card
+namespace {
+// The calling thread on another device for a scope (a stream, its memory and its launches belong to their device).
+struct OnDev {
+    int prev = 0;
+    explicit OnDev(int d) {
+        CK(cudaGetDevice(&prev));
+        CK(cudaSetDevice(d));
+    }
+    ~OnDev() { cudaSetDevice(prev); }
+};
+}  // namespace
+
+void Engine::Impl::hc_alloc() {
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || o.helper_gpu >= ndev || o.helper_gpu == o.gpu || ec.cls_bytes.empty()) {
+        cudaGetLastError();
+        std::fprintf(stderr, "maya-nem: no helper card: --helper-gpu %d is not a second visible CUDA device (%d visible)\n",
+                     o.helper_gpu, ndev);
+        return;
+    }
+    hc.dev = o.helper_gpu;
+    if (const char* v = std::getenv("NEM_HELPER_EVERY")) hc.every = std::max(1, std::atoi(v));
+    if (const char* v = std::getenv("NEM_HELPER_SWAPS")) hc.per = std::max(0, std::atoi(v));
+    if (const char* v = std::getenv("NEM_HELPER_FILL")) hc.fill_cap = std::max(0, std::atoi(v));
+    if (const char* v = std::getenv("NEM_HELPER_STEAL")) hc_steal = std::atoi(v) != 0;
+    const int NL = g.n_lat, ff = g.n_ff_exp, nc = (int) ec.cls_bytes.size();
+    OnDev od(hc.dev);
+    CK(cudaStreamCreate(&hc.s));
+    auto dev_alloc = [&](size_t bytes) {
+        void* p = nullptr;
+        CK(cudaMalloc(&p, bytes));
+        CK(cudaMemset(p, 0, bytes));
+        hc.bytes += bytes;
+        return p;
+    };
+    hc.lat = (float*) dev_alloc((size_t) NL * sizeof(float));
+    hc.qq = (int8_t*) dev_alloc((size_t) NL);
+    hc.qd = (float*) dev_alloc((size_t) NL / 32 * sizeof(float));
+    hc.u = (float*) dev_alloc((size_t) 32 * ff * sizeof(float));
+    hc.hq = (int8_t*) dev_alloc((size_t) 32 * ff);
+    hc.hd = (float*) dev_alloc((size_t) 32 * ff / 32 * sizeof(float));
+    hc.y = (float*) dev_alloc((size_t) 32 * NL * sizeof(float));
+    hc.routed = (float*) dev_alloc((size_t) NL * sizeof(float));
+    CK(cudaHostAlloc((void**) &hc.h_out, (size_t) NL * sizeof(float), cudaHostAllocPortable));
+    // the slots: this card's free VRAM less a reserve, each class's share by its layers (as the main cache's)
+    std::vector<int> nl((size_t) nc, 0);
+    int nmoe = 0;
+    for (int il = 0; il < g.n_layer; ++il)
+        if (ec.layer_cls[(size_t) il] >= 0) {
+            ++nl[(size_t) ec.layer_cls[(size_t) il]];
+            ++nmoe;
+        }
+    size_t fr = 0, tot = 0;
+    CK(cudaMemGetInfo(&fr, &tot));
+    size_t reserve = (size_t) 1024 << 20;
+    if (const char* v = std::getenv("NEM_HELPER_RESERVE_MIB")) reserve = (size_t) std::max(0, std::atoi(v)) << 20;
+    size_t want = fr > reserve ? fr - reserve : 0;
+    if (o.helper_gb >= 0.0) want = std::min(want, (size_t) (o.helper_gb * 1e9));
+    double per_slot = 0;
+    for (int c = 0; c < nc; ++c) per_slot += (double) nl[(size_t) c] / nmoe * (double) ec.cls_bytes[(size_t) c];
+    auto counts = [&](size_t budget) {
+        std::vector<int> n((size_t) nc, 0);
+        const double N = (double) budget / per_slot;
+        size_t used = 0;
+        for (int c = 0; c < nc; ++c) {
+            n[(size_t) c] = (int) (N * nl[(size_t) c] / nmoe);
+            used += (size_t) n[(size_t) c] * ec.cls_bytes[(size_t) c];
+        }
+        if (budget > used) n[(size_t) ec.lend_cls] += (int) ((budget - used) / ec.cls_bytes[(size_t) ec.lend_cls]);
+        return n;
+    };
+    std::vector<int> n = counts(want);
+    uint8_t* base = nullptr;
+    for (;;) {
+        size_t bytes = 0;
+        for (int c = 0; c < nc; ++c) bytes += (size_t) n[(size_t) c] * ec.cls_bytes[(size_t) c];
+        if (bytes == 0) break;
+        void* p = nullptr;
+        if (cudaMalloc(&p, bytes) == cudaSuccess) {
+            base = (uint8_t*) p;
+            hc.bytes += bytes;
+            break;
+        }
+        cudaGetLastError();
+        want = want / 16 * 15;
+        n = counts(want);
+    }
+    if (base) {
+        uint8_t* at = base;
+        for (int c = 0; c < nc; ++c)
+            for (int i = 0; i < n[(size_t) c]; ++i) {
+                hc.ptr.push_back(at);
+                hc.cls.push_back(c);
+                at += ec.cls_bytes[(size_t) c];
+            }
+    }
+    hc.slots = (int) hc.ptr.size();
+    hc.owner.assign((size_t) hc.slots, -1);
+    hc.where.assign((size_t) g.n_layer * ec.ne, -1);
+}
+
+// The helper's slots brought up to date, at most max_copies experts copied: the slots whose expert the main card holds
+// (or is taking) are freed, then the best-scored experts outside both cards come in - into free slots, then in place
+// of the worst-scored ones (with hysteresis: only one that beats its slot's expert by the main cache's margin).  Called
+// between tokens, the helper idle.
+void Engine::Impl::hc_update(int max_copies, bool hysteresis) {
+    if (hc.slots == 0 || max_copies <= 0) return;
+    std::vector<std::pair<int, int>> todo;   // (key, slot)
+    auto better = [&](int a1, int b1) {
+        return ec.score[(size_t) a1] > ec.score[(size_t) b1] || (ec.score[(size_t) a1] == ec.score[(size_t) b1] && a1 < b1);
+    };
+    for (int c = 0; c < (int) ec.cls_bytes.size(); ++c) {
+        std::vector<int> free_slots, res, cand;
+        for (int sl = 0; sl < hc.slots; ++sl) {
+            if (hc.cls[(size_t) sl] != c) continue;
+            const int ow = hc.owner[(size_t) sl];
+            if (ow >= 0 && ec.where[(size_t) ow] != -1) {
+                hc.where[(size_t) ow] = -1;
+                hc.owner[(size_t) sl] = -1;
+            }
+            if (hc.owner[(size_t) sl] < 0) free_slots.push_back(sl);
+            else res.push_back(sl);
+        }
+        for (int il = 0; il < g.n_layer; ++il) {
+            if (ec.layer_cls[(size_t) il] != c) continue;
+            for (int e = 0; e < ec.ne; ++e) {
+                const size_t key = (size_t) il * ec.ne + e;
+                if (ec.score[key] > 0.0f && ec.where[key] == -1 && hc.where[key] == -1) cand.push_back((int) key);
+            }
+        }
+        const size_t left = (size_t) max_copies > todo.size() ? (size_t) max_copies - todo.size() : 0;
+        const size_t top = std::min(cand.size(), left);
+        if (top == 0) continue;
+        std::partial_sort(cand.begin(), cand.begin() + (long) top, cand.end(), better);
+        const size_t nw = std::min(res.size(), top);
+        std::partial_sort(res.begin(), res.begin() + (long) nw, res.end(), [&](int a1, int b1) {
+            return ec.score[(size_t) hc.owner[(size_t) a1]] < ec.score[(size_t) hc.owner[(size_t) b1]];
+        });
+        size_t wi = 0;
+        for (size_t i = 0; i < top; ++i) {
+            const int key = cand[i];
+            int sl = -1;
+            if (!free_slots.empty()) {
+                sl = free_slots.back();
+                free_slots.pop_back();
+            } else {
+                if (wi >= nw) break;
+                const int w0 = res[wi];
+                const float rs = ec.score[(size_t) hc.owner[(size_t) w0]];
+                if (hysteresis ? ec.score[(size_t) key] <= ec.margin * rs + 0.5f : ec.score[(size_t) key] <= rs) break;
+                hc.where[(size_t) hc.owner[(size_t) w0]] = -1;
+                sl = w0;
+                ++wi;
+            }
+            hc.owner[(size_t) sl] = key;
+            hc.where[(size_t) key] = sl;
+            todo.push_back({key, sl});
+        }
+    }
+    if (todo.empty()) return;
+    OnDev od(hc.dev);
+    for (const auto& kv : todo) {
+        const int il = kv.first / ec.ne, e = kv.first % ec.ne;
+        const CpuLayer& c = L[(size_t) il].cl;
+        const size_t ub = ub_of(c), db = db_of(c);
+        uint8_t* d = hc.ptr[(size_t) kv.second];
+        CK(cudaMemcpyAsync(d, c.up + (size_t) e * ub, ub, cudaMemcpyHostToDevice, hc.s));
+        CK(cudaMemcpyAsync(d + ub, c.down + (size_t) e * db, db, cudaMemcpyHostToDevice, hc.s));
+        ++hc.copies;
+    }
+    CK(cudaStreamSynchronize(hc.s));
+}
+
+// A token's experts on the helper card: the latent up from the host, its int8 rows, then gpu_experts' launches on the
+// helper's stream and buffers; their sum -> hc.h_out (there once hc.s is synchronized).
+void Engine::Impl::hc_experts(const Layer& l, const int* slot, const float* w, int n) {
+    const int NL = g.n_lat, ff = g.n_ff_exp;
+    const CpuLayer& c = l.cl;
+    const size_t ub = ub_of(c);
+    OnDev od(hc.dev);
+    CK(cudaMemcpyAsync(hc.lat, h_lat, (size_t) NL * sizeof(float), cudaMemcpyHostToDevice, hc.s));
+    k::q8(hc.lat, 1, NL, hc.qq, hc.qd, hc.s);
+    iq::MvJob jobs[32];
+    for (int i = 0; i < n; ++i) {
+        iq::MvJob& j = jobs[i];
+        j = iq::MvJob{};
+        j.w = hc.ptr[(size_t) slot[i]];
+        j.ld = c.ru;
+        j.type = c.tu;
+        j.k = NL;
+        j.n = ff;
+        j.ncol = 1;
+        j.xq = hc.qq;
+        j.xd = hc.qd;
+        j.y = hc.u + (size_t) i * ff;
+        j.ycs = (size_t) ff;
+    }
+    if (!iq::mv(jobs, n, hc.s)) {
+        std::fprintf(stderr, "maya-nem: no GEMV for the experts' up type %d\n", c.tu);
+        std::abort();
+    }
+    k::relu2(hc.u, (size_t) n * ff, hc.s);
+    k::q8(hc.u, n, ff, hc.hq, hc.hd, hc.s);
+    iq::MvJob dj[32];
+    for (int i = 0; i < n; ++i) {
+        dj[i] = iq::MvJob{};
+        dj[i].w = hc.ptr[(size_t) slot[i]] + ub;
+        dj[i].ld = c.rd;
+        dj[i].type = c.td;
+        dj[i].k = ff;
+        dj[i].n = NL;
+        dj[i].ncol = 1;
+        dj[i].xq = hc.hq + (size_t) i * ff;
+        dj[i].xd = hc.hd + (size_t) i * (ff / 32);
+        dj[i].y = hc.y + (size_t) i * NL;
+        dj[i].ycs = (size_t) NL;
+        dj[i].bias = nullptr;
+        dj[i].alpha = w[i];
+    }
+    if (!iq::mv(dj, n, hc.s)) {
+        std::fprintf(stderr, "maya-nem: no GEMV for the experts' down type %d\n", c.td);
+        std::abort();
+    }
+    k::sum_rows(hc.y, n, NL, hc.routed, hc.s);
+    CK(cudaMemcpyAsync(hc.h_out, hc.routed, (size_t) NL * sizeof(float), cudaMemcpyDeviceToHost, hc.s));
 }
 
 bool Engine::Impl::save_profile(const std::string& path) const {
@@ -1684,6 +1961,7 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     }
     ec_reclaim();
     pf_open = true;
+    pf_tokens_open += n;
     for (int c0 = 0; c0 < n; c0 += pf.C) {
         const int T = std::min(pf.C, n - c0);
         chunk(ids + c0, T, c0 + T == n);
@@ -1780,16 +2058,20 @@ void Engine::Impl::moe_mid(Layer& l, int il, double& cpu_ms) {
         const float d = g.exp_norm ? std::max(tot, 6.103515625e-5f) : 1.0f;
         for (int i = 0; i < nu; ++i) wv[i] = wv[i] / d * g.exp_scale;
     }
-    int gslot[32], csel[32];
-    float gw[32], cw[32];
-    int ng = 0, nc = 0;
+    int gslot[32], csel[32], hslot[32];
+    float gw[32], cw[32], hw[32];
+    int ng = 0, nc = 0, nh = 0;
     for (int i = 0; i < nu; ++i) {
         const size_t key = (size_t) il * ne + sel[i];
         ec.score[key] += 1.0f;
         const int sl = ec.slots ? ec.where[key] : -1;
+        const int hs = sl < 0 && hc.slots ? hc.where[key] : -1;
         if (sl >= 0) {
             gslot[ng] = sl;
             gw[ng++] = wv[i];
+        } else if (hs >= 0) {
+            hslot[nh] = hs;
+            hw[nh++] = wv[i];
         } else {
             csel[nc] = sel[i];
             cw[nc++] = wv[i];
@@ -1797,8 +2079,10 @@ void Engine::Impl::moe_mid(Layer& l, int il, double& cpu_ms) {
     }
     ec.lookups += nu;
     ec.hits += ng;
+    hc.hits += nh;
     float* h_routed = h_tail + 4;
     if (nc) lane.begin(*pool, l.cl, NL, ff, csel, cw, nc, h_lat, h_routed);
+    if (nh) hc_experts(l, hslot, hw, nh);   // (the helper card starts on its share first: it is the slower one)
     if (ng) gpu_experts(l, gslot, gw, ng);
     // the shared expert (on a's int8 rows)
     mv(l.sh_up, qa, a, 0, shu);
@@ -1806,9 +2090,23 @@ void Engine::Impl::moe_mid(Layer& l, int il, double& cpu_ms) {
     quant(qs, shu, 1, g.n_ff_sh);
     mv(l.sh_down, qs, shu, 0, sho);
     if (nc) lane.end();
+    const double c1 = now_ms();
+    st.ms_lane += c1 - c0;
+    st.lane_layers += nc > 0;
+    st.helper_layers += nh > 0;
+    if (nh) {   // the helper's sum joins the CPU lane's on the host (the device adds that to its own in moe_tail)
+        {
+            OnDev od(hc.dev);
+            CK(cudaStreamSynchronize(hc.s));
+        }
+        if (nc)
+            for (int i = 0; i < NL; ++i) h_routed[i] += hc.h_out[i];
+        else std::memcpy(h_routed, hc.h_out, (size_t) NL * sizeof(float));
+        st.ms_helper += now_ms() - c1;
+    }
     cpu_ms += now_ms() - c0;
     int* flags = (int*) h_tail;
-    flags[0] = nc > 0;
+    flags[0] = nc > 0 || nh > 0;
     flags[1] = ng > 0;
 }
 
@@ -1892,6 +2190,11 @@ const float* Engine::Impl::step(int token) {
             ec.lent = true;
             ec_fill();
         }
+        // The prompt changed the scores, and the main cache with them: the helper follows, with more copies after a
+        // longer prompt (an eighth of its tokens, 64 .. fill_cap: a short turn waits ~30 ms for them, a long prompt
+        // a second or two on top of its own reading).
+        hc_update(std::min(hc.fill_cap, std::max(64, (int) std::min<long>(pf_tokens_open / 8, INT_MAX))), false);
+        pf_tokens_open = 0;
     }
     if (moes.empty())
         for (int il = 0; il < g.n_layer; ++il)
@@ -1923,6 +2226,11 @@ const float* Engine::Impl::step(int token) {
         ec_arrive();
         for (float& v : ec.score) v *= ec.decay;
         if (++ec.tok % ec.every == 0) ec_adapt();
+    }
+    if (hc.slots && ++hc.tok % hc.every == 0) {
+        const double u0 = now_ms();
+        hc_update(hc.per, true);
+        st.ms_update += now_ms() - u0;
     }
     st.ms_total += now_ms() - t0;
     st.ms_cpu += cpu_ms;
