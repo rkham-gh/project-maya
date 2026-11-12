@@ -56,6 +56,9 @@
 #include "strata/core/prefill_pieces.hpp"
 #include "strata/core/prefill_gaps.hpp"
 #include "strata/core/vram_mark.hpp"
+#include "strata/core/glm_ngram_draft.hpp"   // glm-dsa B14.13
+#include "strata/core/glm_prompt_cache.hpp"   // glm-dsa B14.14
+#include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -105,16 +108,16 @@
 #include <vector>
 
 namespace {
-// perf-review D-4: the lent slots are refilled with queued copies and one wait; STRATA_REFILL_BLOCKING=1 waits on each
+// perf-review D-4: the lent slots are refilled with queued copies and one wait; MAYA_REFILL_BLOCKING=1 waits on each
 bool refill_blocking() {
-    static const bool v = std::getenv("STRATA_REFILL_BLOCKING") != nullptr;
+    static const bool v = std::getenv("MAYA_REFILL_BLOCKING") != nullptr;
     return v;
 }
 
-// The bytes the on-demand vision encoder needs on the first GPU (what the server measured, STRATA_GLM_VISION_LEND_MB
+// The bytes the on-demand vision encoder needs on the first GPU (what the server measured, MAYA_GLM_VISION_LEND_MB
 // - the variable is named for the engine that had it first); 0 = no on-demand encoder.
 uint64_t vision_lend_need() {
-    const char* v = std::getenv("STRATA_GLM_VISION_LEND_MB");
+    const char* v = std::getenv("MAYA_GLM_VISION_LEND_MB");
     return v != nullptr && std::atoll(v) > 0 ? (uint64_t) std::atoll(v) << 20 : 0;
 }
 
@@ -170,6 +173,7 @@ struct Options {
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
+    bool kv_given = false;             ///< --kv on the command line (GLM: INT8 when not, since v1.1.55)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     std::string kv_streaming;          ///< --kv-streaming on|off: streaming with kv_resident's window (32768 if none)
     std::string dump_residual;
@@ -270,8 +274,16 @@ struct Options {
     /// `--prefill auto`: the largest chunk (up to 8192) whose buffers the expert cache can lend.  Every expert a chunk
     /// routes to is streamed once per chunk, so a bigger chunk streams fewer bytes per token (the "ubatch" effect).
     bool prefill_auto = false;
-    std::string prefill_arg;           ///< `--prefill` as given (the GLM engine reads it as STRATA_GLM_PREFILL)
-    std::string dflash;                ///< `--dflash`: a DFlash2 draft GGUF for the GLM engine (STRATA_GLM_DFLASH)
+    std::string prefill_arg;           ///< `--prefill` as given (the GLM engine reads it as MAYA_GLM_PREFILL)
+    std::string dflash;                ///< `--dflash`: a DFlash2 draft GGUF for the GLM engine (MAYA_GLM_DFLASH)
+    // --ablate (the GLM engine): a control vector's direction projected out of every residual write
+    // (src/core/glm_ablate.hpp); --ablate-layer N its direction.N, --ablate-scale F its strength (0: the file's
+    // maya.ablate.scale, else 1); --ablate-default on|off: whether a conversation projects it until a request's
+    // GEN ablate=0|1 says otherwise (on: as a startup flag; the server starts engines with off)
+    std::string ablate;
+    int ablate_layer = 0;
+    float ablate_scale = 0.0f;
+    bool ablate_default = true;
     bool no_split_rows = false;        ///< plan v0.3 P4 A/B: one whole expert per pool thread
     /// Plan v0.3 P5: the prompt path borrows the top expert-cache slots for its buffers and refills them after
     /// the prompt (default); `--no-prefill-borrow` reserves the buffers' VRAM for the whole session instead.
@@ -288,7 +300,7 @@ struct Options {
     /// the exactness test); `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.
     int spec = 0;
     std::string spec_oracle;
-    std::string spec_follow, spec_follow_save;   // --glm-pack: STRATA_GLM_SPEC_FOLLOW / _SAVE (glm_pack_generate)
+    std::string spec_follow, spec_follow_save;   // --glm-pack: MAYA_GLM_SPEC_FOLLOW / _SAVE (glm_pack_generate)
     int spec_corrupt = 0;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
@@ -326,6 +338,12 @@ struct Options {
     int prompt_cache = 6;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
+    /// --serve: also keep a checkpoint every N tokens the answer writes (the last two; 0 = off).  The next prompt does
+    /// not always go on from everything the session holds: the server's own restarts (the thinking budget closed at a
+    /// sentence's end, the loop guard, a fair-share slice) and a history whose last answer reads back differently
+    /// (re-tokenized, trimmed) continue from INSIDE the answer, where the session cannot be rewound - without these
+    /// they read the whole conversation again (a 32K-token thinking closed by its budget: 88 s on a V100)
+    int64_t decode_cache_every = 1024;
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
@@ -387,6 +405,10 @@ void usage() {
                  "  --parallel N         --serve: up to N requests decode at once (1-8, default 1). One GPU decodes\n"
                  "                       them together (each weight read once for all); a split pipelines them\n"
                  "                       across its cards. Each extra conversation keeps its own context state\n"
+                 "  --ablate GGUF        (--glm-pack) refusal ablation: a control vector's direction (direction.N,\n"
+                 "                       F32 [n_embd]) projected out of every layer's mixer and FFN writes\n"
+                 "                       [--ablate-layer N] [--ablate-scale F] [--ablate-default on|off]\n"
+                 "                       (--serve: GEN ablate=0|1 per request; default on)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --ple-gguf PATH      required PLE table (original second GGUF shard)\n"
@@ -452,6 +474,8 @@ void usage() {
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
+                 "  --decode-cache-every N  --serve: also checkpoint every N written tokens, the last 2 kept (default\n"
+                 "                       1024, 0 = off): a prompt that goes on from inside the answer reads from there\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
@@ -539,6 +563,21 @@ std::vector<std::string> model_shards(const std::string& first) {
         if (std::ifstream(p, std::ios::binary)) out.push_back(p);
     }
     return out.empty() ? std::vector<std::string>{first} : out;
+}
+
+/// The first of the model's shards (model_shards) that holds `tensor`, else `first`: a split whose shard 1 carries
+/// only the metadata (unsloth's Qwen3.8 GGUFs: the weights in shard 2, the n-gram table in shard 3) keeps
+/// token_embd / output.weight in a later shard.
+std::string shard_with(const std::string& first, const char* tensor) {
+    for (const auto& p : model_shards(first)) {
+        try {
+            strata::GgufFile f(p);
+            for (const auto& t : f.tensors())
+                if (t.name == tensor) return p;
+        } catch (const std::exception&) {
+        }
+    }
+    return first;
 }
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
@@ -764,12 +803,12 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
 #endif
 }
 
-// issue #29: a request whose heartbeat (tokens, prompt chunks or layers, verify windows) stops for STRATA_WATCHDOG_S
+// issue #29: a request whose heartbeat (tokens, prompt chunks or layers, verify windows) stops for MAYA_WATCHDOG_S
 // seconds (default_s when unset; 0 = off) is stuck on a flag nobody will raise - end the engine with where it was, so
 // the server starts it again instead of the GPU spinning forever.  Issue #31: before it does, it reports what every
 // part was doing (stall_report), so one occurrence says where the wait is.  Issue #40: the GLM serve has it too.
 void start_serve_watchdog(int default_s) {
-    const char* ws = std::getenv("STRATA_WATCHDOG_S");
+    const char* ws = std::getenv("MAYA_WATCHDOG_S");
     const int limit = ws ? std::atoi(ws) : default_s;
     if (limit <= 0) return;
     std::thread([limit] {
@@ -794,9 +833,9 @@ void start_serve_watchdog(int default_s) {
     }).detach();
 }
 
-/// STRATA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
+/// MAYA_TRACE=1: the VRAM left at a step of the startup (finds what fills the card after the cache is sized)
 void mem_mark(const char* where) {
-    static const bool on = std::getenv("STRATA_TRACE") != nullptr;
+    static const bool on = std::getenv("MAYA_TRACE") != nullptr;
     if (!on) return;
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
@@ -833,6 +872,7 @@ struct ConvCheckpoint {
     std::vector<ImgKey> imgs;     ///< the images among them
     std::vector<uint8_t> gdn, ple, tails;
     uint64_t used = 0;            ///< last-use stamp for the retention policy (conv_cache.hpp)
+    bool decode = false;          ///< taken inside an answer (--decode-cache-every), not at a prompt position
     std::vector<ConvCheckpoint> stage_parts;   ///< a layer split's later stages: their sessions' running state
 };
 
@@ -1053,7 +1093,7 @@ static bool cuda_context_broken(const std::string& why) {
 static int glm_pack_generate(const Options& o) {
 #if !defined(_WIN32)
     // serving: the server ends the engine with QUIT (or by closing its input), and the engine then sets the conversation
-    // aside (STRATA_GLM_SLOT_KEEP).  A SIGTERM to the whole process group (systemd stopping a service, a supervisor
+    // aside (MAYA_GLM_SLOT_KEEP).  A SIGTERM to the whole process group (systemd stopping a service, a supervisor
     // killing the server's group) must not end it mid-write; a server that is already gone must not end it with
     // SIGPIPE when it writes its last lines.
     if (o.serve) {
@@ -1072,13 +1112,13 @@ static int glm_pack_generate(const Options& o) {
     strata::core::Glm5Model model;
     std::string err;
     // the prompt chunk, set in the config's args like Strata's: --prefill auto | N (a chunk of N tokens) | 0
-    // (the engine reads it as STRATA_GLM_PREFILL; without either, auto)
-    if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
-    // the DFlash2 drafter (--dflash, else STRATA_GLM_DFLASH): loaded with the model, on the device of its head
-    if (!o.dflash.empty()) set_env("STRATA_GLM_DFLASH", o.dflash.c_str());
-    // --spec-follow / --spec-follow-save (else STRATA_GLM_SPEC_FOLLOW / _SAVE): read below, once the vocabulary is known
-    if (!o.spec_follow.empty()) set_env("STRATA_GLM_SPEC_FOLLOW", o.spec_follow.c_str());
-    if (!o.spec_follow_save.empty()) set_env("STRATA_GLM_SPEC_FOLLOW_SAVE", o.spec_follow_save.c_str());
+    // (the engine reads it as MAYA_GLM_PREFILL; without either, auto)
+    if (!o.prefill_arg.empty()) set_env("MAYA_GLM_PREFILL", o.prefill_arg.c_str());
+    // the DFlash2 drafter (--dflash, else MAYA_GLM_DFLASH): loaded with the model, on the device of its head
+    if (!o.dflash.empty()) set_env("MAYA_GLM_DFLASH", o.dflash.c_str());
+    // --spec-follow / --spec-follow-save (else MAYA_GLM_SPEC_FOLLOW / _SAVE): read below, once the vocabulary is known
+    if (!o.spec_follow.empty()) set_env("MAYA_GLM_SPEC_FOLLOW", o.spec_follow.c_str());
+    if (!o.spec_follow_save.empty()) set_env("MAYA_GLM_SPEC_FOLLOW_SAVE", o.spec_follow_save.c_str());
     // the expert profile (Strata's profile.bin: setup passes data/expert-profile-glm.bin) and the routing trace
     // (--dump-routing: tools/make_profile.py's input), before the load reads the one and the first prompt the other
     if (!o.expert_profile.empty()) model.set_expert_profile(o.expert_profile);
@@ -1086,10 +1126,19 @@ static int glm_pack_generate(const Options& o) {
         std::fprintf(stderr, "maya generate: --dump-routing: %s\n", err.c_str());
         return 1;
     }
-    // the layer split across the visible GPUs: STRATA_GLM_SPLIT, else --layer-split (auto | K1,K2,..)
+    // the layer split across the visible GPUs: MAYA_GLM_SPLIT, else --layer-split (auto | K1,K2,..)
     if (!model.load_pack_env(o.glm_pack, o.max_context, err, o.layer_split)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
         return 1;
+    }
+    // --ablate: the direction on every part (src/core/glm_ablate.hpp), each conversation by --ablate-default until a
+    // request says otherwise
+    if (!o.ablate.empty()) {
+        if (!model.ablate_load(o.ablate, o.ablate_layer, o.ablate_scale, o.ablate_default, err)) {
+            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "%s (default %s)\n", model.ablate_what().c_str(), o.ablate_default ? "on" : "off");
     }
     const int64_t n_vocab = model.geometry().n_vocab;
     // the driver samples on the device (sample_token), so the fast path never downloads the logits
@@ -1108,6 +1157,8 @@ static int glm_pack_generate(const Options& o) {
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
                     model.dflash_ready() ? 1 : 0, model.vision_lend_bytes(), model.cpu_lane_threads(),
                     model.cpu_lane_threads_max(), model.pcie_share());
+        if (model.ablate_loaded())   // (--ablate: GEN ablate=0|1 turns its projection off / on for the request)
+            std::printf("INFO ablate=1 ablate_default=%d\n", o.ablate_default ? 1 : 0);
         // the Monitor's map of each GPU: what each part holds on its card, in bytes (Glm5Model::VramReport) - the
         // server finds the card NVML numbers by its PCI address and adds what NVML sees besides
         for (const auto& r : model.vram_report())
@@ -1139,17 +1190,17 @@ static int glm_pack_generate(const Options& o) {
 
     const std::vector<int64_t> glm_eos = {154820, 154827, 154829};
     const std::vector<int64_t>& eos = o.eos_given ? o.eos_ids : glm_eos;
-    // STRATA_GLM_KL_DUMP=<file>,<n> (a test of the K/V cache formats): --tokens-file's tokens teacher-forced - all but
+    // MAYA_GLM_KL_DUMP=<file>,<n> (a test of the K/V cache formats): --tokens-file's tokens teacher-forced - all but
     // the last n through the prompt path, those n one at a time through the decode - and the logits after each of the
     // n into file (n x n_vocab F32: row i predicts token size - n + i + 1)
-    if (const char* kd = std::getenv("STRATA_GLM_KL_DUMP")) {
+    if (const char* kd = std::getenv("MAYA_GLM_KL_DUMP")) {
         const std::string spec(kd);
         const size_t c = spec.rfind(',');
         const std::string path = spec.substr(0, c);
         const int64_t n = c == std::string::npos ? 64 : std::atoll(spec.c_str() + c + 1);
         const auto& t = o.tokens;
         if (n <= 0 || (int64_t) t.size() <= n) {
-            std::fprintf(stderr, "maya generate: STRATA_GLM_KL_DUMP needs more than %lld tokens\n", (long long) n);
+            std::fprintf(stderr, "maya generate: MAYA_GLM_KL_DUMP needs more than %lld tokens\n", (long long) n);
             return 2;
         }
         model.set_host_logits(true);
@@ -1190,21 +1241,21 @@ static int glm_pack_generate(const Options& o) {
     // PAUSE (the server's fair slices): STOP, and the conversation's state is kept with what the request wrote (the
     // snapshot moves to the last token fed), so the request that continues it reads only its last token
     std::atomic<bool> pause_req{false}, pause_keep{false};
-    // several conversations at once (STRATA_GLM_SEQS): STOP <rid> / PAUSE <rid> [keep] for one request; the request
+    // several conversations at once (MAYA_GLM_SEQS): STOP <rid> / PAUSE <rid> [keep] for one request; the request
     // whose prompt is being read stops at the next chunk
     std::mutex ctl_mu;
     std::map<int, int> ctl;   // rid -> 1 STOP, 2 PAUSE, 3 PAUSE keep
     std::atomic<int> admitting_rid{-1};
-    // STRATA_GLM_PREFILL_INTERLEAVE (strata/core/prefill_pieces.hpp): the other requests decode between the pieces of
+    // MAYA_GLM_PREFILL_INTERLEAVE (strata/core/prefill_pieces.hpp): the other requests decode between the pieces of
     // a prompt being read, so a STOP / PAUSE for the request being admitted stops its read alone (admit_stop) - not
     // stop_req, which every decoding request reads as its own.  Off: stop_req as before (nothing decodes meanwhile)
     static const strata::core::PrefillInterleave interleave =
-        strata::core::prefill_interleave_parse(std::getenv("STRATA_GLM_PREFILL_INTERLEAVE"));
-    // STRATA_GLM_PREFILL_GAPS (strata/core/prefill_gaps.hpp): the other requests decode at the chunk boundaries of a
+        strata::core::prefill_interleave_parse(std::getenv("MAYA_GLM_PREFILL_INTERLEAVE"));
+    // MAYA_GLM_PREFILL_GAPS (strata/core/prefill_gaps.hpp): the other requests decode at the chunk boundaries of a
     // prompt being read (one call, its chunks pipelined as without) - like interleave, a STOP for the request being
     // read stops its read alone.  Over interleave when both are set.
     static const strata::core::PrefillGaps read_gaps =
-        strata::core::prefill_gaps_parse(std::getenv("STRATA_GLM_PREFILL_GAPS"));
+        strata::core::prefill_gaps_parse(std::getenv("MAYA_GLM_PREFILL_GAPS"));
     std::atomic<bool> admit_stop{false};
     const auto read_stopped = [&] { return stop_req.load() || admit_stop.load(); };
     std::mutex in_mu;
@@ -1303,6 +1354,9 @@ static int glm_pack_generate(const Options& o) {
     int32_t req_think_end = -1;
     // the request's logit_bias (GEN key logit_bias=<id>:<bias>,...): added to its logits before every sample
     std::vector<std::pair<int32_t, float>> req_bias;
+    // the request's ablate=0|1 (GEN key; -1: --ablate-default) and whether it projects the --ablate direction
+    int req_abl = -1;
+    const auto abl_req = [&]() { return model.ablate_loaded() && (req_abl >= 0 ? req_abl != 0 : o.ablate_default); };
     uint64_t snap_img_hash = 1469598103934665603ull;
     const auto img_hash = [&](size_t len) {
         uint64_t h = 1469598103934665603ull;   // FNV-1a over the positions and rows inside [0, len)
@@ -1317,11 +1371,11 @@ static int glm_pack_generate(const Options& o) {
     // CONVERSATION SLOTS (the fast path): a request that does not continue the conversation in the model first sets
     // that conversation aside in a file (Glm5Model::slot_save: its snapshot and DSA caches), then takes back the slot
     // it does continue (slot_load) - chats, and an agent's side requests, that interleave no longer re-read each
-    // other's prompts.  STRATA_GLM_SLOTS=<n> files (default 4, 0 off), for conversations of STRATA_GLM_SLOT_MIN tokens
-    // or more (1024), in STRATA_GLM_SLOT_DIR (default <pack>/slots, emptied at start), at most STRATA_GLM_SLOT_GB on
+    // other's prompts.  MAYA_GLM_SLOTS=<n> files (default 4, 0 off), for conversations of MAYA_GLM_SLOT_MIN tokens
+    // or more (1024), in MAYA_GLM_SLOT_DIR (default <pack>/slots, emptied at start), at most MAYA_GLM_SLOT_GB on
     // disk (16) and never below 8 GB free.  A conversation with pictures is set aside too: its slot keeps img_hash() of
     // them and is taken back only by a prompt with the same pictures at the same places.  Or the slots
-    // live in RAM and nothing reaches the disk: STRATA_GLM_SLOT_RAM_GB (0, off) caps their bytes there - the states
+    // live in RAM and nothing reaches the disk: MAYA_GLM_SLOT_RAM_GB (0, off) caps their bytes there - the states
     // are host buffers that die with the run, so SLOT_DIR, SLOT_GB (1) and the disk-space guard do not apply.
     // (static: the multi path's Ctx, a local struct, uses it as a default member value - MSVC accepts that of a static
     // only, and a local constant left Ctx without a default constructor: "std::construct_at: no matching function")
@@ -1343,22 +1397,23 @@ static int glm_pack_generate(const Options& o) {
     uint64_t slot_clock = 0, slot_seq = 0;
     bool snap_in_slot = false;   // the model's snapshot is one of the slots, unchanged since
     const auto env_num = [](const char* k, double d) { const char* v = getenv(k); return v ? std::atof(v) : d; };
-    int slot_max = model.fast() && getenv("STRATA_GLM_NO_REUSE") == nullptr ? (int) env_num("STRATA_GLM_SLOTS", 4) : 0;
-    const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_GLM_SLOT_MIN", 1024));
-    const uint64_t slot_budget = (uint64_t) (env_num("STRATA_GLM_SLOT_GB", 16) * 1073741824.0);
+    int slot_max = model.fast() && getenv("MAYA_GLM_NO_REUSE") == nullptr ? (int) env_num("MAYA_GLM_SLOTS", 4) : 0;
+    if (slot_max > 0 && strata::core::glmpc::engine_on(model)) slot_max = 0;   // glm-dsa B14.14: the prompt cache replaces the slots
+    const size_t slot_min = (size_t) std::max(1.0, env_num("MAYA_GLM_SLOT_MIN", 1024));
+    const uint64_t slot_budget = (uint64_t) (env_num("MAYA_GLM_SLOT_GB", 16) * 1073741824.0);
     // slots in RAM: the conversation's state is parked in a host buffer instead of a file.  The cap moves to RAM too
     // (slot_cap below); the states die with the run, so SLOT_KEEP, SLOT_DAYS, SLOT_DIR and the 8 GB-free disk guard
     // are theirs no longer.  Nothing on the disk is touched: in RAM mode the slots folder is neither used nor wiped.
-    const bool slot_ram = env_num("STRATA_GLM_SLOT_RAM_GB", 0) > 0;
+    const bool slot_ram = env_num("MAYA_GLM_SLOT_RAM_GB", 0) > 0;
     const uint64_t slot_cap =
-        slot_ram ? (uint64_t) (env_num("STRATA_GLM_SLOT_RAM_GB", 16) * 1073741824.0) : slot_budget;
-    // STRATA_GLM_SLOT_KEEP=1: the slots outlive the engine - the folder is not emptied at start (its files are indexed
+        slot_ram ? (uint64_t) (env_num("MAYA_GLM_SLOT_RAM_GB", 16) * 1073741824.0) : slot_budget;
+    // MAYA_GLM_SLOT_KEEP=1: the slots outlive the engine - the folder is not emptied at start (its files are indexed
     // and kept when they belong to this model), the conversation in the model is set aside when the engine ends
-    // (QUIT or end of input), and a file not used for STRATA_GLM_SLOT_DAYS days (7) is removed.  Every slot then has a
+    // (QUIT or end of input), and a file not used for MAYA_GLM_SLOT_DAYS days (7) is removed.  Every slot then has a
     // .meta beside it: this model's identity, the conversation's tokens and the slot's size; a slot whose .meta is
     // missing, foreign or does not match its file is deleted.  Both files are written under a temporary name first.
-    const bool slot_keep = getenv("STRATA_GLM_SLOT_KEEP") != nullptr && std::atoi(getenv("STRATA_GLM_SLOT_KEEP")) != 0;
-    const double slot_days = env_num("STRATA_GLM_SLOT_DAYS", 7);
+    const bool slot_keep = getenv("MAYA_GLM_SLOT_KEEP") != nullptr && std::atoi(getenv("MAYA_GLM_SLOT_KEEP")) != 0;
+    const double slot_days = env_num("MAYA_GLM_SLOT_DAYS", 7);
     namespace fs = std::filesystem;
     std::filesystem::path slot_dir;
     // what a kept slot must match: the session format, the engine version, the pack and the model's shards (names and
@@ -1434,7 +1489,7 @@ static int glm_pack_generate(const Options& o) {
     if (slot_max > 0 && slot_ram)
         note("slots parked in RAM (" + gb(slot_cap) + " max) - nothing is written to disk, the states die with the run");
     if (slot_max > 0 && !slot_ram) {
-        slot_dir = getenv("STRATA_GLM_SLOT_DIR") ? std::filesystem::path(getenv("STRATA_GLM_SLOT_DIR"))
+        slot_dir = getenv("MAYA_GLM_SLOT_DIR") ? std::filesystem::path(getenv("MAYA_GLM_SLOT_DIR"))
                                                  : std::filesystem::path(o.glm_pack) / "slots";
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
@@ -1511,6 +1566,7 @@ static int glm_pack_generate(const Options& o) {
     // the conversation in the model (its snapshot, snap_tokens) into a slot
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min) return;
+        if (model.ablating()) return;   // (--ablate: a projected conversation is not kept - it is read again)
         // an earlier state of this conversation is superseded (the same pictures: the same tokens with other
         // pictures are another conversation)
         for (size_t i = slots.size(); i-- > 0;)
@@ -1594,7 +1650,10 @@ static int glm_pack_generate(const Options& o) {
     };
     // the longest slot this prompt continues, back in the model: the tokens it covers (0: none)
     const auto slot_take = [&](const std::vector<int32_t>& prompt) -> size_t {
-        if (slot_max <= 0) return 0;
+        if (slot_max <= 0 || abl_req()) return 0;   // (slots hold unprojected states only)
+      for (;;) {   // the longest slot this prompt continues; one that will not load (saved by another model layout, a
+                   // damaged file) is dropped and the next-longest tried - before, the first failure read the whole
+                   // prompt from token 0 although a shorter slot or a checkpoint held most of it
         size_t best = SIZE_MAX, len = 0;
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto& t = slots[i].tokens;
@@ -1611,10 +1670,10 @@ static int glm_pack_generate(const Options& o) {
                               ? model.slot_load(*slots[best].data, (int64_t) len, e)
                               : model.slot_load(slots[best].path, (int64_t) len, e);
         if (!back) {
-            note("taking a conversation back failed (" + e + ") - reading its prompt again");
+            note("taking a conversation back failed (" + e + ") - trying the next slot or checkpoint");
             slot_drop(best);
             snap_tokens.clear();
-            return 0;
+            continue;
         }
         snap_tokens = slots[best].tokens;
         snap_img_hash = slots[best].img;
@@ -1632,6 +1691,7 @@ static int glm_pack_generate(const Options& o) {
                       prompt.size() - len);
         note(m);
         return len;
+      }
     };
     // a request's DFlash window and draft cut (its GEN line's spec= / spec_min_p=; 0 / -1: as the engine started)
     int req_spec = 0;
@@ -1644,19 +1704,19 @@ static int glm_pack_generate(const Options& o) {
     // `tag` prefixes the PP / ERR lines ("<rid> " with several conversations at once).
     std::string tag;
     // CONVERSATION CHECKPOINTS (Glm5Model::ckpt_save): besides the snapshot (the last prompt but its last token), up to
-    // STRATA_GLM_CKPTS (4; 0 = none) states of the conversation in the model at earlier positions, in host RAM (~150 MB
+    // MAYA_GLM_CKPTS (4; 0 = none) states of the conversation in the model at earlier positions, in host RAM (~150 MB
     // each with GLM-5.3-Flash): at the end of the system prompt (the first user turn's marker), at the start of the
-    // prompt's last turn (its last user or tool-result marker) and every STRATA_GLM_CKPT_EVERY (16384) fresh prompt
+    // prompt's last turn (its last user or tool-result marker) and every MAYA_GLM_CKPT_EVERY (16384) fresh prompt
     // tokens - only where at least 512 fresh tokens lie before.  A prompt that leaves the conversation before the
     // snapshot's position - an edited or replaced last message, another chat with the same system prompt and tools, a
     // client that rewrote an older turn - restores the longest checkpoint it starts with and reads only the rest,
-    // where it read everything from token 0.  Text prompts only; STRATA_GLM_NO_REUSE turns it off with the rest of the
-    // reuse.  SEVERAL CONVERSATIONS AT ONCE (STRATA_GLM_SEQS > 1) keep them only with STRATA_GLM_MULTI_CKPTS=1 (#711):
+    // where it read everything from token 0.  Text prompts only; MAYA_GLM_NO_REUSE turns it off with the rest of the
+    // reuse.  SEVERAL CONVERSATIONS AT ONCE (MAYA_GLM_SEQS > 1) keep them only with MAYA_GLM_MULTI_CKPTS=1 (#711):
     // each context then has checkpoints of its own conversation.  The model's checkpoint slots are host buffers that
     // take whichever sequence is bound when one is written, and a checkpoint is good only for the sequence whose DSA
     // rows it stood on, so context c owns the slots [c * ckpt_max, (c + 1) * ckpt_max): its list goes in and out with
     // its snapshot (bind_ctx) and ckpt_base is its first slot.  Every context's checkpoints together are at most
-    // kMultiCkptSlots (~150 MB of host RAM each), and the periodic ones stay off there unless STRATA_GLM_CKPT_EVERY is
+    // kMultiCkptSlots (~150 MB of host RAM each), and the periodic ones stay off there unless MAYA_GLM_CKPT_EVERY is
     // set: each one ends a prompt-path call, a pipeline fill on a split, while other conversations wait to decode.
     struct Ckpt {
         std::vector<int32_t> tokens;   // the conversation's first tokens the checkpoint holds the state after (empty: free)
@@ -1665,19 +1725,19 @@ static int glm_pack_generate(const Options& o) {
     std::vector<Ckpt> ckpts;   // the bound context's (several conversations: each context's in turn, see bind_ctx)
     uint64_t ckpt_clock = 0;
     int ckpt_base = 0;         // the bound context's first checkpoint slot in the model (0 with one conversation)
-    const bool multi_ckpts = model.seq_count() > 1 && env_num("STRATA_GLM_MULTI_CKPTS", 0) != 0;
+    const bool multi_ckpts = model.seq_count() > 1 && env_num("MAYA_GLM_MULTI_CKPTS", 0) != 0;
     const int ckpt_max = [&] {
-        if (!model.fast() || getenv("STRATA_GLM_NO_REUSE") != nullptr) return 0;
-        const int want = std::max(0, std::min(16, (int) env_num("STRATA_GLM_CKPTS", 4)));
+        if (!model.fast() || getenv("MAYA_GLM_NO_REUSE") != nullptr) return 0;
+        const int want = std::max(0, std::min(16, (int) env_num("MAYA_GLM_CKPTS", 4)));
         if (model.seq_count() <= 1) return want;
         if (!multi_ckpts) return 0;
         constexpr int kMultiCkptSlots = 32;   // every context's together (~4.8 GB with GLM-5.3-Flash at most)
         return std::min(want, kMultiCkptSlots / model.seq_count());
     }();
     const int64_t ckpt_every =
-        model.seq_count() > 1 && getenv("STRATA_GLM_CKPT_EVERY") == nullptr
+        model.seq_count() > 1 && getenv("MAYA_GLM_CKPT_EVERY") == nullptr
             ? 0
-            : std::max<int64_t>(0, (int64_t) env_num("STRATA_GLM_CKPT_EVERY", 16384));
+            : std::max<int64_t>(0, (int64_t) env_num("MAYA_GLM_CKPT_EVERY", 16384));
     if (multi_ckpts && ckpt_max > 0) {
         const std::string every = ckpt_every > 0 ? " and every " + std::to_string(ckpt_every) + " fresh tokens" : "";
         std::fprintf(stderr, "glm checkpoints: up to %d for each of the %d conversations at once "
@@ -1717,7 +1777,7 @@ static int glm_pack_generate(const Options& o) {
         at.erase(std::unique(at.begin(), at.end()), at.end());
         // at most ckpt_max a prompt, the latest kept (the turn's start, then the ones before it)
         if ((int) at.size() > ckpt_max) at.erase(at.begin(), at.end() - ckpt_max);
-        // every prompt-path call between them must reach its minimum (STRATA_GLM_PREFILL_MIN, 32: fewer go through the
+        // every prompt-path call between them must reach its minimum (MAYA_GLM_PREFILL_MIN, 32: fewer go through the
         // token path, one token at a time): only the piece after the last one may be shorter
         std::vector<size_t> kept;
         for (const size_t p : at)
@@ -1741,8 +1801,11 @@ static int glm_pack_generate(const Options& o) {
         slot_put(" (its system prompt, for other chats that start with it)");
         if (snap_in_slot && !slots.empty() && slots.back().tokens.size() == p) slots.back().prefix = true;
     };
-    // the state now (after prompt[0, p)) into a free or the least recently used checkpoint
-    const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p, bool from_snapshot = false) {
+    // the state now (after prompt[0, p)) into a free or the least recently used checkpoint (at_pos: the state after
+    // prompt[0, p) for a p the read went past - glm-dsa's positional state, Glm5Model::ckpt_save_at; glm-dsa has no
+    // snapshot buffers to copy either, so a from_snapshot checkpoint there is the position p too)
+    const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p, bool from_snapshot = false,
+                               bool at_pos = false) {
         if ((int) ckpts.size() < ckpt_max) ckpts.emplace_back();
         size_t c = 0;
         for (size_t i = 0; i < ckpts.size(); ++i) {
@@ -1752,7 +1815,10 @@ static int glm_pack_generate(const Options& o) {
         std::string e;
         ckpts[c].tokens.clear();
         const int slot = ckpt_base + (int) c;   // (several conversations: this context's own slots)
-        if (!(from_snapshot ? model.ckpt_save_snapshot(slot, e) : model.ckpt_save(slot, e))) {
+        const bool positional = at_pos || (from_snapshot && model.ckpt_positional());
+        if (!(positional      ? model.ckpt_save_at(slot, (int64_t) p, e)
+              : from_snapshot ? model.ckpt_save_snapshot(slot, e)
+                              : model.ckpt_save(slot, e))) {
             std::fprintf(stderr, "glm checkpoints: not kept at %zu (%s)\n", p, e.c_str());
             return;
         }
@@ -1776,13 +1842,13 @@ static int glm_pack_generate(const Options& o) {
         std::fprintf(stderr, "glm nan guard: %s - this conversation's state is dropped; it is read again from token 0\n",
                      why.c_str());
     };
-    // set by the several-conversation scheduler while it admits a request (STRATA_GLM_PREFILL_INTERLEAVE): the piece the
+    // set by the several-conversation scheduler while it admits a request (MAYA_GLM_PREFILL_INTERLEAVE): the piece the
     // prompt path reads next (0: the rest of the segment, as before) and what runs between two pieces - 0 go on,
     // 1 stopped (the request's STOP), 2 failed (prompt_between_err says why; every request ended, the state reset)
     std::function<size_t()> prompt_piece;
     std::function<int()> prompt_between;
     std::string prompt_between_err;
-    // STRATA_GLM_PREFILL_GAPS: true inside a gap (the decode steps at a chunk boundary of a prompt's read, or between
+    // MAYA_GLM_PREFILL_GAPS: true inside a gap (the decode steps at a chunk boundary of a prompt's read, or between
     // two of its calls) - no tier boundary runs there, nothing binds another context (a PAUSE's snapshot waits for the
     // read's end: deferred_pauses), and an engine error leaves the contexts' reset to gap_reset, after the read has
     // ended (the pool's tail is lent in it); gap_failed: a gap inside a prompt-path call failed (prompt_between_err
@@ -1810,12 +1876,17 @@ static int glm_pack_generate(const Options& o) {
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
         // restored when this prompt extends it - a chat's next turn reads only what is new
         strata::core::progress_at("the request: restoring a conversation");
-        const bool snap_ok = model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
+        // --ablate: the state, its snapshot and its checkpoints were read with this conversation's setting - a request
+        // with the other one reuses none of them (the prompt is read from the start); projected states are never kept
+        // as slots or in the prompt cache (slot_put / below), and none is taken back for a projecting request
+        const bool abl_want = abl_req();
+        const bool abl_flip = model.ablate_loaded() && abl_want != model.ablating();
+        const bool snap_ok = !abl_flip && model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
                              std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
-                             img_hash(snap_tokens.size()) == snap_img_hash && getenv("STRATA_GLM_NO_REUSE") == nullptr;
+                             img_hash(snap_tokens.size()) == snap_img_hash && getenv("MAYA_GLM_NO_REUSE") == nullptr;
         // the longest checkpoint this prompt starts with (it holds less than the snapshot when both match)
         int ck = -1;
-        if (ckpt_max > 0 && cur_img_pos.empty())
+        if (ckpt_max > 0 && cur_img_pos.empty() && !abl_flip)
             for (int c = 0; c < (int) ckpts.size(); ++c) {
                 const auto& t = ckpts[(size_t) c].tokens;
                 if (!t.empty() && t.size() < prompt.size() && (ck < 0 || t.size() > ckpts[(size_t) ck].tokens.size()) &&
@@ -1834,7 +1905,11 @@ static int glm_pack_generate(const Options& o) {
                         std::equal(sl.tokens.begin(), sl.tokens.end(), prompt.begin()))
                         slot_len = sl.tokens.size();
             std::string ce;
-            if (slot_len > ck_len) {
+            if (slot_len > ck_len) {   // the slot first; when none loads (another layout, a damaged file) the checkpoint
+                reuse = slot_take(prompt);   // below is used instead of reading from token 0
+                if (reuse > 0) ckpt_drop_past(0);   // another conversation's state now
+            }
+            if (reuse > 0) {
             } else if (model.ckpt_restore(ckpt_base + ck, ce)) {
                 reuse = ck_len;
                 from_ckpt = true;
@@ -1847,11 +1922,14 @@ static int glm_pack_generate(const Options& o) {
                 ckpts[(size_t) ck].tokens.clear();
             }
         }
+        // glm-dsa B14.14: the conversation in the model goes to the NVMe prompt cache before this prompt overwrites it
+        // (no-op unless MAYA_GLM_PROMPT_CACHE_DIR on a glm-dsa model; the slots are off then)
+        if (reuse == 0 && !model.ablating()) strata::core::glmpc::engine_put(model, snap_tokens, snap_img_hash == kNoImages);
         if (reuse == 0 && slot_max > 0) {
             slot_put("");              // the conversation in the model, before this prompt overwrites it
             reuse = slot_take(prompt);
             if (reuse > 0) ckpt_drop_past(0);   // another conversation's state now
-        } else if (reuse > 0 && !from_ckpt && slot_max > 0 && getenv("STRATA_GLM_SLOT_ROUNDTRIP") != nullptr) {
+        } else if (reuse > 0 && !from_ckpt && slot_max > 0 && !abl_want && getenv("MAYA_GLM_SLOT_ROUNDTRIP") != nullptr) {
             // a test: the restored state goes through a slot file and back - the same tokens must follow
             snap_in_slot = false;
             slot_put("");
@@ -1861,18 +1939,23 @@ static int glm_pack_generate(const Options& o) {
                 reuse = back;
             }
         }
+        if (reuse == 0 && !abl_want) reuse = strata::core::glmpc::engine_take(model, prompt, cur_img_pos.empty(), snap_tokens, snap_img_hash, snap_in_slot, kNoImages);   // glm-dsa B14.14
         if (reuse == 0) model.reset();
+        if (model.ablate_loaded()) {   // (the conversation's setting from here on: the state it holds now is read so)
+            model.set_ablate(abl_want);
+            if (abl_flip && reuse == 0) snap_tokens.clear();   // (the other setting's snapshot: never restored again)
+        }
         ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
         // THE TURN'S START: a prompt that goes on from the snapshot and opens its last turn (<|user|> / <|observation|>)
         // within 512 tokens of it gets no checkpoint there from ckpt_marks - so an edit of that turn's message read the
         // whole conversation again (13.5K tokens: 20.8 s).  The snapshot itself (the previous prompt but its last
         // token, a few tokens before the turn) is kept as a checkpoint instead: copied to host RAM on a side thread
-        // while this prompt runs, so it costs the prompt nothing.  STRATA_GLM_CKPT_TURN=0: off.  After the slot
+        // while this prompt runs, so it costs the prompt nothing.  MAYA_GLM_CKPT_TURN=0: off.  After the slot
         // restore and ckpt_drop_past: a conversation just taken back from a slot gets it too (before, the restore
         // dropped the checkpoint kept here, and an edited turn after A -> B -> A read all of A again: #400)
         if (reuse > 0 && !from_ckpt && reuse == snap_tokens.size() && reuse >= 512 && ckpt_max > 0 &&
             cur_img_pos.empty()) {
-            static const bool turn_on = [] { const char* v = getenv("STRATA_GLM_CKPT_TURN"); return !v || atoi(v) != 0; }();
+            static const bool turn_on = [] { const char* v = getenv("MAYA_GLM_CKPT_TURN"); return !v || atoi(v) != 0; }();
             constexpr int32_t kUserTok = 154827, kObsTok = 154829;   // <|user|>, <|observation|>
             size_t last = 0;
             for (size_t i = prompt.size() - 1; i-- > reuse;)
@@ -1885,7 +1968,7 @@ static int glm_pack_generate(const Options& o) {
         std::vector<float> lg;
         const strata::core::VramMark vram0 = strata::core::vram_mark(vram_devs());   // (the line at the read's end)
         t0 = std::chrono::steady_clock::now();
-        gap_mark = t0;   // (STRATA_GLM_PREFILL_GAPS: the first gap's stage starts with the read, not the restore)
+        gap_mark = t0;   // (MAYA_GLM_PREFILL_GAPS: the first gap's stage starts with the read, not the restore)
         // the prompt one CHUNK at a time (PP reports per chunk: the server shows it and counts it as a heartbeat);
         // the state is saved before the generation prompt (snap_at), so an identical or extending prompt can reuse it
         bool snapped = false;
@@ -1893,12 +1976,12 @@ static int glm_pack_generate(const Options& o) {
         // <think></think>), where it used to stand before the last token.  The next prompt of this conversation goes on
         // from the same place whatever came of this answer - the answer itself, nothing (a cancelled answer that the
         // client sends again with a new message after it), or the same prompt again - so it continues the snapshot
-        // instead of leaving it at the <|assistant|> it no longer has.  Opt-in (STRATA_GLM_SNAP_GEN=1): the prompt's
+        // instead of leaving it at the <|assistant|> it no longer has.  Opt-in (MAYA_GLM_SNAP_GEN=1): the prompt's
         // last 2-4 tokens then go through the token path instead of the batched one, so a greedy answer can differ
         // from a read with the snapshot before the last token (the default).
         size_t snap_at = prompt.size() - 1;
         {
-            static const bool snap_gen = env_num("STRATA_GLM_SNAP_GEN", 0) != 0;
+            static const bool snap_gen = env_num("MAYA_GLM_SNAP_GEN", 0) != 0;
             constexpr int32_t kAsstTok = 154828;   // <|assistant|>
             // (at `reuse` itself too: the same prompt again restores the snapshot there and keeps it there)
             for (size_t k = 2; snap_gen && k <= 4 && k <= prompt.size(); ++k) {
@@ -1927,23 +2010,39 @@ static int glm_pack_generate(const Options& o) {
             std::vector<size_t> marks = ckpt_marks(prompt, reuse, snap_at);
             // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
             const size_t sys_end = strata::core::system_prompt_end(prompt.data(), prompt.size(), 154827);   // <|user|>
-            // without checkpoints (STRATA_GLM_CKPTS=0, several conversations without STRATA_GLM_MULTI_CKPTS) the read
+            // without checkpoints (MAYA_GLM_CKPTS=0, several conversations without MAYA_GLM_MULTI_CKPTS) the read
             // still ends a call there with the slots on, for slot_prefix: another conversation with this system prompt
             // (a new conversation of the same client, another request of the same kind) restores it instead of reading
             // it again.  (With checkpoints the mark is ckpt_marks' `first` where that one is kept, and slot_prefix
             // runs there the same way: with several conversations the slot serves the other contexts too, which a
             // context's own checkpoints cannot.)
-            // STRATA_GLM_PREFIX_CUT=0: off
-            static const bool prefix_cut_on = env_num("STRATA_GLM_PREFIX_CUT", 1) != 0;
+            // MAYA_GLM_PREFIX_CUT=0: off
+            static const bool prefix_cut_on = env_num("MAYA_GLM_PREFIX_CUT", 1) != 0;
             if (ckpt_max <= 0 && slot_max > 0 && prefix_cut_on && cur_img_pos.empty())
                 strata::core::add_mark(marks, strata::core::prefix_cut(prompt.data(), prompt.size(), reuse, slot_min,
                                                                         154827), reuse);
+            // glm-dsa L1-2: a checkpoint there is a position (Glm5Model::ckpt_positional: the caches' rows before it,
+            // no state to copy), so its marks do not end a prompt-path call - the call reads through them and each
+            // is kept once the read is past it (ckpt_save_at), so a split's parts pipeline the whole read (a 32K
+            // prompt: one call of four chunks, not two calls of two, each filling and draining the pipeline).  The
+            // system prompt's end still ends its call with the slots on (slot_prefix saves the state there).
+            std::vector<size_t> later;   // those marks, ascending
+            if (ckpt_max > 0 && model.ckpt_positional()) {
+                std::vector<size_t> cut;
+                for (const size_t p : marks) (slot_max > 0 && p == sys_end ? cut : later).push_back(p);
+                marks.swap(cut);
+            }
+            size_t li = 0;   // the next of them to keep
+            std::atomic<size_t> read_to{reuse};   // every part has read the prompt up to here (progress callback)
+            const auto keep_later = [&](size_t upto) {
+                for (; li < later.size() && later[li] <= upto; ++li) ckpt_keep(prompt, later[li], false, true);
+            };
             size_t at = reuse;   // the next token the prompt path reads
             bool pok = true, between_failed = false;
-            // one call to the next checkpoint mark (or the prompt's last token) - with STRATA_GLM_PREFILL_INTERLEAVE and
+            // one call to the next checkpoint mark (or the prompt's last token) - with MAYA_GLM_PREFILL_INTERLEAVE and
             // requests decoding, a piece of it, and their decode steps between two pieces (prompt_between)
             size_t mi = 0, seg_start = at;
-            // STRATA_GLM_PREFILL_GAPS: a gap before the read too (a round for the running requests) - back-to-back reads
+            // MAYA_GLM_PREFILL_GAPS: a gap before the read too (a round for the running requests) - back-to-back reads
             // would otherwise stall them for the last stage of one and the first of the next
             if (read_gap_first && prompt_between && at < snap_at) {
                 const int r = prompt_between();
@@ -1973,6 +2072,7 @@ static int glm_pack_generate(const Options& o) {
                 const size_t base = at - reuse;
                 model.prefill_progress = [&](int64_t done, int64_t total) {
                     (void) total;
+                    read_to.store(reuse + base + (size_t) done, std::memory_order_relaxed);
                     pp_line(base + (size_t) done);
                     return !read_stopped();
                 };
@@ -1983,6 +2083,8 @@ static int glm_pack_generate(const Options& o) {
                 if (!pok && gap_failed) between_failed = true;   // (a decode gap inside the call failed)
                 if (pok) {
                     at = end;
+                    read_to.store(at, std::memory_order_relaxed);
+                    keep_later(at);
                     if (end == seg_end && mi < marks.size()) {
                         if (ckpt_max > 0) ckpt_keep(prompt, end);   // (no checkpoints: the mark is a prefix cut's only)
                         if (end == sys_end) slot_prefix(prompt, end);
@@ -2019,7 +2121,7 @@ static int glm_pack_generate(const Options& o) {
                 if (gap_reset) gap_reset();   // (a gap's failure: the reset multi_fail left for after the read)
                 return 1;
             }
-            // a call the prompt path did not take (fewer tokens than STRATA_GLM_PREFILL_MIN: false, no error) leaves the
+            // a call the prompt path did not take (fewer tokens than MAYA_GLM_PREFILL_MIN: false, no error) leaves the
             // rest to the token path below - from where the prompt path stopped, not from `reuse`
             i_first = at;
             if (pok) {
@@ -2031,14 +2133,25 @@ static int glm_pack_generate(const Options& o) {
                 // agent that gave up waiting and sends the same prompt again - goes on from there instead of reading
                 // it all again, and a conversation that runs in between sets it aside in a slot.  The DSA rows before
                 // the checkpoint were written by calls that ended; the cancelled call wrote only past it.
-                // STRATA_GLM_KEEP_CANCELLED=0: the state is dropped, as before.
-                static const bool keep_cancelled = env_num("STRATA_GLM_KEEP_CANCELLED", 1) != 0;
+                // glm-dsa (positional checkpoints, `later`): its marks do not end a call, so the cancelled call itself
+                // went past them - `at` is still its start.  Every part has written the cache rows before read_to (the
+                // progress callback: a pipeline's last part after its stream sync, the sequential path once the chunk
+                // is queued on every part's stream, which ckpt_save_at / ckpt_restore synchronize), so the marks up
+                // to there are kept now and the longest checkpoint up to there is restored - as when each mark ended a
+                // call (a 32K prompt cancelled at 24,000 tokens: its retry goes on from 16,384, not from token 0).
+                // MAYA_GLM_KEEP_CANCELLED=0: the state is dropped, as before.
+                static const bool keep_cancelled = env_num("MAYA_GLM_KEEP_CANCELLED", 1) != 0;
+                const size_t reached = later.empty() ? at : std::max(at, read_to.load(std::memory_order_relaxed));
                 size_t kept = 0;
                 if (keep_cancelled && ckpt_max > 0 && cur_img_pos.empty()) {
+                    // (the marks in (at, reached]: each is longer than any checkpoint the read started from, so the
+                    // restore below takes the last of them and ckpt_drop_past keeps them all)
+                    keep_later(reached);
                     int best = -1;
                     for (int c = 0; c < (int) ckpts.size(); ++c) {
                         const auto& t = ckpts[(size_t) c].tokens;
-                        if (!t.empty() && t.size() <= at && (best < 0 || t.size() > ckpts[(size_t) best].tokens.size()) &&
+                        if (!t.empty() && t.size() <= reached &&
+                            (best < 0 || t.size() > ckpts[(size_t) best].tokens.size()) &&
                             std::equal(t.begin(), t.end(), prompt.begin()))
                             best = c;
                     }
@@ -2116,7 +2229,7 @@ static int glm_pack_generate(const Options& o) {
     // Text only, and only when the state stands exactly there (the decode paths leave pos = fed tokens).
     const auto pause_snapshot = [&](const std::vector<int32_t>& prompt, const std::vector<int32_t>& emitted,
                                     bool keep) {
-        if (model.fast() && cur_img_pos.empty() && !emitted.empty() && getenv("STRATA_GLM_NO_REUSE") == nullptr) {
+        if (model.fast() && cur_img_pos.empty() && !emitted.empty() && getenv("MAYA_GLM_NO_REUSE") == nullptr) {
             const int64_t p = model.position();
             const int64_t full = (int64_t) (prompt.size() + emitted.size());
             if (keep && slot_max > 0 && p > (int64_t) prompt.size() && p < full) {
@@ -2144,15 +2257,15 @@ static int glm_pack_generate(const Options& o) {
             }
         }
     };
-    // STRATA_GLM_SPEC_FOLLOW=<file> (--spec-follow): every request decodes this continuation instead of its own picks
-    // and ends with it (Glm5Model::set_follow) - a speed A/B on one text.  STRATA_GLM_SPEC_FOLLOW_SAVE=<file>
+    // MAYA_GLM_SPEC_FOLLOW=<file> (--spec-follow): every request decodes this continuation instead of its own picks
+    // and ends with it (Glm5Model::set_follow) - a speed A/B on one text.  MAYA_GLM_SPEC_FOLLOW_SAVE=<file>
     // (--spec-follow-save): each request's decoded ids are written there, the next run's continuation.  A text made by
     // another model, or by the same model with other settings, favours the drafts that made it: compare a change on
     // the same model and its own text.
     std::vector<int32_t> follow_ids;
-    const char* follow_save = getenv("STRATA_GLM_SPEC_FOLLOW_SAVE");
+    const char* follow_save = getenv("MAYA_GLM_SPEC_FOLLOW_SAVE");
     if (follow_save != nullptr && follow_save[0] == '\0') follow_save = nullptr;
-    if (const char* fp = getenv("STRATA_GLM_SPEC_FOLLOW"); fp != nullptr && fp[0] != '\0') {
+    if (const char* fp = getenv("MAYA_GLM_SPEC_FOLLOW"); fp != nullptr && fp[0] != '\0') {
         std::ifstream input(fp);
         std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         std::vector<int64_t> v;
@@ -2176,7 +2289,7 @@ static int glm_pack_generate(const Options& o) {
         pause_req.store(false);
         pause_keep.store(false);
         model.force_next(-1);
-        model.set_follow(follow_ids);   // STRATA_GLM_SPEC_FOLLOW: this request's tokens (empty: its own picks)
+        model.set_follow(follow_ids);   // MAYA_GLM_SPEC_FOLLOW: this request's tokens (empty: its own picks)
         if (!follow_ids.empty()) max_new = std::min<int64_t>(max_new, (int64_t) follow_ids.size());
         bool in_think = req_think_budget > 0 && req_think_end >= 0;
         std::vector<int32_t> prompt;
@@ -2213,10 +2326,10 @@ static int glm_pack_generate(const Options& o) {
         // thinking budget or max_tokens ends it - minutes of nothing.  When the last W tokens are one pattern of at most
         // 32 tokens repeated exactly, thinking is closed at once (as the budget does); in the answer, what the model is in the
         // middle of is closed (a tool call's argument, else the turn), and a second loop ends it.
-        // W: STRATA_GLM_LOOP_THINK (256) while thinking, STRATA_GLM_LOOP_ANSWER (1024) in the answer - long enough
+        // W: MAYA_GLM_LOOP_THINK (256) while thinking, MAYA_GLM_LOOP_ANSWER (1024) in the answer - long enough
         // for legitimately repetitive output (a zero-filled array); 0 turns that check off.
-        static const int loop_w_think = (int) env_num("STRATA_GLM_LOOP_THINK", 256);
-        static const int loop_w_answer = (int) env_num("STRATA_GLM_LOOP_ANSWER", 1024);
+        static const int loop_w_think = (int) env_num("MAYA_GLM_LOOP_THINK", 256);
+        static const int loop_w_answer = (int) env_num("MAYA_GLM_LOOP_ANSWER", 1024);
         std::vector<int> gen_hist;
         std::vector<int32_t> emitted;   // every token this request wrote (a PAUSE keeps the state they lead to)
         bool in_arg = false;     // inside a tool call's <arg_value> (the answer's position, for the loop guard)
@@ -2352,14 +2465,18 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) (model.mtp_rounds_ - rounds0),
                              (double) n_spec / (double) (model.mtp_rounds_ - rounds0), lens.c_str());
             }
-        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready() && req_spec != 1 &&
+                   !model.spec_plain_turn()) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
-            // running the NextN block's draft (same tokens as the loop below)
-            // STRATA_GLM_SPEC_WIN=1: the MTP drafts + the pipelined verify window through a split (decode_spec_pipe)
+            // running the NextN block's draft (same tokens as the loop below).  "spec": 1 (the request's) decodes
+            // token by token, as on the DFlash and one-GPU branches above; so does the head tuner's measured
+            // no-drafting turn (spec_plain_turn, GLM-5.3 on 3+ GPUs)
+            // MAYA_GLM_SPEC_WIN=1: the MTP drafts + the pipelined verify window through a split (decode_spec_pipe)
             int64_t n_spec = 0;
             int spec_win = 0;
-            if (const char* e = getenv("STRATA_GLM_SPEC_WIN")) spec_win = std::atoi(e) != 0;
+            if (const char* e = getenv("MAYA_GLM_SPEC_WIN")) spec_win = std::atoi(e) != 0;
             const bool piped = spec_win != 0;
+            strata::core::glmng::set_history(&model, prompt);   // glm-dsa B14.13 (no-op unless MAYA_GLM_NGRAM_DRAFT)
             const bool done_ok = piped ? model.decode_spec_pipe(sp, max_new, on_token, n_spec, err)
                                        : model.decode_spec(sp, max_new, on_token, n_spec, err);
             if (!done_ok) {
@@ -2388,6 +2505,7 @@ static int glm_pack_generate(const Options& o) {
                     return 1;
                 }
             }
+            model.spec_plain_end(produced);   // (the head tuner's no-drafting turn: its time)
         }
         const auto t2 = std::chrono::steady_clock::now();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -2440,7 +2558,7 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         model.set_follow({});
-        // STRATA_GLM_SPEC_FOLLOW_SAVE: this request's decoded ids, the continuation another run can follow
+        // MAYA_GLM_SPEC_FOLLOW_SAVE: this request's decoded ids, the continuation another run can follow
         if (follow_save != nullptr && !emitted.empty()) {
             const std::string tmp = std::string(follow_save) + ".tmp";
             {
@@ -2459,7 +2577,7 @@ static int glm_pack_generate(const Options& o) {
         return 0;
     };
 
-    // ---- SEVERAL CONVERSATIONS AT ONCE (serve, STRATA_GLM_SEQS=<n> > 1).  GEN lines carry rid=<id>, and every line
+    // ---- SEVERAL CONVERSATIONS AT ONCE (serve, MAYA_GLM_SEQS=<n> > 1).  GEN lines carry rid=<id>, and every line
     // a request causes carries it after its keyword (T <rid> <id>, PP <rid> ..., DONE <rid> ..., ERR <rid> ...);
     // STOP <rid> and PAUSE <rid> [keep] end one request, STOP alone all of them.  Each request runs in one of the n
     // sequence states, a CONTEXT: an idle context whose snapshot the prompt extends is taken as it stands (nothing
@@ -2472,7 +2590,7 @@ static int glm_pack_generate(const Options& o) {
                      model.seq_count());
         follow_ids.clear();
     }
-    // STRATA_GLM_MULTI_MTP=<drafts>: the running requests' batched steps carry verify windows - each one's last token
+    // MAYA_GLM_MULTI_MTP=<drafts>: the running requests' batched steps carry verify windows - each one's last token
     // and the NextN block's drafts after it (Glm5Model::mtpw_*, strata/core/mtp_rows.hpp)
     const bool mtp_rows = multi && model.mtpw_ok();
     if (multi && strata::core::Glm5Model::multi_mtp_setting() > 0 && !mtp_rows)
@@ -2490,7 +2608,7 @@ static int glm_pack_generate(const Options& o) {
         std::vector<int32_t> snap_tokens;
         uint64_t snap_img_hash = kNoImages;
         bool snap_in_slot = false;
-        std::vector<Ckpt> ckpts;   // its checkpoints (STRATA_GLM_MULTI_CKPTS): the model's slots from c * ckpt_max on
+        std::vector<Ckpt> ckpts;   // its checkpoints (MAYA_GLM_MULTI_CKPTS): the model's slots from c * ckpt_max on
         uint64_t used = 0;
         bool busy = false;
     };
@@ -2537,7 +2655,7 @@ static int glm_pack_generate(const Options& o) {
         std::chrono::steady_clock::time_point t0, t1;
         uint64_t spec_steps0 = 0, spec_hits0 = 0;
         strata::core::Glm5Model::FastStats st1;
-        // STRATA_GLM_MULTI_MTP: the NextN block's drafts for the positions after `pending` (made at position
+        // MAYA_GLM_MULTI_MTP: the NextN block's drafts for the positions after `pending` (made at position
         // draft_at after draft_tok: stale once either moved), and this request's verify statistics
         std::vector<int32_t> drafts;
         int64_t draft_at = -1;
@@ -2559,17 +2677,18 @@ static int glm_pack_generate(const Options& o) {
         std::vector<int64_t> img_pos;
         std::vector<float> img_rows;
         std::vector<std::pair<int32_t, float>> bias;
+        int abl = -1;   // its GEN ablate= (-1: --ablate-default)
     };
     std::deque<Pending> pending;
     // the room a context must leave for the answer (at most what the request asked for): a long prompt goes to a
     // context with this much left after it, and its max tokens are cut to that context
-    static const int64_t multi_room = (int64_t) env_num("STRATA_GLM_MULTI_ROOM", 16384);
-    static const int multi_boundary_every = (int) env_num("STRATA_GLM_MULTI_BOUNDARY", 32);
-    static const bool multi_spec = env_num("STRATA_GLM_MULTI_SPEC", 1) != 0;
+    static const int64_t multi_room = (int64_t) env_num("MAYA_GLM_MULTI_ROOM", 16384);
+    static const int multi_boundary_every = (int) env_num("MAYA_GLM_MULTI_BOUNDARY", 32);
+    static const bool multi_spec = env_num("MAYA_GLM_MULTI_SPEC", 1) != 0;
     static const int split_rows = strata::core::Glm5Model::split_rows_setting();
-    // STRATA_GLM_EVEN_GROUPS=1: the split's groups cut evenly from all the running requests, two at least, instead of
+    // MAYA_GLM_EVEN_GROUPS=1: the split's groups cut evenly from all the running requests, two at least, instead of
     // k at a time (strata/core/split_groups.hpp): k 4 no longer makes one group - and idle GPUs - at 4 requests or fewer
-    static const bool even_groups = env_num("STRATA_GLM_EVEN_GROUPS", 0) != 0;
+    static const bool even_groups = env_num("MAYA_GLM_EVEN_GROUPS", 0) != 0;
     // Reuse split-row scheduler buffers; allocating vectors for each decode group defeats part of the batching gain.
     std::vector<Gen*> split_group;
     std::vector<int> split_seqs;
@@ -2619,8 +2738,8 @@ static int glm_pack_generate(const Options& o) {
             }
             return 0;
         };
-        static const int loop_w_think = (int) env_num("STRATA_GLM_LOOP_THINK", 256);
-        static const int loop_w_answer = (int) env_num("STRATA_GLM_LOOP_ANSWER", 1024);
+        static const int loop_w_think = (int) env_num("MAYA_GLM_LOOP_THINK", 256);
+        static const int loop_w_answer = (int) env_num("MAYA_GLM_LOOP_ANSWER", 1024);
         if (g.in_think && tok != g.think_end) {
             if (const int per = looping(loop_w_think)) {
                 g.force = g.think_end;
@@ -2700,7 +2819,7 @@ static int glm_pack_generate(const Options& o) {
         }
         return g.produced < g.max_new;
     };
-    // the PAUSE snapshots a read's gaps kept back (STRATA_GLM_PREFILL_GAPS): taken once no prompt is being read and no
+    // the PAUSE snapshots a read's gaps kept back (MAYA_GLM_PREFILL_GAPS): taken once no prompt is being read and no
     // request waits for its first token (the tail's logits are its own until then), their contexts idle again
     const auto flush_pauses = [&] {
         for (const auto& d : deferred_pauses) {
@@ -2773,7 +2892,7 @@ static int glm_pack_generate(const Options& o) {
         if (!gen_token(g, tok)) gen_finish(g);
         else g.pending = tok;
     };
-    // STRATA_GLM_MULTI_MTP: the groups of verify windows in flight, oldest first - each past its front (every part but
+    // MAYA_GLM_MULTI_MTP: the groups of verify windows in flight, oldest first - each past its front (every part but
     // the last), `back` once its last part and head are queued too
     struct WinGroup {
         std::vector<Gen*> g;
@@ -2793,10 +2912,10 @@ static int glm_pack_generate(const Options& o) {
     // windows' drafts - the next group's last part is queued between the drafts and their wait, so the last GPU goes
     // on with it; the requests that ended, ended
     const auto win_take = [&]() -> bool {
-        // phase timing of a rows path's round (STRATA_GLM_MTPW_TRACE=1): the wait for the picks, the accept + the
+        // phase timing of a rows path's round (MAYA_GLM_MTPW_TRACE=1): the wait for the picks, the accept + the
         // commit, the next round's drafts, the whole wall
-        static const bool trace = getenv("STRATA_GLM_MTPW_TRACE") != nullptr &&
-                                  std::atoi(getenv("STRATA_GLM_MTPW_TRACE")) != 0;
+        static const bool trace = getenv("MAYA_GLM_MTPW_TRACE") != nullptr &&
+                                  std::atoi(getenv("MAYA_GLM_MTPW_TRACE")) != 0;
         const auto t_round0 = std::chrono::steady_clock::now();
         WinGroup w = std::move(wflight.front());
         wflight.pop_front();
@@ -2915,7 +3034,7 @@ static int glm_pack_generate(const Options& o) {
         return true;
     };
     // an engine error in the middle: every running request gets it, the sequences are reset
-    uint64_t multi_fails = 0;      // (a prompt read between decode steps sees one happen: STRATA_GLM_PREFILL_INTERLEAVE)
+    uint64_t multi_fails = 0;      // (a prompt read between decode steps sees one happen: MAYA_GLM_PREFILL_INTERLEAVE)
     std::string multi_fail_why;
     const auto multi_fail = [&](const std::string& why) {
         ++multi_fails;
@@ -2951,7 +3070,7 @@ static int glm_pack_generate(const Options& o) {
         }
         gen_sweep();
     };
-    // the contexts' reset a failed gap left (STRATA_GLM_PREFILL_GAPS; multi_fail), once the read has ended
+    // the contexts' reset a failed gap left (MAYA_GLM_PREFILL_GAPS; multi_fail), once the read has ended
     gap_reset = [&] {
         if (!gap_failed) return;
         gap_failed = false;
@@ -2964,18 +3083,18 @@ static int glm_pack_generate(const Options& o) {
             model.reset();
         }
     };
-    // the decode steps between two pieces of a prompt being read in context read_ctx (STRATA_GLM_PREFILL_INTERLEAVE;
+    // the decode steps between two pieces of a prompt being read in context read_ctx (MAYA_GLM_PREFILL_INTERLEAVE;
     // set below, after multi_step): prompt_between's 0 / 1 / 2
     std::function<int(int)> interleave_round;
-    // one decode gap of a prompt being read (STRATA_GLM_PREFILL_GAPS; set below, after multi_step): 0 / 1 / 2 as
+    // one decode gap of a prompt being read (MAYA_GLM_PREFILL_GAPS; set below, after multi_step): 0 / 1 / 2 as
     // prompt_between's; gap_mark: the read's start, then each gap's end
     std::function<int()> read_gap;
     uint64_t gap_count = 0, gap_tok = 0;
     double gap_ms = 0.0;
     // the last gap's decode round (ms; 0: none yet) - a boundary's gap is due once its budget is half of one
-    // (prefill_gap_due; STRATA_GLM_PREFILL_GAP_CREDIT=0: every boundary, as before)
+    // (prefill_gap_due; MAYA_GLM_PREFILL_GAP_CREDIT=0: every boundary, as before)
     double gap_round_ms = 0.0;
-    static const bool gap_credit = env_num("STRATA_GLM_PREFILL_GAP_CREDIT", 1) != 0;
+    static const bool gap_credit = env_num("MAYA_GLM_PREFILL_GAP_CREDIT", 1) != 0;
     const auto gen_admit = [&](int rid, const std::vector<int64_t>& ids, int64_t max_new,
                                const strata::kernels::SamplerParams& rq) {
         if (!multi_drain() || !resolve_ready()) {
@@ -3008,7 +3127,7 @@ static int glm_pack_generate(const Options& o) {
             g->sp.host_history = &g->pen;
         }
         // the context: an idle one that holds the prompt and the room after it, and whose snapshot - or one of its
-        // conversation checkpoints (STRATA_GLM_MULTI_CKPTS: an edited last message, a cancelled answer sent again
+        // conversation checkpoints (MAYA_GLM_MULTI_CKPTS: an edited last message, a cancelled answer sent again
         // without it, an older turn rewritten) - this prompt extends (the longest), else the least recently used of
         // those.  prep_prompt then restores the one it found, as with one conversation.
         const int64_t want = (int64_t) g->prompt.size() + std::min<int64_t>(max_new, multi_room) + 8;
@@ -3020,10 +3139,12 @@ static int glm_pack_generate(const Options& o) {
             const auto& st = c == cur_ctx ? snap_tokens : ctxs[(size_t) c].snap_tokens;
             const uint64_t hh = c == cur_ctx ? snap_img_hash : ctxs[(size_t) c].snap_img_hash;
             size_t len = 0;
-            if (!st.empty() && st.size() < g->prompt.size() && std::equal(st.begin(), st.end(), g->prompt.begin()) &&
-                img_hash(st.size()) == hh)
+            // (--ablate: a context read with the other setting holds nothing this request can continue)
+            const bool abl_same = !model.ablate_loaded() || model.abl_seq_on(c) == abl_req();
+            if (abl_same && !st.empty() && st.size() < g->prompt.size() &&
+                std::equal(st.begin(), st.end(), g->prompt.begin()) && img_hash(st.size()) == hh)
                 len = st.size();
-            if (ckpt_max > 0 && cur_img_pos.empty()) {   // (checkpoints are kept of text prompts only)
+            if (abl_same && ckpt_max > 0 && cur_img_pos.empty()) {   // (checkpoints are kept of text prompts only)
                 const std::vector<Ckpt>& cl = c == cur_ctx ? ckpts : ctxs[(size_t) c].ckpts;
                 for (const Ckpt& k : cl)
                     if (k.tokens.size() > len && k.tokens.size() < g->prompt.size() &&
@@ -3049,7 +3170,7 @@ static int glm_pack_generate(const Options& o) {
                 return;
             }
             pending.push_back({rid, ids, max_new, rq, req_think_budget, req_think_end, cur_img_pos, cur_img_rows,
-                               req_bias});
+                               req_bias, req_abl});
             std::fprintf(stderr, "glm multi: request %d waits for a context that holds %lld tokens\n", rid,
                          (long long) want);
             return;
@@ -3075,7 +3196,7 @@ static int glm_pack_generate(const Options& o) {
         ctxs[(size_t) best].busy = true;
         g->ctx = best;
         tag = std::to_string(rid) + " ";
-        // STRATA_GLM_PREFILL_GAPS: the running requests decode at the read's chunk boundaries and between its calls
+        // MAYA_GLM_PREFILL_GAPS: the running requests decode at the read's chunk boundaries and between its calls
         // (the split's batched rows: they never bind a context; text prompts only, as interleave)
         const bool use_gaps = read_gaps.percent > 0 && cur_img_pos.empty() && split_rows > 0 && model.split_rows_ok();
         if (read_gaps.percent > 0 && !use_gaps && !gens.empty()) {
@@ -3106,15 +3227,15 @@ static int glm_pack_generate(const Options& o) {
             gap_count = gap_tok = 0;
             gap_ms = 0.0;
         }
-        // STRATA_GLM_PREFILL_INTERLEAVE: while other requests decode, the prompt in pieces with their steps between
+        // MAYA_GLM_PREFILL_INTERLEAVE: while other requests decode, the prompt in pieces with their steps between
         // (text prompts only: a prompt's image rows are the driver's globals while it is read)
         if (interleave.tokens > 0 && read_gaps.percent == 0 && !cur_img_pos.empty() && !gens.empty())
             std::fprintf(stderr, "glm multi: request %d's prompt has images: read whole, not in pieces "
                                  "(MAYA_GLM_PREFILL_INTERLEAVE is for text prompts)\n", rid);
         if (!use_gaps && interleave.tokens > 0 && cur_img_pos.empty()) {
-            // (STRATA_GLM_PREFILL_INTERLEAVE_ALWAYS=1, a test: the pieces with nothing decoding too - to compare with
+            // (MAYA_GLM_PREFILL_INTERLEAVE_ALWAYS=1, a test: the pieces with nothing decoding too - to compare with
             // the prompt read whole, the decode alone)
-            static const bool always = env_num("STRATA_GLM_PREFILL_INTERLEAVE_ALWAYS", 0) != 0;
+            static const bool always = env_num("MAYA_GLM_PREFILL_INTERLEAVE_ALWAYS", 0) != 0;
             prompt_piece = [&]() -> size_t {
                 for (const auto& gp : gens)
                     if (!gp->done) return interleave.tokens;
@@ -3202,6 +3323,7 @@ static int glm_pack_generate(const Options& o) {
             req_think_budget = w2.think_budget;
             req_think_end = w2.think_end;
             req_bias = std::move(w2.bias);
+            req_abl = w2.abl;
             cur_img_pos = std::move(w2.img_pos);
             cur_img_rows = std::move(w2.img_rows);
             gen_admit(w2.rid, w2.ids, w2.max_new, w2.rq);
@@ -3218,7 +3340,7 @@ static int glm_pack_generate(const Options& o) {
             flush_pauses();
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
         static const bool spec_win_env = [] {
-            const char* e = getenv("STRATA_GLM_SPEC_WIN");
+            const char* e = getenv("MAYA_GLM_SPEC_WIN");
             return e != nullptr && std::atoi(e) != 0;
         }();
         if (only != nullptr && !only->inflight && multi_spec && !step_no_spec && model.spec_ready() && spec_win_env) {
@@ -3282,6 +3404,7 @@ static int glm_pack_generate(const Options& o) {
             int32_t last = -1, forced_unused = -1;
             bool interrupted = false;
             int64_t n_spec = 0;
+            strata::core::glmng::set_history(&model, g.prompt, g.emitted);   // glm-dsa B14.13
             const bool ok = model.decode_spec(g.sp, g.max_new - g.produced, [&](int tok) {
                 forced_unused = -1;   // a force handed over is consumed by the token that comes next
                 last = tok;
@@ -3316,13 +3439,13 @@ static int glm_pack_generate(const Options& o) {
             multi_fail(err);
             return;
         }
-        // STRATA_GLM_MULTI_MTP: the ready requests' windows (their last token and the drafts made for the positions
+        // MAYA_GLM_MULTI_MTP: the ready requests' windows (their last token and the drafts made for the positions
         // after it) in groups as the split's batched rows take them, each group through every part but the last;
         // then the oldest group back (win_take) - its last part queued now if it was not
-        // (STRATA_GLM_MULTI_MTP_MAX, 4: the windows only while that many requests or fewer run - with more, every
+        // (MAYA_GLM_MULTI_MTP_MAX, 4: the windows only while that many requests or fewer run - with more, every
         // GPU is already busy and a window's rows cost about what the tokens they save cost; 0: always. Switching
         // drains what the other way has in flight)
-        static const int mtp_max = (int) env_num("STRATA_GLM_MULTI_MTP_MAX", 4);
+        static const int mtp_max = (int) env_num("MAYA_GLM_MULTI_MTP_MAX", 4);
         int n_run = 0;
         for (auto& gp : gens) n_run += !gp->done;
         const bool use_win = mtp_rows && (mtp_max <= 0 || n_run <= mtp_max);
@@ -3516,7 +3639,7 @@ static int glm_pack_generate(const Options& o) {
         gen_sweep();
     };
 
-    // Between two pieces of a prompt being read (STRATA_GLM_PREFILL_INTERLEAVE): `rounds` rounds of the scheduler's own
+    // Between two pieces of a prompt being read (MAYA_GLM_PREFILL_INTERLEAVE): `rounds` rounds of the scheduler's own
     // steps - each until every request running at its start has a token more (or ended) - then every issued token back
     // (the prompt path needs the GPUs to itself) and the reading context bound again.  The steps are multi_step's, so
     // a request that ends meanwhile ends as it would (DONE, its pause snapshot), and a STOP for one ends it; an engine
@@ -3561,7 +3684,7 @@ static int glm_pack_generate(const Options& o) {
         return read_stopped() ? 1 : 0;
     };
 
-    // One decode gap of a prompt's read (STRATA_GLM_PREFILL_GAPS): at a chunk boundary inside a prompt-path call (every
+    // One decode gap of a prompt's read (MAYA_GLM_PREFILL_GAPS): at a chunk boundary inside a prompt-path call (every
     // part idle, the pool's tail lent; Glm5Model::prefill_gap) or between two of its calls.  The running requests' own
     // steps (multi_step's: the split's batched rows, which never bind a context) in rounds - each until every request
     // running at its start has a token more or ended - for percent / (100 - percent) of the time the read ran since
@@ -3623,11 +3746,11 @@ static int glm_pack_generate(const Options& o) {
         return read_stopped() ? 1 : 0;
     };
 
-    // STRATA_GLM_MULTI_BENCH=<n>,<prompt>,<gen>[,<boundary rounds>] (needs STRATA_GLM_SEQS >= n): n synthetic
+    // MAYA_GLM_MULTI_BENCH=<n>,<prompt>,<gen>[,<boundary rounds>] (needs MAYA_GLM_SEQS >= n): n synthetic
     // prompts of <prompt> tokens, then <gen> greedy tokens each - sequence 0 alone through the token path first (the
     // reference), then all n through the selected together, split-rows or pipelined path; prints both rates and whether
     // same tokens both ways.
-    if (const char* mb = getenv("STRATA_GLM_MULTI_BENCH")) {
+    if (const char* mb = getenv("MAYA_GLM_MULTI_BENCH")) {
         int n = 2, L = 512, G = 256, K = 32, same_prompt = 0;
         std::sscanf(mb, "%d,%d,%d,%d,%d", &n, &L, &G, &K, &same_prompt);
         if (n > model.seq_count() || n < 1 || L < 2 || G < 2) {
@@ -3706,7 +3829,7 @@ static int glm_pack_generate(const Options& o) {
         st_a = model.fast_stats();
         const auto t0 = now();
         int since = 0, boundaries = 0;
-        // STRATA_GLM_MULTI_MTP: every sequence's verify windows through the batched rows (the server's order of calls)
+        // MAYA_GLM_MULTI_MTP: every sequence's verify windows through the batched rows (the server's order of calls)
         const bool wrows = model.mtpw_ok() && (model.rows_ok() || (split_rows > 0 && model.split_rows_ok()));
         const bool rows = model.rows_ok() && !wrows;   // one GPU: all n together, one step per token of each
         const bool srows = !rows && !wrows && split_rows > 0 && model.split_rows_ok();
@@ -3840,7 +3963,7 @@ static int glm_pack_generate(const Options& o) {
         if (srows) {
             std::deque<int> qg;
             const auto issue_rows = [&](const std::vector<int>& seqs) -> bool {
-                // (STRATA_GLM_EVEN_GROUPS: the groups the server makes, from the sequences still decoding)
+                // (MAYA_GLM_EVEN_GROUPS: the groups the server makes, from the sequences still decoding)
                 int active = 0;
                 for (int s = 0; s < n; ++s) active += (int) out[(size_t) s].size() < G;
                 size_t first = 0;
@@ -3954,9 +4077,9 @@ static int glm_pack_generate(const Options& o) {
         std::printf("  solo :");
         for (int i = 0; i < 12 && i < (int) solo.size(); ++i) std::printf(" %d", solo[(size_t) i]);
         std::printf("\n");
-        // STRATA_GLM_MULTI_DUMP=<file>: every sequence's tokens, a line each (then the solo run's) - two builds' or
+        // MAYA_GLM_MULTI_DUMP=<file>: every sequence's tokens, a line each (then the solo run's) - two builds' or
         // settings' runs compared whole, not by their first 12
-        if (const char* dump = getenv("STRATA_GLM_MULTI_DUMP")) {
+        if (const char* dump = getenv("MAYA_GLM_MULTI_DUMP")) {
             if (std::FILE* f = std::fopen(dump, "w")) {
                 for (int s = 0; s <= n; ++s) {
                     const std::vector<int>& v = s < n ? out[(size_t) s] : solo;
@@ -3978,19 +4101,19 @@ static int glm_pack_generate(const Options& o) {
                                  "header of src/program/generate.cpp)\n");
             return 2;
         }
-        // STRATA_GLM_SCORE=<c>: score --tokens instead of generating.  Every token goes through the one-token decode
+        // MAYA_GLM_SCORE=<c>: score --tokens instead of generating.  Every token goes through the one-token decode
         // path (the tiers and the CPU lane as in a decode); the tokens after the first c are scored given the ones
-        // before: mean NLL, perplexity, top-1 hits.  STRATA_GLM_SCORE_DUMP=<file> writes each scored position's
-        // log-softmax (n_vocab floats); STRATA_GLM_SCORE_REF=<file> reads such a dump and reports KL(ref || this) and
+        // before: mean NLL, perplexity, top-1 hits.  MAYA_GLM_SCORE_DUMP=<file> writes each scored position's
+        // log-softmax (n_vocab floats); MAYA_GLM_SCORE_REF=<file> reads such a dump and reports KL(ref || this) and
         // how often both pick the same top token - the quality yardstick for engine changes and for quants.
-        // STRATA_GLM_SCORE_TOPK=<file> is the compact reference (the FP8 model's, tools/maya_quant): an int32 k, then
+        // MAYA_GLM_SCORE_TOPK=<file> is the compact reference (the FP8 model's, tools/maya_quant): an int32 k, then
         // per scored position k int32 token ids (best first) and their k float log-probs.  KL over those k tokens plus
         // one bucket for the rest of the vocabulary.
-        if (const char* sc = getenv("STRATA_GLM_SCORE")) {
+        if (const char* sc = getenv("MAYA_GLM_SCORE")) {
             const size_t c = (size_t) std::max(0L, std::atol(sc));
-            const char* dump = getenv("STRATA_GLM_SCORE_DUMP");
-            const char* ref = getenv("STRATA_GLM_SCORE_REF");
-            const char* tkf = getenv("STRATA_GLM_SCORE_TOPK");
+            const char* dump = getenv("MAYA_GLM_SCORE_DUMP");
+            const char* ref = getenv("MAYA_GLM_SCORE_REF");
+            const char* tkf = getenv("MAYA_GLM_SCORE_TOPK");
             std::FILE* df = dump && dump[0] ? std::fopen(dump, "wb") : nullptr;
             std::FILE* rf = ref && ref[0] ? std::fopen(ref, "rb") : nullptr;
             std::FILE* tf = tkf && tkf[0] ? std::fopen(tkf, "rb") : nullptr;
@@ -4008,10 +4131,10 @@ static int glm_pack_generate(const Options& o) {
             double nll = 0.0, kl = 0.0, kl_max = 0.0;
             size_t n = 0, top1 = 0, same = 0, nref = 0;
             const auto ts = std::chrono::steady_clock::now();
-            // STRATA_GLM_SCORE_PREFILL=1: the unscored context (all but its last token) through the prompt path, so a
+            // MAYA_GLM_SCORE_PREFILL=1: the unscored context (all but its last token) through the prompt path, so a
             // long context is scored in minutes (the KV-cache formats at 128K); the scored tokens stay token by token
             size_t i0 = 0;
-            if (getenv("STRATA_GLM_SCORE_PREFILL") != nullptr && model.fast() && model.prefill_chunk() > 0 && c > 2 &&
+            if (getenv("MAYA_GLM_SCORE_PREFILL") != nullptr && model.fast() && model.prefill_chunk() > 0 && c > 2 &&
                 c < o.tokens.size()) {
                 const std::vector<int32_t> part(o.tokens.begin(), o.tokens.begin() + (long) (c - 1));
                 if (!model.prefill(part, err, (int32_t) o.tokens[c - 1])) {
@@ -4092,21 +4215,21 @@ static int glm_pack_generate(const Options& o) {
         return rc;
     }
 
-    // STRATA_GLM_WARM_PROMPT=<n> (default 0 = off; 32 or more): one synthetic prompt through the whole part chain
+    // MAYA_GLM_WARM_PROMPT=<n> (default 0 = off; 32 or more): one synthetic prompt through the whole part chain
     // before the server is told READY, so the session's first request does not pay what only a session's first
     // prompt pays (issue #8: it read 95-133 ms/token against 23-44 warm - the first chunk carries the one-time work:
     // every kernel's first launch, the prompt path's own allocations, the tiers' first reads).  It costs about one
     // chunk of the smallest part's size (~15 s on a four-way split, beside the tiers' own 90-151 s warm-up), its ids
     // are spread over the vocabulary so the routes are not one expert's, and the state is zeroed right after it: no
     // conversation can see it (a request with no slot in use resets anyway, before its own prompt).
-    if (const char* wv = getenv("STRATA_GLM_WARM_PROMPT")) {
+    if (const char* wv = getenv("MAYA_GLM_WARM_PROMPT")) {
         const int wn = std::atoi(wv);
         if (wn > 0 && model.prefill_chunk() > 0) {
             const int wtn = std::max(32, wn);
             std::vector<int32_t> wids((size_t) wtn);
             for (int i = 0; i < wtn; ++i) wids[(size_t) i] = (int32_t) (100 + (i * 131) % 20000);
             std::fprintf(stderr, "glm fast: warming the prompt path with a %d-token prompt before READY "
-                                 "(STRATA_GLM_WARM_PROMPT)\n", wtn);
+                                 "(MAYA_GLM_WARM_PROMPT)\n", wtn);
             const auto wt0 = std::chrono::steady_clock::now();
             std::string werr;
             const bool wok = model.prefill(wids, werr);
@@ -4140,6 +4263,17 @@ static int glm_pack_generate(const Options& o) {
         cudaSetDevice(cur);
         return ok ? (int64_t) (fb >> 20) : -1;
     };
+    // an integrated GPU (an APU): what is allocated after the expert pool fit (the one-GPU drafting buffers, ~3.4 GB
+    // for GLM-5.3) can use up the reserve and go on into its shared GPU memory - the same RAM, and it runs as before -
+    // so "0 MiB free" there is no reason to shrink the pool
+    const auto integrated_gpu = [](int dev) {
+        int v = 0;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        return v != 0;
+    };
     for (size_t i = 0; i < pools.size(); ++i) {
         const auto& pv = pools[i];
         const int64_t fm = free_mib_on(pv.dev);
@@ -4147,6 +4281,10 @@ static int glm_pack_generate(const Options& o) {
         const int64_t ok_mib = i == 0 ? 256 : 512;
         if (fm >= ok_mib) {
             std::fprintf(stderr, "maya serve: CUDA%d: %lld MiB of VRAM free with everything loaded\n", pv.dev, (long long) fm);
+        } else if (!pv.adapted && integrated_gpu(pv.dev)) {
+            std::fprintf(stderr, "maya serve: CUDA%d: %lld MiB of VRAM free with everything loaded (an integrated GPU: "
+                                 "what is allocated after the expert pool, such as the drafting buffers, is in its "
+                                 "shared GPU memory - nothing to change)\n", pv.dev, (long long) fm);
         } else if (pv.adapted) {
             std::fprintf(stderr, "maya serve: WARNING: CUDA%d: %lld MiB of VRAM free with everything loaded - this card "
                                  "only just fits the model (the VRAM reserve was lowered to %d MiB so the expert pool "
@@ -4219,7 +4357,7 @@ static int glm_pack_generate(const Options& o) {
         // the watchdog watches a command from here until this iteration ends, whichever way it ends.  A command that
         // ended is progress: back-to-back short commands (the zero-shot suite's LOGP lines, ~0.4 s each on the token
         // path, which has no beat of its own) leave the watchdog's 1 s look almost never on an idle moment, so
-        // without this beat it stopped a healthy engine after STRATA_WATCHDOG_S of answers
+        // without this beat it stopped a healthy engine after MAYA_WATCHDOG_S of answers
         struct BusyScope {
             BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("the request"); }
             ~BusyScope() {
@@ -4262,6 +4400,10 @@ static int glm_pack_generate(const Options& o) {
             std::vector<int32_t> t(t64.begin(), t64.end());
             snap_tokens.clear();                  // the saved state is LOGP's now, not a conversation's
             ckpt_drop_past(0);                    // ... and so are the caches the checkpoints stood on
+            if (model.ablate_loaded() && model.ablating() != o.ablate_default) {   // (--ablate: LOGP scores as the
+                model.set_ablate(o.ablate_default);                                 //  engine started - read anew)
+                lp_ctx.clear();
+            }
             model.set_host_logits(true);
             const std::vector<int32_t> ctx(t.begin(), t.begin() + n_ctx);
             bool ok = true;
@@ -4314,13 +4456,13 @@ static int glm_pack_generate(const Options& o) {
             int64_t max_new = 0;
             ss >> max_new;
             strata::kernels::SamplerParams rq = sp;
-            bool any_key = false, greedy_req = false;
+            bool any_key = false, greedy_req = false, seed_req = false;
             req_think_budget = 0;
             req_think_end = -1;
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
             int req_threads = 0;
             int req_chunks = 0;   // ... and its disk reads' pieces (0: as the engine started)
-            double req_msw = -1.0;   // ... and its light-miss bar / first layer (STRATA_GLM_MISS_SKIP_W / _FROM; < 0: the engine's)
+            double req_msw = -1.0;   // ... and its light-miss bar / first layer (MAYA_GLM_MISS_SKIP_W / _FROM; < 0: the engine's)
             int req_msf = -1;
             int req_rid = -1;
             req_spec = 0;
@@ -4328,9 +4470,11 @@ static int glm_pack_generate(const Options& o) {
             req_spec_n_min = -1;
             req_spec_cum = -1.0;
             req_bias.clear();
+            req_abl = -1;
             std::string bias_err;
             int pen_n = 0;
             float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
+            strata::core::glmknob::Request req_knobs;   // glm-dsa request knobs: this request's engine knobs
             std::string tok2, ids, emb_path;
             while (ss >> tok2) {
                 const size_t eq = tok2.find('=');
@@ -4348,7 +4492,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "top_p") { rq.top_p = (float) std::atof(v.c_str()); any_key = true; }
                 else if (k == "top_k") { rq.top_k = std::atoi(v.c_str()); any_key = true; }
                 else if (k == "min_p") { rq.min_p = (float) std::atof(v.c_str()); any_key = true; }
-                else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); }
+                else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); seed_req = rq.seed != 0; }
                 else if (k == "think_budget") { req_think_budget = std::atoll(v.c_str()); }
                 else if (k == "think_end") { req_think_end = std::atoi(v.c_str()); }
                 else if (k == "pcie_frac") { req_pcie = std::atof(v.c_str()); }
@@ -4361,6 +4505,8 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "spec_min_p") { req_spec_min_p = std::atof(v.c_str()); }
                 else if (k == "spec_n_min") { req_spec_n_min = std::atoi(v.c_str()); }
                 else if (k == "spec_cum") { req_spec_cum = std::atof(v.c_str()); }
+                else if (req_knobs.take(k, v)) {}   // glm-dsa request knobs: promote_min= .. pcie_frac_head= (glm_req_knobs.hpp)
+                else if (k == "ablate") { req_abl = std::atoi(v.c_str()) != 0 ? 1 : 0; }   // (--ablate: this request's)
                 else if (k == "logit_bias") {   // <id>:<bias>,... - -100 or below bans the token
                     for (size_t at = 0; at < v.size() && bias_err.empty();) {
                         size_t end = v.find(',', at);
@@ -4388,6 +4534,10 @@ static int glm_pack_generate(const Options& o) {
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
             if (greedy_req) rq.greedy = true;
+            // a sampled request without a seed draws a new one (#845: seed 0 for every such request gave the same answer
+            // each time); a seed in the request, or --seed when the engine started, stays exact
+            if (!rq.greedy && !seed_req && o.seed == 0)
+                rq.seed = (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
             // a repeat penalty of 0 or below (some clients' "off"; the logits would be divided by it) or a value that is
             // not a number counts as neutral
             if (!std::isfinite(pen_repeat) || pen_repeat <= 0.0f) pen_repeat = 1.0f;
@@ -4425,6 +4575,7 @@ static int glm_pack_generate(const Options& o) {
             model.set_cpu_lane_threads(req_threads > 0 ? req_threads : 0);
             model.set_read_chunks(req_chunks > 0 ? req_chunks : 0);
             model.set_miss_skip(req_msw, req_msf);
+            strata::core::glmknob::apply(model, req_knobs);   // glm-dsa request knobs: after set_pcie_share (pcie_frac_head)
             std::vector<int64_t> toks;
             std::string e;
             if (max_new <= 0 || ids.empty() || !parse_i64_list(ids.c_str(), toks, e)) {
@@ -4504,6 +4655,11 @@ static int glm_pack_generate(const Options& o) {
                 gen_finish(*gp);
             }
         gen_sweep();
+        if (strata::core::glmpc::engine_on(model))   // glm-dsa B14.14: every conversation to the prompt cache
+            for (int c = 0; c < (int) ctxs.size(); ++c) {
+                bind_ctx(c);
+                if (!model.ablating()) strata::core::glmpc::engine_put(model, snap_tokens, snap_img_hash == kNoImages);
+            }
         if (slot_keep && !slot_ram)
             for (int c = 0; c < (int) ctxs.size(); ++c) {
                 bind_ctx(c);
@@ -4511,6 +4667,7 @@ static int glm_pack_generate(const Options& o) {
             }
         return 0;
     }
+    if (!model.ablating()) strata::core::glmpc::engine_put(model, snap_tokens, snap_img_hash == kNoImages);   // glm-dsa B14.14
     if (slot_keep && !slot_ram) slot_put(" on shutdown");
     save_profile("quit");   // #477
     strata::core::Glm5Model::set_routing_dump("", err);   // --dump-routing: the trace closed whole
@@ -4583,22 +4740,41 @@ int main(int argc, char** argv) {
         else if (a == "--glm-pack") o.glm_pack = next("--glm-pack");
         else if (a == "--glm-ram-resident") {
 #if defined(_WIN32)
-            _putenv_s("STRATA_GLM_RAM_RESIDENT", "1");
+            _putenv_s("MAYA_GLM_RAM_RESIDENT", "1");
 #else
-            setenv("STRATA_GLM_RAM_RESIDENT", "1", 1);
+            setenv("MAYA_GLM_RAM_RESIDENT", "1", 1);
 #endif
         }
-        else if (a == "--parallel") {   // the sequence states (STRATA_GLM_SEQS): n conversations at once
+        else if (a == "--ablate") o.ablate = next("--ablate");
+        else if (a == "--ablate-layer") {
+            const int n = std::atoi(next("--ablate-layer"));
+            if (n < 1 || n > 4096) { std::fprintf(stderr, "--ablate-layer takes 1..4096\n"); return 2; }
+            o.ablate_layer = n;
+        }
+        else if (a == "--ablate-scale") {
+            const double v = std::atof(next("--ablate-scale"));
+            if (!(v >= 1e-6 && v <= 1e6)) { std::fprintf(stderr, "--ablate-scale takes 1e-6..1e6\n"); return 2; }
+            o.ablate_scale = (float) v;
+        }
+        else if (a == "--ablate-default") {   // on (every pass, as a startup flag) | off (GEN ablate=1 turns it on)
+            const std::string v = next("--ablate-default");
+            if (v != "on" && v != "off" && v != "1" && v != "0") {
+                std::fprintf(stderr, "--ablate-default: on or off\n");
+                return 2;
+            }
+            o.ablate_default = v == "on" || v == "1";
+        }
+        else if (a == "--parallel") {   // the sequence states (MAYA_GLM_SEQS): n conversations at once
             const int n = std::atoi(next("--parallel"));
             if (n < 1 || n > 8) { std::fprintf(stderr, "--parallel takes 1..8\n"); return 2; }
-            set_env("STRATA_GLM_SEQS", std::to_string(n).c_str());
+            set_env("MAYA_GLM_SEQS", std::to_string(n).c_str());
         }
         else if (a == "--glm-ram-slack") {
             const char* v = next("--glm-ram-slack");
 #if defined(_WIN32)
-            _putenv_s("STRATA_GLM_RAM_SLACK", v);
+            _putenv_s("MAYA_GLM_RAM_SLACK", v);
 #else
-            setenv("STRATA_GLM_RAM_SLACK", v, 1);
+            setenv("MAYA_GLM_RAM_SLACK", v, 1);
 #endif
         }
         else if (a == "--tokens") {
@@ -4646,7 +4822,7 @@ int main(int argc, char** argv) {
         else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
-        else if (a == "--kv") o.kv = next("--kv");
+        else if (a == "--kv") { o.kv = next("--kv"); o.kv_given = true; }
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--kv-streaming") o.kv_streaming = next("--kv-streaming");
         else if (a == "--stream-token") o.stream_token = true;
@@ -4726,6 +4902,7 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+        else if (a == "--decode-cache-every") o.decode_cache_every = std::max(0LL, std::atoll(next("--decode-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
@@ -4812,9 +4989,13 @@ int main(int argc, char** argv) {
     // mistake worth saying out loud.
     // --kv-streaming on|off: on streams with --kv-resident's window (32768 when it gives none), off keeps every cell in
     // VRAM whatever --kv-resident says
+    bool kv_auto = false;   // `on` with no window of the user's: glm-dsa streams only when its cache does not fit (36)
     if (!o.kv_streaming.empty()) {
         if (o.kv_streaming == "on") {
-            if (o.kv_resident <= 0) o.kv_resident = 32768;
+            if (o.kv_resident <= 0) {
+                o.kv_resident = 32768;
+                kv_auto = true;
+            }
         } else if (o.kv_streaming == "off") {
             o.kv_resident = 0;
         } else {
@@ -4822,19 +5003,30 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (!o.ablate.empty() && o.glm_pack.empty()) {   // (the Qwen engine has no projection: refused, not ignored)
+        std::fprintf(stderr, "--ablate: the GLM engine only (--glm-pack); this model's engine has no refusal ablation\n");
+        return 2;
+    }
     if (!o.glm_pack.empty()) {
+        // GLM without --kv: INT8, as the setup writes it (v1.1.55: KL against the full model within FP16's own
+        // run-to-run spread, no new loops; half the latent cache's VRAM); --kv fp16 or MAYA_GLM_KV_INT8=0 keeps FP16
+        if (!o.kv_given && std::getenv("MAYA_GLM_KV_INT8") == nullptr) o.kv = "int8";
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
-        if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
+        if (o.kv == "int8" && std::getenv("MAYA_GLM_KV_INT8") == nullptr) set_env("MAYA_GLM_KV_INT8", "1");
         // --kv-resident N: KV streaming of the DSA latent cache (Glm5Model::kv_resident_cells, read at load)
         if (o.kv_resident < 0) {
             std::fprintf(stderr, "maya generate: --kv-resident must be 0 or more\n");
             return 2;
         }
-        if (o.kv_resident > 0 && std::getenv("STRATA_GLM_KV_RESIDENT") == nullptr)
-            set_env("STRATA_GLM_KV_RESIDENT", std::to_string(o.kv_resident).c_str());
-        if (o.kv_streaming == "off") set_env("STRATA_GLM_KV_RESIDENT", "0");   // (off whatever the environment says)
-        // the expert pool's size, set in the config's args (the engine reads them as STRATA_GLM_EXPERT_CACHE,
-        // STRATA_GLM_RESERVE_MB and STRATA_GLM_RESERVE_LATER_MB; given here, they win over the environment):
+        const bool kv_env = std::getenv("MAYA_GLM_KV_RESIDENT") != nullptr;
+        if (o.kv_resident > 0 && !kv_env)
+            set_env("MAYA_GLM_KV_RESIDENT", std::to_string(o.kv_resident).c_str());
+        // OWNER-DECISIONS 36: the setup's `on` lets a glm-dsa model keep its whole cache in VRAM when it fits there
+        // (decided at load from the measured VRAM; Flash streams as before)
+        if (kv_auto && !kv_env && std::getenv("MAYA_GLM_KV_AUTO") == nullptr) set_env("MAYA_GLM_KV_AUTO", "1");
+        if (o.kv_streaming == "off") set_env("MAYA_GLM_KV_RESIDENT", "0");   // (off whatever the environment says)
+        // the expert pool's size, set in the config's args (the engine reads them as MAYA_GLM_EXPERT_CACHE,
+        // MAYA_GLM_RESERVE_MB and MAYA_GLM_RESERVE_LATER_MB; given here, they win over the environment):
         // --expert-cache auto | N (0 = auto), --vram-reserve-mib N, --vram-reserve-later-mib N
         if (o.expert_cache < -1) {
             std::fprintf(stderr, "maya generate: --expert-cache takes auto or a number of experts\n");
@@ -4845,10 +5037,10 @@ int main(int argc, char** argv) {
             return 2;
         }
         if (o.expert_cache != 0)
-            set_env("STRATA_GLM_EXPERT_CACHE", o.expert_cache < 0 ? "auto" : std::to_string(o.expert_cache).c_str());
-        if (o.vram_reserve_given) set_env("STRATA_GLM_RESERVE_MB", std::to_string(o.vram_reserve_mib).c_str());
+            set_env("MAYA_GLM_EXPERT_CACHE", o.expert_cache < 0 ? "auto" : std::to_string(o.expert_cache).c_str());
+        if (o.vram_reserve_given) set_env("MAYA_GLM_RESERVE_MB", std::to_string(o.vram_reserve_mib).c_str());
         if (o.vram_reserve_later_mib >= 0)
-            set_env("STRATA_GLM_RESERVE_LATER_MB", std::to_string(o.vram_reserve_later_mib).c_str());
+            set_env("MAYA_GLM_RESERVE_LATER_MB", std::to_string(o.vram_reserve_later_mib).c_str());
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }
@@ -5001,7 +5193,7 @@ int main(int argc, char** argv) {
         o.native_bf16 = o.native_bf16_extra = true;
         o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
         o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
-        if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
+        if (o.native_head_gguf.empty()) o.native_head_gguf = shard_with(o.native_preset, "output.weight");
         if (o.native_dense_gguf.empty()) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
             // may put any layer in any shard (Swift's GGUFs: layers 13-47 in shard 2, the PLE table in shard 1)
@@ -5127,7 +5319,7 @@ int main(int argc, char** argv) {
     else if (!strata::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "maya generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
-                     std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
+                     std::getenv("MAYA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (MAYA_NO_IQ256 set)");
     strata::core::NativeEmbed native_embed;
     if (native_pack) {
         if (o.native_preset.empty() || o.spec < 2 || o.keep_canonical ||
@@ -5137,7 +5329,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         const strata::core::ModelGeometry g0;
-        if (!native_embed.load(o.native_preset, g0.n_embd, 248320, err)) {
+        if (!native_embed.load(shard_with(o.native_preset, "token_embd.weight"), g0.n_embd, 248320, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
@@ -5652,7 +5844,7 @@ int main(int argc, char** argv) {
     //     the routed mass of rank r is taken as (r+1)^-1.2 (fits the sweep's hit rates: K=24/26/28 predicted
     //     99.53/99.34/99.15%, measured 99.5/99.4/99.0%).
     // Up to 3 GPUs every placement is tried; beyond, the layers are shared in proportion to speed.
-    // STRATA_SPLIT_MISS_MS tunes the miss cost (a slower CPU: higher).
+    // MAYA_SPLIT_MISS_MS tunes the miss cost (a slower CPU: higher).
     const int64_t split_pf_mib = o.prefill_chunk > 0 ? 160 + (o.prefill_chunk * 680) / 1024 : 0;
     auto stage_room = [&](int dev, bool later) -> int64_t {
         const strata::core::OnDevice on(dev);
@@ -5681,7 +5873,7 @@ int main(int argc, char** argv) {
                                  "%.2f GiB for experts\n", dev, sms, khz / 1e6, layer_ms[(size_t) i],
                          (double) cap[(size_t) i] / 1073741824.0);
         }
-        const double miss_ms = std::getenv("STRATA_SPLIT_MISS_MS") ? std::atof(std::getenv("STRATA_SPLIT_MISS_MS")) : 190.0;
+        const double miss_ms = std::getenv("MAYA_SPLIT_MISS_MS") ? std::atof(std::getenv("MAYA_SPLIT_MISS_MS")) : 190.0;
         std::vector<double> mass(profile.size());
         double total_mass = 0;
         for (size_t r = 0; r < profile.size(); ++r) total_mass += (mass[r] = std::pow((double) r + 1.0, -1.2));
@@ -5830,7 +6022,7 @@ int main(int argc, char** argv) {
                 // cuBLAS and staging state, the verify window ~90 MiB, the host-registered expert tiers' tables ~110 MiB)
                 const int64_t verify_mib = 16 * ((int64_t) o.spec + 2);
                 const int64_t other_mib = 192 + 112;
-                const char* fv = std::getenv("STRATA_SERVE_FREE_FLOOR_MIB");
+                const char* fv = std::getenv("MAYA_SERVE_FREE_FLOOR_MIB");
                 const int64_t floor_mib = fv ? std::atoll(fv) : 256;
                 const int64_t post_mib = own_mib + verify_mib + other_mib;
                 const int64_t by_floor = ((int64_t) (free_b >> 20) - post_mib - floor_mib) * (1ll << 20) / blob;
@@ -5909,11 +6101,11 @@ int main(int argc, char** argv) {
         // high.  A cache sized from it filled the card to 0 MiB, the driver then paged, and a request that needed a
         // page back while the verify graph spun on a host flag never finished.  So the slots are zeroed and the
         // free figure read again; while it is short of the reserve the cache is reopened smaller.
-        // STRATA_TEST_CACHE_FAIL=N: the first N opens fail as an out-of-commit cudaMalloc does (tests the retry)
-        int fake_fails = std::getenv("STRATA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("STRATA_TEST_CACHE_FAIL")) : 0;
+        // MAYA_TEST_CACHE_FAIL=N: the first N opens fail as an out-of-commit cudaMalloc does (tests the retry)
+        int fake_fails = std::getenv("MAYA_TEST_CACHE_FAIL") ? std::atoi(std::getenv("MAYA_TEST_CACHE_FAIL")) : 0;
         int failed = 0;
 #if !defined(STRATA_USE_HIP)
-        // an on-demand vision encoder (serve --vision; the server sets STRATA_GLM_VISION_LEND_MB): the cache is mapped
+        // an on-demand vision encoder (serve --vision; the server sets MAYA_GLM_VISION_LEND_MB): the cache is mapped
         // in pieces, so its tail can be given back while a picture is read (HIP: only VRAM that is free is lent)
         if (o.serve && o.vision && vision_lend_need() > 0) xcache.set_lendable(true);
 #endif
@@ -6905,9 +7097,9 @@ int main(int argc, char** argv) {
         static constexpr int64_t kAutoChunks[] = {8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
         // at 8192-token chunks nearly every expert streams anyway, so a lent slot costs little: 90% when the
         // copies are DMA from pinned RAM (Q2_0 8192 + a 384-slot ring: 1283 tok/s), 85% when host copies are the
-        // limit (lending more only streams more through them).  STRATA_PREFILL_LEND_PCT overrides (tuning).
+        // limit (lending more only streams more through them).  MAYA_PREFILL_LEND_PCT overrides (tuning).
         const int64_t kAutoLendPct = [] {
-            const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
+            const char* v = std::getenv("MAYA_PREFILL_LEND_PCT");
             return v ? (int64_t) std::atoi(v)
                      : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
         }();
@@ -7120,13 +7312,20 @@ int main(int argc, char** argv) {
         std::map<int64_t, std::vector<ConvCheckpoint>> part_at;   // position -> one part per stage
         std::vector<int64_t> part_next(stages.size() + 1, INT64_MAX);
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
-        // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr) -> bool {
+        // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L).
+        // `written`: the tokens the session consumed instead of `cur` (a checkpoint inside the answer, at L > n)
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr,
+                                 const std::vector<int32_t>* written = nullptr) -> bool {
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
             ConvCheckpoint c;
-            c.ids.assign(cur.begin(), cur.begin() + L);
+            if (written != nullptr) {
+                c.ids.assign(written->begin(), written->begin() + L);
+                c.decode = true;
+            } else {
+                c.ids.assign(cur.begin(), cur.begin() + L);
+            }
             c.imgs = imgs_below(req_imgs, L);
             if (parts != nullptr) {
                 if (parts->size() != stages.size() + 1) return false;
@@ -7365,8 +7564,8 @@ int main(int argc, char** argv) {
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
-        // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
-        const bool trace = std::getenv("STRATA_TRACE") != nullptr;
+        // MAYA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
+        const bool trace = std::getenv("MAYA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
             if (!trace) return;
             std::fprintf(stderr, "maya trace: %s %lld %lld\n", what, a, b);
@@ -7843,14 +8042,27 @@ int main(int argc, char** argv) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
                     }
+                // where the prompt left what the session holds (a conversation that "reads everything again" shows
+                // here why: an edited message, a changed system prompt or thinking level, a turn read back otherwise)
+                if (live_ok && !from_live && !live.empty()) {
+                    const int64_t m = std::min<int64_t>((int64_t) live.size(), n);
+                    int64_t k = 0;
+                    while (k < m && (int32_t) ids[(size_t) k] == live[(size_t) k]) ++k;
+                    std::fprintf(stderr, "maya serve: the prompt leaves the session's %zu tokens at token %lld; %lld "
+                                         "reused from a checkpoint (%zu kept)\n",
+                                 live.size(), (long long) k, (long long) resume, checks.size());
+                }
             }
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
+            // (a checkpoint inside an earlier answer below `resume` is of no more use: this request writes the cells
+            //  after it, and the one it starts from - a restart's - stays; so at most the last answer's two are kept)
             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
-                             return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
+                             return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs) ||
+                                    (c.decode && (int64_t) c.ids.size() < resume);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
-            int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
+            int64_t reread_to = -1;   // MAYA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
@@ -7864,7 +8076,7 @@ int main(int argc, char** argv) {
                 ConvCheckpoint* c = nullptr;
                 for (ConvCheckpoint& k : checks) if ((int64_t) k.ids.size() == resume) c = &k;
                 if (c != nullptr) c->used = ++check_clock;   // mounting through it is the use LRU counts
-                static const bool reread = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+                static const bool reread = std::getenv("MAYA_CKPT_REREAD") != nullptr;
                 if (reread && c != nullptr) {
                     // THE CHECK OF THE CHECKPOINT: instead of restoring it, read its tokens again from position 0 in
                     // one run (below, with the prompt path's slots lent like any read) - the same chunks the request
@@ -7917,8 +8129,8 @@ int main(int argc, char** argv) {
             // not in VRAM over PCIe), and it borrows slots it must refill after (~180 ms); a window costs ~16 ms a
             // token, with the misses on the CPU.  Each part below is decided on its own, so a long first message is
             // read batched and its header still goes through the windows.  Picture rows need the batched path.
-            // STRATA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
-            static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
+            // MAYA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
+            static const bool no_short = std::getenv("MAYA_CKPT_REREAD") != nullptr;
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
                 if (no_short || b - a > o.short_read) return false;
                 if (sp.embd_rows != nullptr)
@@ -7966,7 +8178,7 @@ int main(int argc, char** argv) {
             auto refill = [&](std::string& e) -> bool {
                 if (lent_now.empty()) return true;
                 tr("refill start", (long long) lent_now.size());
-                for (const auto& [i, slot] : lent_now) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                for (const auto& [i, slot] : lent_now) {   // D-4: queued, one wait (MAYA_REFILL_BLOCKING=1: each)
                     const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                     const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                     // (an expert staged from the model file: its ring slot is reused - copied and waited for)
@@ -8180,8 +8392,8 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
-            // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
-            static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
+            // MAYA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
+            static const bool dec_timing = std::getenv("MAYA_DECODE_TIMING") != nullptr;
             struct DecSnap {
                 double wait, pool, host, plan, actq, jobs, run;
                 int64_t misses, entries, hits, pcie;
@@ -8204,6 +8416,11 @@ int main(int argc, char** argv) {
             int64_t think_left = req_think_budget > 0 && req_think_end >= 0 ? req_think_budget : 0;
             bool force_end = false;
             bool window_failed = false;   // a window failed: the request ends here, the engine lives
+            // the next checkpoint inside the answer (--decode-cache-every): at that many consumed tokens
+            int64_t dc_next = o.prompt_cache > 0 && o.decode_cache_every > 0
+                                  ? (int64_t) consumed.size() + o.decode_cache_every : INT64_MAX;
+            static int dc_request = 0;   // (MAYA_DECODE_CKPT_ROUNDTRIP=alt: the check on every other request)
+            ++dc_request;
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
@@ -8260,6 +8477,17 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                // the window ends at the first end of turn (and at the token limit): the session then holds exactly
+                // what was sent before the last token, as with one token a window, so the next turn's prompt goes on
+                // from it (until v1.1.54 the drafts accepted past <|im_end|> joined it: the next prompt left the
+                // session at its last token and read back from a checkpoint inside the answer).  Nothing past the
+                // end of turn is ever sent, so the answer is the same.
+                for (int i = 0; i < a; ++i)
+                    if (produced_n + i + 1 >= max_new ||
+                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end()) {
+                        a = i;
+                        break;
+                    }
                 if (force_end) {                       // (the budget: the answer starts here, whatever came out)
                     outv[0] = (int32_t) req_think_end;
                     force_end = false;
@@ -8345,6 +8573,46 @@ int main(int argc, char** argv) {
                 if (timed_round && !eos)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                // A CHECKPOINT INSIDE THE ANSWER (--decode-cache-every): the state after everything consumed so far,
+                // which the session holds after the commit (taken once the draft and the adaptive tier are done:
+                // nothing else is on the GPU).  The last two of this answer are kept (the older ones go), so a prompt
+                // that goes on from a point inside it - a server restart at the thinking budget, a history that
+                // reads the answer back differently - reads at most ~2N tokens again.
+                if (!eos && (int64_t) consumed.size() >= dc_next) {
+                    const int64_t L = (int64_t) consumed.size();
+                    dc_next = L + o.decode_cache_every;
+                    if (!checkpoint_at(L, nullptr, &consumed)) {
+                        std::fprintf(stderr, "maya serve: a checkpoint inside the answer failed at %lld; none more "
+                                             "for this request\n", (long long) L);
+                        dc_next = INT64_MAX;
+                    } else {
+                        // MAYA_DECODE_CKPT_ROUNDTRIP (a check): put the checkpoint just taken back at once - the
+                        // answer must go on token for token as without it (a deterministic run: --mtp-max-t 1)
+                        // (=alt: only on every other request, so one engine compares both)
+                        static const char* rt_env = std::getenv("MAYA_DECODE_CKPT_ROUNDTRIP");
+                        const bool roundtrip = rt_env != nullptr && (std::strcmp(rt_env, "alt") != 0 || dc_request % 2 == 1);
+                        if (roundtrip)
+                            for (const ConvCheckpoint& k : checks)
+                                if ((int64_t) k.ids.size() == L) {
+                                    bool ok = checkpoint_restore(k, ss, g) && k.stage_parts.size() == stages.size();
+                                    for (size_t i = 0; ok && i < stages.size(); ++i) {
+                                        const strata::core::OnDevice on(stages[i]->dev);
+                                        ok = checkpoint_restore(k.stage_parts[i], stages[i]->ss, g);
+                                    }
+                                    std::fprintf(stderr, "maya serve: MAYA_DECODE_CKPT_ROUNDTRIP at %lld: %s\n",
+                                                 (long long) L, ok ? "put back" : "FAILED");
+                                }
+                        int n_dec = 0;
+                        for (const ConvCheckpoint& k : checks) n_dec += k.decode ? 1 : 0;
+                        while (n_dec > 2) {   // the oldest one inside an answer goes
+                            auto old = checks.end();
+                            for (auto it = checks.begin(); it != checks.end(); ++it)
+                                if (it->decode && (old == checks.end() || it->ids.size() < old->ids.size())) old = it;
+                            checks.erase(old);
+                            --n_dec;
+                        }
+                    }
+                }
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
@@ -8374,7 +8642,7 @@ int main(int argc, char** argv) {
                 live_ok = o.prompt_cache > 0;
             }
             if (window_failed) continue;   // the ERR was reported: the engine lives, the next request runs
-            static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
+            static const bool state_hash = std::getenv("MAYA_STATE_HASH") != nullptr;
             if (state_hash && live_ok) {
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
@@ -8403,7 +8671,7 @@ int main(int argc, char** argv) {
                 };
                 const ConvStateSizes z = conv_state_sizes(g);
                 uint64_t h_gdn = hash_dev(ss.gdn_state, z.gdn, 1469598103934665603ull);
-                if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // per GDN layer: which one differs first
+                if (std::getenv("MAYA_STATE_HASH_GDN") != nullptr) {   // per GDN layer: which one differs first
                     const size_t per = z.gdn / (size_t) g.n_gdn_layers();
                     std::string s;
                     char b[8];
@@ -8478,9 +8746,9 @@ int main(int argc, char** argv) {
                              100.0 * (double) req_hits / (double) req_look,
                              (long long) req_hits, (long long) req_look);
             }
-            // STRATA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
+            // MAYA_SPLIT_TIMING: where each verify stage's host time went, cumulative per window since the start
             // (waiting for its GPU to ring a layer, the CPU pool and plan per layer, staging the window)
-            if (static const bool st_timing = std::getenv("STRATA_SPLIT_TIMING") != nullptr; st_timing)
+            if (static const bool st_timing = std::getenv("MAYA_SPLIT_TIMING") != nullptr; st_timing)
                 for (int st = 0; st < n_stages; ++st) {
                     const strata::core::Verifier& v = stage_ver(st);
                     const double w = v.windows > 0 ? (double) v.windows : 1.0;
@@ -8621,7 +8889,7 @@ int main(int argc, char** argv) {
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {
             const Clock::time_point tr = Clock::now();
-            for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+            for (const auto& [i, slot] : lent) {   // D-4: queued, one wait (MAYA_REFILL_BLOCKING=1: each)
                 const uint8_t* b = srcp->blob(i / g.n_expert, i % g.n_expert);
                 const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
                 const bool blocking = refill_blocking() || !srcp->stable(i / g.n_expert, i % g.n_expert);

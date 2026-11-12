@@ -5,8 +5,8 @@ import {Component, html, useEffect, useLayoutEffect, useRef, useState} from "./p
 import {SPRITE, coarse, ctxfmt, esc, fmt, isPhone, modelName, timeStr, tokfmt} from "./lib.js";
 import {LEVELS, P, PRESET_NAMES, S, copyText, emit, presetOf, savePrefs, thinkPill, thinkTitles} from "./state.js";
 import {mcpOn} from "./server.js";
-import {addFiles, cancelEdit, chatView, ctxMeter, editMessage, focusInput, newChat, painters, regenerate,
-        removeAttachment, scrollDown, send, setThinking, stopAnswer, thinkingOf, updateCtxMeter} from "./chats.js";
+import {addFiles, cancelEdit, chatView, ctxMeter, editMessage, focusInput, levelLeftAtDefault, newChat, painters,
+        regenerate, removeAttachment, scrollDown, send, setThinking, stopAnswer, thinkingOf, updateCtxMeter} from "./chats.js";
 import {markdown, onCodeClick, patchHtml, streamingMarkdown} from "./md.js";
 import {ChatMenuItems, openSettings, setSide, showView, status, usd} from "./sidebar.js";
 import {MS, loadModels} from "./models.js";
@@ -91,7 +91,8 @@ function UserMsg({m, i}) {
   return html`<div class="you" data-id=${m.id}>
     ${(m.files || []).length || (m.images || []).length ? html`<div class="you__files">
       ${(m.files || []).map((f) => html`<span class="chip"><${Icon} name="attach" sm/>${f.name}</span>`)}
-      ${(m.images || []).map((im) => im.url ? html`<img src=${im.url} alt=${im.name || "picture"}/>`
+      ${(m.images || []).map((im) => im.url ? (im.kind === "video" ? html`<video src=${im.url} controls preload="metadata" aria-label=${im.name || "video"}></video>`
+                                                                     : html`<img src=${im.url} alt=${im.name || "picture"}/>`)
                                             : html`<span class="chip"><${Icon} name="image" sm/>${im.name || "picture"}</span>`)}</div>` : null}
     ${m.text ? html`<div class="you__bubble">${m.text}</div>` : null}
     <div class="you__actions"><span class="you__time">${m.time ? timeStr(m.time) : ""}</span>
@@ -300,7 +301,11 @@ function ThinkingBar({bar, below}) {
   const level = thinkingOf(), pill = thinkPill(level), n = pill.n, li = pill.i;
   const titles = thinkTitles();
   const track = useRef(null), dragging = useRef(false);
-  const set = (i) => { const l = LEVELS[Math.min(n - 1, Math.max(0, i))]; if (l.id !== thinkingOf()) setThinking(l.id); };
+  // (GLM-5.3: a tap on the level already set picks it when it was only the default - a Max its user picks may think
+  //  longer, levelLeftAtDefault; every other model: as before)
+  const set = (i) => { const l = LEVELS[Math.min(n - 1, Math.max(0, i))]; if (l.id !== thinkingOf() || levelLeftAtDefault()) setThinking(l.id); };
+  const leftMax = level === "max" && levelLeftAtDefault();
+  const maxHint = leftMax ? ` (the default: tap it to let it think longer, up to ${fmt(S.health.thinking_budget_max)} tokens)` : "";
   const from = (x) => { const r = track.current.getBoundingClientRect(); return Math.floor(((x - r.left) / r.width) * n); };
   const down = (e) => { dragging.current = true; e.currentTarget.setPointerCapture(e.pointerId); set(from(e.clientX)); };
   const move = (e) => { if (dragging.current) set(from(e.clientX)); };
@@ -319,7 +324,7 @@ function ThinkingBar({bar, below}) {
       onPointerDown=${down} onPointerMove=${move} onPointerUp=${up} onPointerCancel=${up} onKeyDown=${keys}>
       <span class="think-bar__fill"></span>
       ${LEVELS.map((l, i) => html`<span class=${`think-bar__seg${i === li ? " is-sel" : ""}`}
-        title=${titles[l.id]}>${l.name}</span>`)}
+        title=${titles[l.id] + (i === li ? maxHint : "")}>${l.name}</span>`)}
     </div>
   </div>`;
 }

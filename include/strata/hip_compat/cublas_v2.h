@@ -1,4 +1,15 @@
 #pragma once
+// hipBLAS 2.x (ROCm 6.x) keeps the hipDataType / hipblasComputeType_t GemmEx API behind HIPBLAS_V2 (ROCm 7's
+// hipBLAS 3 has it by default): opt in before the header, as a distribution's ROCm 6 (Debian's 6.4) needs it.
+// (a hipBLAS without the version header builds as before: no version, so neither ROCm 6 branch below)
+#if defined(__has_include)
+#if __has_include(<hipblas/hipblas-version.h>)
+#include <hipblas/hipblas-version.h>
+#endif
+#endif
+#if defined(hipblasVersionMajor) && hipblasVersionMajor < 3 && !defined(HIPBLAS_V2)
+#define HIPBLAS_V2
+#endif
 #include <hipblas/hipblas.h>
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
 #define CUBLAS_DEFAULT_MATH HIPBLAS_DEFAULT_MATH
@@ -18,10 +29,20 @@
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
 #define cublasGemmEx hipblasGemmEx
+// (the same argument order: hipDataType operands, hipblasStride strides, hipblasComputeType_t; glm-dsa's prompt MLA)
+#define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
 #define cublasSgemm hipblasSgemm
 #define cublasSgemmStridedBatched hipblasSgemmStridedBatched
 #define cublasHandle_t hipblasHandle_t
 #define cublasSetMathMode hipblasSetMathMode
 #define cublasSetStream hipblasSetStream
+#if defined(hipblasVersionMajor) && hipblasVersionMajor < 3
+// hipBLAS 2.x has no hipblasSetWorkspace: rocBLAS then sizes its own workspace (a no-op, the GEMMs are the same)
+static inline hipblasStatus_t strata_hipblas_set_workspace_noop(hipblasHandle_t, void*, size_t) {
+    return HIPBLAS_STATUS_SUCCESS;
+}
+#define cublasSetWorkspace strata_hipblas_set_workspace_noop
+#else
 #define cublasSetWorkspace hipblasSetWorkspace
+#endif
 #define cublasStatus_t hipblasStatus_t
