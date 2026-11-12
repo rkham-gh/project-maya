@@ -14208,8 +14208,15 @@ struct Model::Impl {
             return false;
         }
         helper_shared = shared != nullptr && std::strcmp(shared, "1") == 0;
-        if (helper_shared && (pk.gguf || g.n_mtp == 0 || o.tp != 2)) {
-            err = "DS4_HELPER_SHARED: requires EXL3, TP2 and loaded DSpark blocks";
+        // (upstream: EXL3 and --tp 2 only, the setup it was measured on.  MAYA_DS4_HELPER_SHARED_ANY=1 lifts those two:
+        //  a GGUF's helper beside the drafter on one card - an RTX 3090 with DSpark's blocks and a pool of the experts
+        //  an RTX 5090's VRAM leaves over, the 5090 holding every trunk layer (DS4_SPLIT=40,0, DS4_DRAFT_GPU=1).  The
+        //  pool is reserved before the drafter is placed either way; nothing else here depends on the format)
+        const char* any = ds4_env("DS4_HELPER_SHARED_ANY");
+        const bool shared_any = any != nullptr && std::atoi(any) != 0;
+        if (helper_shared && (g.n_mtp == 0 || (!shared_any && (pk.gguf || o.tp != 2)))) {
+            err = "DS4_HELPER_SHARED: requires EXL3, TP2 and loaded DSpark blocks (MAYA_DS4_HELPER_SHARED_ANY=1: a GGUF, "
+                  "any --tp, with loaded DSpark blocks)";
             return false;
         }
         if (!helper_shared && std::find(o.gpus.begin(), o.gpus.end(), (int) id) != o.gpus.end()) {
