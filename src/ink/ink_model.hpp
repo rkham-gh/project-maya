@@ -18,6 +18,10 @@ struct Geo {
     int n_swa = 0, d_rel = 0, rel_ext = 0, rel_ext_swa = 0, conv_k = 0, log_floor = 0;
     int vocab = 0, vocab_unpadded = 0, ctx_train = 0;
     std::vector<uint8_t> swa;   // per layer: 1 sliding window, 0 global
+    // Inkling 2: the output's softcap, the q / k and relative states' L2 clips, the experts' gate / up softcaps, the
+    // layers in an attention-residual block
+    float lcap = 0.0f, qkclip = 0.0f, rclip = 0.0f, gcap = 0.0f, ucap = 0.0f;
+    int res_block = 6;
 };
 
 struct Options {

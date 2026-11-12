@@ -24,9 +24,9 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="the pack directory (tokenizer/ goes inside)")
     a = ap.parse_args()
     tok = pathlib.Path(a.out) / "tokenizer"
-    cfg = ST.extract(a.gguf, tok)
+    cfg = ST.extract(a.gguf, a.out)   # (extract writes <out>/tokenizer)
     if cfg["pre"] != "inkling":
-        raise SystemExit(f"{a.gguf}: pre-tokenizer {cfg['pre']!r}, not Inkling-Small's 'inkling'")
+        raise SystemExit(f"{a.gguf}: pre-tokenizer {cfg['pre']!r}, not Inkling's 'inkling'")
     meta = json.loads((tok / "tokenizer.json").read_text(encoding="utf-8"))
     sid = meta.get("special_ids") or {}
     # (the server ends a request at the "eos" a pack names - maya-ink's own end, <|content_model_end_sampling|>)

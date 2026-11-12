@@ -1,5 +1,22 @@
-// src/ink/ink_model.cu - maya-ink's model (ink_model.hpp): the GGUF read, the weights placed, and a token's step
-// through Inkling-Small's layers - llama.cpp's graph (src/models/inkling.cpp in ggml-org/llama.cpp#25731) step by step:
+// src/ink/ink_model.cu - maya-ink's model (ink_model.hpp), branch inkling2: Inkling 2 Small (Thinking Machines, 594B
+// MoE, 17B active) from the GGUF written by C:\llm\test-results\2026-11-12-inkling2\ink2_convert.py, following
+// transformers' modeling_inkling2.py (huggingface/transformers#50682):
+//
+//   h = rmsnorm(embd[token], token_embd_norm); blocks = []
+//   per layer i:  x = i == 0 ? h : attn_res(blocks, h, attn_res_q) (3 queries on the global layers: q / k / v inputs)
+//                 q, r, gate, sinks from rmsnorm(x_q); k, v from rmsnorm(x_k), rmsnorm(x_v)
+//                 k, v = (y + conv(y)) / sqrt(5) (sliding), dynamic taps (global: static + proj(x_k / x_v), / 3)
+//                 q = l2clip(q * q_clip) (x tau on the global layers); k = l2clip(k); v = rmsnorm per head
+//                 o = sigmoid(gate) * attention(q, K, V, rel band(l2clip(r * rel_clip)), sinks), scale 1 / sqrt(hd)
+//                 a = (Wo o + conv(Wo o)) / sqrt(5)
+//                 at i % 6 == 0: blocks += [h], res = a; else res = h + a
+//                 f = rmsnorm(attn_res(blocks, res, ffn_res_q), ffn_norm); the top 8 of sigmoid(logits) + bias,
+//                 weights sigmoid / their sum x 8; experts softcap(g, 4) sigmoid(g) softcap(u, 25) before down
+//                 h = res + (moe + conv(moe)) / sqrt(5)
+//   logits = softcap(output(rmsnorm(attn_res(blocks, h, output_res_q), output_norm)), 30), the padded rows -inf
+//
+// (Inkling-Small, the engine this branch came from, followed llama.cpp's graph (src/models/inkling.cpp in
+// ggml-org/llama.cpp#25731) step by step:)
 //
 //   x = rmsnorm(embd[token], token_embd_norm)
 //   per layer:  a = rmsnorm(x, attn_norm);  q, k, v, r = Wq a, Wk a, Wv a, Wr a
@@ -139,6 +156,13 @@ struct Layer {
     DMat gate, up, down;           // dense layers
     DMat gate_inp;                 // MoE layers: n_expert + n_shexp rows
     DMat sh_gate[2], sh_up[2], sh_down[2];
+    // Inkling 2
+    float* in_norm[3] = {nullptr, nullptr, nullptr};    // the global layers' q / k / v input norms
+    float *sc_k_stat = nullptr, *sc_v_stat = nullptr;   // their dynamic convs' static taps [K][kvw]
+    float *res_q = nullptr, *ffn_q = nullptr;           // the attention residuals' queries ([nq][E], [E])
+    int nq = 1;
+    float *q_clip = nullptr, *rel_clip = nullptr;
+    DMat wgate, wsink, kproj, vproj;
     CpuLayer cl;
     __half *K = nullptr, *V = nullptr;
     int kv_rows = 0;
@@ -174,6 +198,12 @@ struct Engine::Impl {
     int8_t* xq = nullptr;
     float* xd = nullptr;
     uint16_t* e16 = nullptr;
+    // Inkling 2's token path: the token's finished blocks (RMS-normed, [blocks][E]), the layer's residual, the
+    // attention residuals' outputs [3][E], the normed inputs [3][E], the gate [H hd], the sinks [H], the dynamic taps of
+    // k and v [Hkv K], k and v after a global layer's convs, the output's residual query
+    float *blk = nullptr, *res = nullptr, *mix = nullptr, *a3 = nullptr, *gt = nullptr, *snk = nullptr, *dyk = nullptr,
+          *dyv = nullptr, *k2 = nullptr, *v2 = nullptr, *out_q = nullptr;
+    int n_blocks() const { return (g.n_layer + g.res_block - 1) / g.res_block; }
     // host (pinned)
     float *h_f = nullptr, *h_rlog = nullptr, *h_tail = nullptr, *h_logits = nullptr, *h_tokd = nullptr,
           *h_gamma = nullptr;
@@ -390,6 +420,8 @@ struct Engine::Impl {
         float *X = nullptr, *A = nullptr, *Q = nullptr, *Kf = nullptr, *Vf = nullptr, *Kc = nullptr, *Vc = nullptr;
         float *R = nullptr, *Y = nullptr, *Ye = nullptr, *GU = nullptr, *RL = nullptr, *wts = nullptr, *wl = nullptr;
         float *S = nullptr, *Ot = nullptr, *tau = nullptr;
+        float *RES = nullptr, *GATE = nullptr, *SINK = nullptr, *DYN = nullptr;   // (Inkling 2)
+        __half* BLK = nullptr;   // a chunk's finished blocks, RMS-normed: [blocks][C][E]
         __half *Ah = nullptr, *Qh = nullptr, *AOh = nullptr, *Kw = nullptr, *Vw = nullptr, *Xe = nullptr, *He = nullptr;
         __half *P = nullptr, *W1 = nullptr, *W2 = nullptr;
         int *h_ids = nullptr, *h_cnt = nullptr, *h_off = nullptr;
@@ -415,6 +447,15 @@ struct Engine::Impl {
     void lin(const DMat& m, const __half* x, int T, float* y) {
         f16w(m, pf.W1);
         gemm(x, m.k, pf.W1, m.k, y, m.n, T, m.n, m.k);
+    }
+    // y [T][n] = x [T][k] . W^T for an F32 matrix (the sinks' and the dynamic taps' projections)
+    void lin32(const DMat& m, const float* x, int T, float* y) {
+        const float one = 1.0f, zero = 0.0f;
+        if (cublasSgemm(pf.cb, CUBLAS_OP_T, CUBLAS_OP_N, m.n, T, m.k, &one, (const float*) m.w, m.k, x, m.k, &zero, y,
+                        m.n) != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "maya-ink: cuBLAS F32 product failed\n");
+            std::abort();
+        }
     }
     void pf_attention(const Layer& l, int T, int pos0, const __half* Kb, const __half* Vb, int kp0, int nkeys,
                       float* out);
@@ -685,8 +726,8 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     }
     const strata::GgufFile& f0 = *files[0];
     const strata::MetaValue* arch = f0.get("general.architecture");
-    if (!arch || arch->s != "inkling") {
-        err = "not an Inkling GGUF (general.architecture " + (arch ? arch->s : std::string("missing")) + ")";
+    if (!arch || arch->s != "inkling2") {
+        err = "not an Inkling 2 GGUF (general.architecture " + (arch ? arch->s : std::string("missing")) + ")";
         return false;
     }
     const int nsplit = meta_int(f0, "split.count", 1);
@@ -707,7 +748,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
         for (const auto& t : fp->tensors()) tens[t.name] = Tensor{&t, fp->tensor_data(t)};
 
     // the shape
-    const std::string A = "inkling.";
+    const std::string A = "inkling2.";
     g.n_layer = meta_int(f0, A + "block_count");
     g.n_embd = meta_int(f0, A + "embedding_length");
     g.n_ff = meta_int(f0, A + "feed_forward_length");
@@ -726,7 +767,14 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     g.rel_ext = meta_int(f0, A + "rel_extent");
     g.rel_ext_swa = meta_int(f0, A + "rel_extent_swa");
     g.conv_k = meta_int(f0, A + "shortconv_kernel");
-    g.n_dense = meta_int(f0, A + "dense_block_count");
+    g.n_dense = 0;
+    g.n_shexp = std::max(0, g.n_shexp);
+    g.lcap = meta_f(f0, A + "final_logit_softcapping", 30.0f);
+    g.qkclip = meta_f(f0, A + "qk_l2_clip", 0.0f);
+    g.rclip = meta_f(f0, A + "rel_l2_clip", 0.0f);
+    g.gcap = meta_f(f0, A + "mlp_gate_softcap", 0.0f);
+    g.ucap = meta_f(f0, A + "mlp_up_softcap", 0.0f);
+    g.res_block = meta_int(f0, A + "attn_res_block", 6);
     g.logit_scale = 1.0f / meta_f(f0, A + "logit_scale_denom", 1.0f);
     g.log_floor = meta_int(f0, A + "log_scaling_n_floor", 0);
     g.log_alpha = meta_f(f0, A + "log_scaling_alpha", 0.0f);
@@ -737,8 +785,9 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     if (const strata::MetaValue* v = f0.get(A + "attention.sliding_window_pattern"))
         for (int i = 0; i < g.n_layer && i < (int) v->items.size(); ++i) g.swa[(size_t) i] = v->items[(size_t) i].u ? 1 : 0;
     if (g.n_layer <= 0 || g.n_embd <= 0 || g.head_dim % 32 != 0 || g.head_dim > 256 || g.n_head % g.n_head_kv != 0 ||
-        g.conv_k < 2 || g.conv_k > 8 || g.n_shexp != 2 || g.n_used > 16 || g.d_rel <= 0) {
-        err = "an Inkling shape this engine does not take";
+        g.conv_k < 2 || g.conv_k > 8 || g.n_shexp != 0 || g.n_used > 16 || g.d_rel <= 0 || g.qkclip <= 0.0f ||
+        g.gcap <= 0.0f || g.ucap <= 0.0f || g.res_block <= 0 || (g.n_layer + g.res_block - 1) / g.res_block > 8) {
+        err = "an Inkling 2 shape this engine does not take";
         return false;
     }
     kvw = g.n_head_kv * g.head_dim;
@@ -774,6 +823,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     if (!mat("output.weight", E, g.vocab, output, err)) return false;
     if (!(tok_norm = f32("token_embd_norm.weight", (size_t) E, err))) return false;
     if (!(out_norm = f32("output_norm.weight", (size_t) E, err))) return false;
+    if (!(out_q = f32("output_res_q.weight", (size_t) E, err))) return false;
     L.resize((size_t) g.n_layer);
     for (int il = 0; il < g.n_layer; ++il) {
         Layer& l = L[(size_t) il];
@@ -781,21 +831,33 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
         l.swa = g.swa[(size_t) il] != 0;
         l.dense = il < g.n_dense;
         l.E = l.swa ? g.rel_ext_swa : g.rel_ext;
-        std::vector<float> gs;
-        if (!(l.attn_norm = f32(b + "attn_norm.weight", (size_t) E, err))) return false;
-        if (!(l.q_norm = f32(b + "attn_q_norm.weight", (size_t) hd, err))) return false;
-        if (!(l.k_norm = f32(b + "attn_k_norm.weight", (size_t) hd, err))) return false;
+        if (l.swa) {
+            if (!(l.attn_norm = f32(b + "attn_norm.weight", (size_t) E, err))) return false;
+            if (!(l.sc_k = f32(b + "shortconv_k.weight", (size_t) kc * kvw, err))) return false;
+            if (!(l.sc_v = f32(b + "shortconv_v.weight", (size_t) kc * kvw, err))) return false;
+        } else {
+            static const char* nn[3] = {"attn_q_in_norm", "attn_k_in_norm", "attn_v_in_norm"};
+            for (int i = 0; i < 3; ++i)
+                if (!(l.in_norm[i] = f32(b + nn[i] + ".weight", (size_t) E, err))) return false;
+            if (!(l.sc_k_stat = f32(b + "shortconv_k_static.weight", (size_t) kc * kvw, err))) return false;
+            if (!(l.sc_v_stat = f32(b + "shortconv_v_static.weight", (size_t) kc * kvw, err))) return false;
+            if (!mat(b + "shortconv_k_proj.weight", E, g.n_head_kv * kc, l.kproj, err) ||
+                !mat(b + "shortconv_v_proj.weight", E, g.n_head_kv * kc, l.vproj, err))
+                return false;
+        }
+        l.nq = l.swa ? 1 : 3;
+        if (il > 0 && !(l.res_q = f32(b + "attn_res_q.weight", (size_t) E * l.nq, err))) return false;
+        if (!(l.ffn_q = f32(b + "ffn_res_q.weight", (size_t) E, err))) return false;
+        if (!(l.q_clip = f32(b + "attn_q_clip.weight", (size_t) H * hd, err))) return false;
+        if (!(l.rel_clip = f32(b + "attn_rel_clip.weight", (size_t) H * g.d_rel, err))) return false;
         if (!(l.rel_proj = f32(b + "attn_rel_proj.weight", (size_t) g.d_rel * l.E, err))) return false;
-        if (!(l.sc_k = f32(b + "shortconv_k.weight", (size_t) kc * kvw, err))) return false;
-        if (!(l.sc_v = f32(b + "shortconv_v.weight", (size_t) kc * kvw, err))) return false;
         if (!(l.sc_attn = f32(b + "shortconv_attn.weight", (size_t) kc * E, err))) return false;
         if (!(l.sc_mlp = f32(b + "shortconv_mlp.weight", (size_t) kc * E, err))) return false;
         if (!(l.ffn_norm = f32(b + "ffn_norm.weight", (size_t) E, err))) return false;
-        if (!(l.gscale_d = f32(b + "ffn_gscale.weight", 1, err, &gs))) return false;
-        l.gscale = gs[0];
         if (!mat(b + "attn_q.weight", E, H * hd, l.wq, err) || !mat(b + "attn_k.weight", E, kvw, l.wk, err) ||
             !mat(b + "attn_v.weight", E, kvw, l.wv, err) || !mat(b + "attn_r.weight", E, H * g.d_rel, l.wr, err) ||
-            !mat(b + "attn_output.weight", H * hd, E, l.wo, err))
+            !mat(b + "attn_output.weight", H * hd, E, l.wo, err) || !mat(b + "attn_gate.weight", E, H * hd, l.wgate, err) ||
+            !mat(b + "attn_sinks.weight", E, H, l.wsink, err))
             return false;
         if (l.dense) {
             if (!mat(b + "ffn_gate.weight", E, g.n_ff, l.gate, err) || !mat(b + "ffn_up.weight", E, g.n_ff, l.up, err) ||
@@ -809,10 +871,6 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
                 return false;
             }
             if (!(l.exp_bias_d = f32(b + "exp_probs_b.bias", (size_t) ne, err, &l.exp_bias))) return false;
-            if (!bank(b + "ffn_gate_shexp.weight", E, g.n_ff_exp, g.n_shexp, l.sh_gate, err) ||
-                !bank(b + "ffn_up_shexp.weight", E, g.n_ff_exp, g.n_shexp, l.sh_up, err) ||
-                !bank(b + "ffn_down_shexp.weight", g.n_ff_exp, E, g.n_shexp, l.sh_down, err))
-                return false;
             // the routed experts stay where they are, for the CPU lane
             const Tensor *tg = find(b + "ffn_gate_exps.weight"), *tu = find(b + "ffn_up_exps.weight"),
                          *td = find(b + "ffn_down_exps.weight");
@@ -827,6 +885,8 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
             l.cl.gate = tg->data;
             l.cl.up = tu->data;
             l.cl.down = td->data;
+            l.cl.gcap = g.gcap;
+            l.cl.ucap = g.ucap;
         }
         // the caches: a full one on the global layers, a ring of n_swa rows on the sliding ones
         l.kv_rows = l.swa ? g.n_swa : max_ctx;
@@ -863,7 +923,17 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     gamma = dalloc<float>(2);
     attn_scr = dalloc<float>(
         k::attn_scratch_floats(H, hd, std::max(k::attn_nsp(0, max_ctx), k::attn_nsp(g.n_swa, g.n_swa))));
-    const int kmax = std::max(g.n_ff, 2 * g.n_ff_exp) * 2;
+    const int kmax = std::max({3 * E, 4 * g.n_ff_exp, H * hd, 2 * g.n_ff});
+    blk = dalloc<float>((size_t) n_blocks() * E);
+    res = dalloc<float>(E);
+    mix = dalloc<float>((size_t) 3 * E);
+    a3 = dalloc<float>((size_t) 3 * E);
+    gt = dalloc<float>((size_t) H * hd);
+    snk = dalloc<float>(H);
+    dyk = dalloc<float>((size_t) g.n_head_kv * kc);
+    dyv = dalloc<float>((size_t) g.n_head_kv * kc);
+    k2 = dalloc<float>(kvw);
+    v2 = dalloc<float>(kvw);
     xq = dalloc<int8_t>((size_t) kmax);
     xd = dalloc<float>((size_t) kmax / 32);
     e16 = dalloc<uint16_t>(E);
@@ -914,10 +984,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
                          (now_ms() - tp) / 1000.0, working_set_gb());
     }
     if (const char* rl = std::getenv("INK_ROUTE_LOG")) route_log = std::fopen(rl, "ab");
-    if (const char* fv = std::getenv("INK_FUSE")) fuse = std::atoi(fv) & 15;
-    if (!(k::fused_ok(E, g.head_dim, g.conv_k, g.d_rel) && g.n_head % g.n_head_kv == 0 && g.n_head / g.n_head_kv <= 8 &&
-          g.n_head * g.head_dim == E))
-        fuse = 0;
+    fuse = 0;   // (Inkling 2: the fused token kernels are Inkling-Small's; the plain ones run)
     const size_t before_pf = dev_bytes;
     if (!pf_alloc(err)) return false;
     const size_t before_ec = dev_bytes;
@@ -1458,7 +1525,7 @@ void Engine::Impl::gpu_experts(const Layer& l, const int* slot, const float* w, 
         std::fprintf(stderr, "maya-ink: no GEMV for the experts' types %d / %d\n", c.tg, c.tu);
         std::abort();
     }
-    k::swiglu_f32_rows(ec.gu, n, ff, ec.h, s);
+    k::act_cap_rows(ec.gu, n, ff, g.gcap, g.ucap, nullptr, ec.h, s);
     k::q8(ec.h, n, ff, ec.hq, ec.hd, s);
     iq::MvJob dj[16];
     for (int i = 0; i < n; ++i) {
@@ -1861,7 +1928,7 @@ void Engine::Impl::hc_experts(const Layer& l, const int* slot, const float* w, i
         std::fprintf(stderr, "maya-ink: no GEMV for the experts' types %d / %d\n", c.tg, c.tu);
         std::abort();
     }
-    k::swiglu_f32_rows(hc.gu, n, ff, hc.h, hc.s);
+    k::act_cap_rows(hc.gu, n, ff, g.gcap, g.ucap, nullptr, hc.h, hc.s);
     k::q8(hc.h, n, ff, hc.hq, hc.hd, hc.s);
     iq::MvJob dj[16];
     for (int i = 0; i < n; ++i) {
@@ -2070,6 +2137,11 @@ bool Engine::Impl::pf_alloc(std::string& err) {
         carve(pf.list, (size_t) C * nu);
         carve(pf.wl, (size_t) C * nu);
         carve(pf.tau, (size_t) C);
+        carve(pf.RES, CE);
+        carve(pf.GATE, (size_t) C * qw);
+        carve(pf.SINK, (size_t) C * H);
+        carve(pf.DYN, (size_t) C * g.n_head_kv * g.conv_k);
+        carve(pf.BLK, (size_t) n_blocks() * CE);
         carve(pf.Ah, CE);
         carve(pf.Qh, (size_t) C * qw);
         carve(pf.AOh, (size_t) C * qw);
@@ -2161,8 +2233,7 @@ void Engine::Impl::gemm(const __half* X, int ldx, const __half* W, int ldw, floa
 void Engine::Impl::pf_attention(const Layer& l, int T, int pos0, const __half* Kb, const __half* Vb, int kp0,
                                 int nkeys, float* out) {
     const int H = g.n_head, Hkv = g.n_head_kv, hd = g.head_dim, G = H / Hkv;
-    const float scale = 1.0f / (float) hd, one = 1.0f, zero = 0.0f;
-    const float* tl = (!l.swa && g.log_floor > 0) ? pf.tau : nullptr;
+    const float scale = 1.0f / std::sqrt((float) hd), one = 1.0f, zero = 0.0f;
     const int window = l.swa ? g.n_swa : 0;
     auto r8 = [](int v) { return (v + 7) & ~7; };
     // the keys a tile of the queries [ta, tb) needs: from lo(ta) (the window's start on a sliding layer) to the last
@@ -2185,8 +2256,8 @@ void Engine::Impl::pf_attention(const Layer& l, int T, int pos0, const __half* K
                 std::fprintf(stderr, "maya-ink: cuBLAS scores %dx%d failed (%d)\n", M, nk, (int) r);
                 std::abort();
             }
-            k::attn_softmax(pf.S, ld, pf.P, ld, M, nk, G, gi, ta, pos0, kp0 + j0, window, pf.R, l.rel_proj, l.E, H,
-                            g.d_rel, tl, s);
+            k::attn_softmax2(pf.S, ld, pf.P, ld, M, nk, G, gi, ta, pos0, kp0 + j0, window, pf.R, l.rel_proj, l.E, H,
+                             g.d_rel, pf.SINK, s);
             r = cublasGemmEx(pf.cb, CUBLAS_OP_N, CUBLAS_OP_N, hd, M, nk, &one, Vt, CUDA_R_16F, kvw, pf.P, CUDA_R_16F, ld,
                              &zero, pf.Ot, CUDA_R_32F, hd, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
             if (r != CUBLAS_STATUS_SUCCESS) {
@@ -2223,7 +2294,7 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
         std::fprintf(stderr, "maya-ink: cuBLAS router failed\n");
         std::abort();
     }
-    k::route(pf.RL, ne + nsh, l.exp_bias_d, T, ne, nsh, nu, g.exp_scale * l.gscale, pf.sel, pf.wts, s);
+    k::route2(pf.RL, ne + nsh, l.exp_bias_d, T, ne, nu, g.exp_scale, pf.sel, pf.wts, s);
     CK(cudaMemsetAsync(pf.cnt, 0, (size_t) ne * sizeof(int), s));
     k::expert_count(pf.sel, T * nu, pf.cnt, s);
     CK(cudaMemcpyAsync(pf.h_cnt, pf.cnt, (size_t) ne * sizeof(int), cudaMemcpyDeviceToHost, s));
@@ -2300,7 +2371,7 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
             }
             iq::gather_f16((const uint16_t*) pf.Ah, E, pf.list + o0, rows, E, (uint16_t*) pf.Xe, s);
             gemm(pf.Xe, E, pf.W1, E, pf.GU, 2 * ff, rows, 2 * ff, E);
-            k::swiglu_rows(pf.GU, rows, ff, nullptr, 0, pf.He, s);
+            k::act_cap_rows(pf.GU, rows, ff, g.gcap, g.ucap, pf.He, nullptr, s);
             gemm(pf.He, ff, pf.W2, ff, pf.Ye, E, rows, E, ff);
             k::scatter_add(pf.Ye, pf.list + o0, pf.wl + o0, rows, E, pf.Y, s);
         }
@@ -2366,25 +2437,55 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
     static const bool times = std::getenv("INK_PF_TIMES") != nullptr;
     if (times) CK(cudaStreamSynchronize(s));
     double tl0 = now_ms();
+    const float c5 = 1.0f / std::sqrt((float) (kc + 1));
+    const size_t bstride = (size_t) pf.C * E;
     for (int il = 0; il < g.n_layer; ++il) {
         Layer& l = L[(size_t) il];
         float* cv = l.conv;
         float *st_k = cv, *st_v = cv + (size_t) (kc - 1) * kvw, *st_a = cv + (size_t) (kc - 1) * 2 * kvw,
               *st_m = cv + (size_t) (kc - 1) * (2 * kvw + E);
+        const int nb = (il + g.res_block - 1) / g.res_block;   // the blocks finished before this layer
+        const bool boundary = il % g.res_block == 0;
+        // an attention input (query qi of the residual's), normed by nw: pf.A (F32) and pf.Ah (F16)
+        auto input = [&](int qi, const float* nw) {
+            if (il == 0) {
+                k::rmsnorm(pf.X, nw, pf.A, T, E, g.eps, s);
+            } else {
+                k::attn_res(nullptr, pf.BLK, bstride, nb, pf.X, l.res_q + (size_t) qi * E, 1, pf.A, 0, T, E, s);
+                k::rmsnorm(pf.A, nw, pf.A, T, E, g.eps, s);
+            }
+            k::to_f16(pf.A, pf.Ah, (size_t) T * E, s);
+        };
         // attention
-        k::rmsnorm(pf.X, l.attn_norm, pf.A, T, E, g.eps, s);
-        k::to_f16(pf.A, pf.Ah, (size_t) T * E, s);
+        input(0, l.swa ? l.attn_norm : l.in_norm[0]);
         lin(l.wq, pf.Ah, T, pf.Q);
-        lin(l.wk, pf.Ah, T, pf.Kf);
-        lin(l.wv, pf.Ah, T, pf.Vf);
         lin(l.wr, pf.Ah, T, pf.R);
-        k::sconv_chunk(pf.Kf, pf.Kc, st_k, l.sc_k, T, kvw, kc, false, s);
-        k::sconv_state(pf.Kf, st_k, T, kvw, kc, s);
-        k::sconv_chunk(pf.Vf, pf.Vc, st_v, l.sc_v, T, kvw, kc, false, s);
-        k::sconv_state(pf.Vf, st_v, T, kvw, kc, s);
+        lin(l.wgate, pf.Ah, T, pf.GATE);
+        lin32(l.wsink, pf.A, T, pf.SINK);
+        if (l.swa) {
+            lin(l.wk, pf.Ah, T, pf.Kf);
+            lin(l.wv, pf.Ah, T, pf.Vf);
+            k::sconv2_chunk(pf.Kf, pf.Kc, st_k, l.sc_k, T, kvw, kc, c5, s);
+            k::sconv_state(pf.Kf, st_k, T, kvw, kc, s);
+            k::sconv2_chunk(pf.Vf, pf.Vc, st_v, l.sc_v, T, kvw, kc, c5, s);
+            k::sconv_state(pf.Vf, st_v, T, kvw, kc, s);
+        } else {
+            input(1, l.in_norm[1]);
+            lin(l.wk, pf.Ah, T, pf.Kf);
+            lin32(l.kproj, pf.A, T, pf.DYN);
+            k::dsconv(pf.Kf, pf.Kc, st_k, l.sc_k_stat, pf.DYN, T, kvw, Hkv, kc, s);
+            k::sconv_state(pf.Kf, st_k, T, kvw, kc, s);
+            input(2, l.in_norm[2]);
+            lin(l.wv, pf.Ah, T, pf.Vf);
+            lin32(l.vproj, pf.A, T, pf.DYN);
+            k::dsconv(pf.Vf, pf.Vc, st_v, l.sc_v_stat, pf.DYN, T, kvw, Hkv, kc, s);
+            k::sconv_state(pf.Vf, st_v, T, kvw, kc, s);
+        }
         const float* tl = (!l.swa && g.log_floor > 0) ? pf.tau : nullptr;
-        k::head_norm(pf.Q, l.q_norm, T, H, hd, g.eps, tl, s);
-        k::head_norm(pf.Kc, l.k_norm, T, Hkv, hd, g.eps, nullptr, s);
+        k::head_clip(pf.Q, l.q_clip, g.qkclip, tl, T, H, hd, s);
+        k::head_clip(pf.Kc, nullptr, g.qkclip, nullptr, T, Hkv, hd, s);
+        k::head_unorm(pf.Vc, T, Hkv, hd, g.eps, s);
+        k::head_clip(pf.R, l.rel_clip, g.rclip, tl, T, H, g.d_rel, s);
         k::q_group(pf.Q, pf.Qh, T, H, Hkv, hd, s);
         float* AO = pf.Q;   // (free once q_group has its copy)
         if (!l.swa) {
@@ -2404,10 +2505,17 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
             k::window_to_ring(pf.Kw, l.K, kp0, j0, nk, g.n_swa, kvw, s);
             k::window_to_ring(pf.Vw, l.V, kp0, j0, nk, g.n_swa, kvw, s);
         }
+        k::gate_mul(AO, pf.GATE, (size_t) T * qw, s);
         k::to_f16(AO, pf.AOh, (size_t) T * qw, s);
         lin(l.wo, pf.AOh, T, pf.Y);
-        k::sconv_chunk(pf.Y, pf.X, st_a, l.sc_attn, T, E, kc, true, s);
+        k::sconv2_chunk(pf.Y, pf.Ye, st_a, l.sc_attn, T, E, kc, c5, s);
         k::sconv_state(pf.Y, st_a, T, E, kc, s);
+        if (boundary) {
+            k::unorm(pf.X, nullptr, pf.BLK + (size_t) nb * bstride, T, E, 1e-6f, s);
+            CK(cudaMemcpyAsync(pf.RES, pf.Ye, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToDevice, s));
+        } else {
+            k::add2(pf.RES, pf.X, pf.Ye, (size_t) T * E, s);
+        }
         if (times) {
             CK(cudaStreamSynchronize(s));
             const double t1 = now_ms();
@@ -2415,12 +2523,13 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
             tl0 = t1;
         }
         // the FFN
-        k::rmsnorm(pf.X, l.ffn_norm, pf.A, T, E, g.eps, s);
+        k::attn_res(nullptr, pf.BLK, bstride, nb + (boundary ? 1 : 0), pf.RES, l.ffn_q, 1, pf.A, 0, T, E, s);
+        k::rmsnorm(pf.A, l.ffn_norm, pf.A, T, E, g.eps, s);
         k::to_f16(pf.A, pf.Ah, (size_t) T * E, s);
-        if (l.dense) pf_dense(l, T);
-        else pf_moe(l, T);
-        k::sconv_chunk(pf.Y, pf.X, st_m, l.sc_mlp, T, E, kc, true, s);
+        pf_moe(l, T);
+        k::sconv2_chunk(pf.Y, pf.Ye, st_m, l.sc_mlp, T, E, kc, c5, s);
         k::sconv_state(pf.Y, st_m, T, E, kc, s);
+        k::add2(pf.X, pf.RES, pf.Ye, (size_t) T * E, s);
         if (times) {
             CK(cudaStreamSynchronize(s));
             const double t1 = now_ms();
@@ -2434,22 +2543,22 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
                      "page faults, working set %.1f GB\n",
                      pf.attn_ms, pf.moe_ms, pf.copy_ms, page_faults(), working_set_gb());
     pos = pos0 + T;
-    if (want_logits) {
-        k::rmsnorm(pf.X + (size_t) (T - 1) * E, out_norm, a, 1, E, g.eps, s);
+    if (want_logits) {   // the last token's: the output's residual over its blocks and x
+        k::attn_res(nullptr, pf.BLK + (size_t) (T - 1) * E, bstride, n_blocks(), pf.X + (size_t) (T - 1) * E, out_q, 1,
+                    a, 0, 1, E, s);
+        k::rmsnorm(a, out_norm, a, 1, E, g.eps, s);
         if (is_float(output.type)) {
             k::gemv_f(output.w, output.type, output.rb, a, logits, output.n, output.k, s);
         } else {
             quant(a, 1, E);
             mv(output, a, 0, logits, g.logit_scale);
         }
+        k::softcap(logits, g.vocab, g.lcap, s);
         CK(cudaMemcpyAsync(h_logits, logits, (size_t) g.vocab * sizeof(float), cudaMemcpyDeviceToHost, s));
     }
     CK(cudaStreamSynchronize(s));
-    if (want_logits) {
-        if (is_float(output.type))
-            for (int i = 0; i < g.vocab; ++i) h_logits[i] *= g.logit_scale;
+    if (want_logits)
         for (int i = g.vocab_unpadded; i < g.vocab; ++i) h_logits[i] = -INFINITY;
-    }
 }
 
 const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx) {
@@ -2497,105 +2606,102 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
 // 8 the output's int8 rows in the attention's combine.
 void Engine::Impl::tok_attention(Layer& l, const Layer* prev) {
     const int E = g.n_embd, H = g.n_head, Hkv = g.n_head_kv, hd = g.head_dim, kc = g.conv_k;
+    const int il = (int) (&l - L.data());
     float* cv = l.conv;
     float *st_k = cv, *st_v = cv + (size_t) (kc - 1) * kvw, *st_a = cv + (size_t) (kc - 1) * 2 * kvw;
     const float* t = (!l.swa && g.log_floor > 0) ? tau : nullptr;
     const int ring = l.swa ? g.n_swa : 0;
-    if (prev) {
-        if (fuse & 1) {
-            CK(cudaMemcpyAsync(d_tail, h_tail, tail_bytes(), cudaMemcpyHostToDevice, s));
-            float* st_m = prev->conv + (size_t) (kc - 1) * (2 * kvw + E);
-            k::conv_add(2, x, d_tail + 4, ec.routed, so, (const int*) d_tail, st_m, prev->sc_mlp, kc, E, s);
-        } else {
-            tok_tail(*prev);
-        }
-    }
-    if (fuse & 1) {
-        k::norm_q8(x, l.attn_norm, g.eps, a, xq, xd, E, s);
+    const float c5 = 1.0f / std::sqrt((float) (kc + 1));
+    if (prev) tok_tail(*prev);
+    const int nb = (il + g.res_block - 1) / g.res_block;
+    // the normed inputs in a3: row 0 for q, r, the gate and the sinks (and k, v on a sliding layer), rows 1 / 2 for k / v
+    // on a global one
+    const int nr = (!l.swa && il > 0) ? 3 : 1;
+    if (il == 0) {
+        k::rmsnorm(x, l.swa ? l.attn_norm : l.in_norm[0], a3, 1, E, g.eps, s);
     } else {
-        k::rmsnorm(x, l.attn_norm, a, 1, E, g.eps, s);
-        quant(a, 1, E);
+        k::attn_res(blk, nullptr, (size_t) E, nb, x, l.res_q, l.nq, mix, (size_t) E, 1, E, s);
+        if (l.swa) k::rmsnorm(mix, l.attn_norm, a3, 1, E, g.eps, s);
+        else
+            for (int i = 0; i < 3; ++i) k::rmsnorm(mix + (size_t) i * E, l.in_norm[i], a3 + (size_t) i * E, 1, E, g.eps, s);
     }
+    quant(a3, nr, E);
+    const int rk = nr == 3 ? 1 : 0, rv = nr == 3 ? 2 : 0;
     {
-        const DMat* ms[4] = {&l.wq, &l.wk, &l.wv, &l.wr};
-        const int rows[4] = {0, 0, 0, 0};
-        float* ys[4] = {q, kk, vv, r};
-        mv_jobs(ms, rows, ys, 4, a);
+        const DMat* ms[5] = {&l.wq, &l.wk, &l.wv, &l.wr, &l.wgate};
+        const int rows[5] = {0, rk, rv, 0, 0};
+        float* ys[5] = {q, kk, vv, r, gt};
+        mv_jobs(ms, rows, ys, 5, a3);
     }
-    if (fuse & 2) {
-        k::kv_conv_store(kk, vv, st_k, st_v, l.sc_k, l.sc_v, kc, l.k_norm, g.eps, l.K, l.V, dpos, ring, Hkv, hd, s);
+    mv(l.wsink, a3, 0, snk);
+    float *kp = kk, *vp = vv;
+    if (l.swa) {
+        k::sconv2(kk, st_k, l.sc_k, 1, kvw, kc, c5, s);
+        k::sconv2(vv, st_v, l.sc_v, 1, kvw, kc, c5, s);
     } else {
-        k::shortconv(kk, st_k, l.sc_k, 1, kvw, kc, s);
-        k::shortconv(vv, st_v, l.sc_v, 1, kvw, kc, s);
-        k::head_norm(kk, l.k_norm, 1, Hkv, hd, g.eps, nullptr, s);
-        k::kv_store_dev(kk, vv, l.K, l.V, dpos, ring, kvw, s);
+        mv(l.kproj, a3, rk, dyk);
+        mv(l.vproj, a3, rv, dyv);
+        k::dsconv(kk, k2, st_k, l.sc_k_stat, dyk, 1, kvw, Hkv, kc, s);
+        k::sconv_state(kk, st_k, 1, kvw, kc, s);
+        k::dsconv(vv, v2, st_v, l.sc_v_stat, dyv, 1, kvw, Hkv, kc, s);
+        k::sconv_state(vv, st_v, 1, kvw, kc, s);
+        kp = k2;
+        vp = v2;
     }
-    k::AttnFuse fz;
-    if (fuse & 4) {
-        fz.qn = l.q_norm;
-        fz.tau = t;
-        fz.eps = g.eps;
-        fz.rr = r;
-        fz.proj = l.rel_proj;
-        fz.d_rel = g.d_rel;
-    } else {
-        k::head_norm(q, l.q_norm, 1, H, hd, g.eps, t, s);
-        k::rel_logits(r, l.rel_proj, t, rel, 1, H, g.d_rel, l.E, s);
-    }
-    if (fuse & 8) {
-        fz.oq = xq;
-        fz.od = xd;
-    }
-    k::attn_decode(q, l.K, l.V, l.kv_rows, 0, dpos, ring, (fuse & 4) ? nullptr : rel, l.E, H, Hkv, hd,
-                   1.0f / (float) hd, o_, attn_scr, s, &fz);
-    if (!(fuse & 8)) quant(o_, 1, H * hd);
+    k::head_clip(q, l.q_clip, g.qkclip, t, 1, H, hd, s);
+    k::head_clip(kp, nullptr, g.qkclip, nullptr, 1, Hkv, hd, s);
+    k::head_unorm(vp, 1, Hkv, hd, g.eps, s);
+    k::head_clip(r, l.rel_clip, g.rclip, t, 1, H, g.d_rel, s);
+    k::rel_logits(r, l.rel_proj, nullptr, rel, 1, H, g.d_rel, l.E, s);
+    k::kv_store_dev(kp, vp, l.K, l.V, dpos, ring, kvw, s);
+    k::attn_decode2(q, l.K, l.V, l.kv_rows, dpos, ring, rel, l.E, H, Hkv, hd, 1.0f / std::sqrt((float) hd), snk, gt,
+                    o_, xq, xd, attn_scr, s);
     mv(l.wo, o_, 0, ao);
-    if (fuse & 1) {
-        k::conv_add(1, x, ao, nullptr, nullptr, nullptr, st_a, l.sc_attn, kc, E, s);
-        k::norm_q8(x, l.ffn_norm, g.eps, f, xq, xd, E, s);
+    k::sconv2(ao, st_a, l.sc_attn, 1, E, kc, c5, s);
+    const bool boundary = il % g.res_block == 0;
+    if (boundary) {
+        k::unorm(x, blk + (size_t) nb * E, nullptr, 1, E, 1e-6f, s);
+        CK(cudaMemcpyAsync(res, ao, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s));
     } else {
-        k::shortconv(ao, st_a, l.sc_attn, 1, E, kc, s);
-        k::add(x, ao, E, s);
+        k::add2(res, x, ao, (size_t) E, s);
     }
+    k::attn_res(blk, nullptr, (size_t) E, nb + (boundary ? 1 : 0), res, l.ffn_q, 1, mix, (size_t) E, 1, E, s);
+    k::rmsnorm(mix, l.ffn_norm, f, 1, E, g.eps, s);
+    quant(f, 1, E);
 }
 
-// A MoE layer's router: f = rmsnorm(x) and its int8 rows (the VRAM experts' and the shared experts' input; fused: made
-// by tok_attention), the logits, f and the logits to the host.
+// A layer's router: the logits of f (made by tok_attention, F32 rows), f and the logits to the host.
 void Engine::Impl::tok_router(const Layer& l) {
     const int E = g.n_embd;
-    if (!(fuse & 1)) {
-        k::rmsnorm(x, l.ffn_norm, f, 1, E, g.eps, s);
-        quant(f, 1, E);
-    }
     mv(l.gate_inp, f, 0, rlog);
     CK(cudaMemcpyAsync(h_f, f, (size_t) E * sizeof(float), cudaMemcpyDeviceToHost, s));
     CK(cudaMemcpyAsync(h_rlog, rlog, (size_t) (g.n_expert + g.n_shexp) * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
 
-// A MoE layer's end (unfused): the CPU lane's sum and which lanes ran (h_tail, written by the host) up to the device,
-// then moe_tail: fo, the FFN's short convolution, x += it.
+// A layer's end: the CPU lane's sum and which lanes ran (h_tail, written by the host) up to the device, then
+// x = res + (moe + conv(moe)) / sqrt(5).
 void Engine::Impl::tok_tail(const Layer& l) {
     const int E = g.n_embd, kc = g.conv_k;
     float* st_m = l.conv + (size_t) (kc - 1) * (2 * kvw + E);
     CK(cudaMemcpyAsync(d_tail, h_tail, tail_bytes(), cudaMemcpyHostToDevice, s));
-    k::moe_tail(x, d_tail + 4, ec.routed, so, (const int*) d_tail, st_m, l.sc_mlp, E, kc, s);
+    k::moe_tail2(x, res, d_tail + 4, ec.routed, (const int*) d_tail, st_m, l.sc_mlp, E, kc,
+                 1.0f / std::sqrt((float) (kc + 1)), s);
 }
 
-// The last MoE layer's end and the output head: the logits to the host.
+// The last layer's end and the output head: the output's residual over the blocks, its norm, the head, the softcap; the
+// logits to the host.
 void Engine::Impl::tok_head(const Layer& last) {
-    const int E = g.n_embd, kc = g.conv_k;
-    if (fuse & 1) {
-        CK(cudaMemcpyAsync(d_tail, h_tail, tail_bytes(), cudaMemcpyHostToDevice, s));
-        float* st_m = last.conv + (size_t) (kc - 1) * (2 * kvw + E);
-        k::conv_add(2, x, d_tail + 4, ec.routed, so, (const int*) d_tail, st_m, last.sc_mlp, kc, E, s);
-        k::norm_q8(x, out_norm, g.eps, a, xq, xd, E, s);
+    const int E = g.n_embd;
+    tok_tail(last);
+    k::attn_res(blk, nullptr, (size_t) E, n_blocks(), x, out_q, 1, a, (size_t) E, 1, E, s);
+    k::rmsnorm(a, out_norm, a, 1, E, g.eps, s);
+    if (is_float(output.type)) {
+        k::gemv_f(output.w, output.type, output.rb, a, logits, output.n, output.k, s);
     } else {
-        tok_tail(last);
-        k::rmsnorm(x, out_norm, a, 1, E, g.eps, s);
-        if (!is_float(output.type)) quant(a, 1, E);
+        quant(a, 1, E);
+        mv(output, a, 0, logits, g.logit_scale);
     }
-    if (is_float(output.type)) k::gemv_f(output.w, output.type, output.rb, a, logits, output.n, output.k, s);
-    else mv(output, a, 0, logits, g.logit_scale);
+    k::softcap(logits, g.vocab, g.lcap, s);
     CK(cudaMemcpyAsync(h_logits, logits, (size_t) g.vocab * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
 
@@ -2757,21 +2863,14 @@ const float* Engine::Impl::step(int token) {
                               [&](int a1, int b1) { return sc[a1] > sc[b1] || (sc[a1] == sc[b1] && a1 < b1); });
             for (int i = 0; i < g.n_used; ++i) sel[i] = idx[i];
         }
-        // weights: softmax over logsigmoid of [the chosen raw logits, the shared logits], x scale x gscale
+        // weights: the chosen sigmoid scores over their sum, x scale
         float wv[18];
-        const int nw = g.n_used + nsh;
-        float mx = -INFINITY;
-        for (int i = 0; i < nw; ++i) {
-            const float z = i < g.n_used ? h_rlog[sel[i]] : h_rlog[ne + (i - g.n_used)];
-            wv[i] = z >= 0.0f ? -std::log1p(std::exp(-z)) : z - std::log1p(std::exp(z));   // logsigmoid
-            mx = std::max(mx, wv[i]);
-        }
         float sum = 0.0f;
-        for (int i = 0; i < nw; ++i) {
-            wv[i] = std::exp(wv[i] - mx);
+        for (int i = 0; i < g.n_used; ++i) {
+            wv[i] = 1.0f / (1.0f + std::exp(-h_rlog[sel[i]]));
             sum += wv[i];
         }
-        for (int i = 0; i < nw; ++i) wv[i] = wv[i] / sum * g.exp_scale * l.gscale;
+        for (int i = 0; i < g.n_used; ++i) wv[i] = wv[i] / (sum + 1e-20f) * g.exp_scale;
         phase(pt.route);
         // the chosen experts in VRAM go to the GPU, the others to the CPU lane, both at once
         int gslot[16], csel[16], hslot[16];
@@ -2804,25 +2903,6 @@ const float* Engine::Impl::step(int token) {
         if (nc && early) lane.begin(*pool, l.cl, E, ff, csel, cw, nc, h_f, h_routed);
         if (nh) hc_experts(l, hslot, hw, nh);   // (the helper card starts on its share first: it is the slower one)
         if (ng) gpu_experts(l, gslot, gw, ng);
-        h_gamma[0] = wv[g.n_used];
-        h_gamma[1] = wv[g.n_used + 1];
-        CK(cudaMemcpyAsync(gamma, h_gamma, 2 * sizeof(float), cudaMemcpyHostToDevice, s));
-        // the shared experts, their gammas before the down (the GPU's experts have read f's int8 rows by now)
-        {
-            const DMat* ms[4] = {&l.sh_gate[0], &l.sh_up[0], &l.sh_gate[1], &l.sh_up[1]};
-            const int rows[4] = {0, 0, 0, 0};
-            float* ys[4] = {sg, su, sg + ff, su + ff};
-            mv_jobs(ms, rows, ys, 2 * nsh, f);
-        }
-        for (int sh = 0; sh < nsh; ++sh)
-            k::swiglu(sg + (size_t) sh * ff, su + (size_t) sh * ff, sg + (size_t) sh * ff, ff, gamma + sh, s);
-        quant(sg, nsh, ff);
-        {
-            const DMat* ms[2] = {&l.sh_down[0], &l.sh_down[1]};
-            const int rows[2] = {0, 1};
-            float* ys[2] = {so, so + E};
-            mv_jobs(ms, rows, ys, nsh, sg);
-        }
         if (trace) {
             CK(cudaStreamSynchronize(s));
             std::fprintf(stderr, "[trace] layer %d: experts %d %d %d %d %d %d, %d on the GPU; CPU lane next\n", il,
@@ -2865,8 +2945,6 @@ const float* Engine::Impl::step(int token) {
     const bool staging = ec_stage_begin(4 * ec.piece);   // (the head's GEMV is the token's longest wait)
     CK(cudaStreamSynchronize(s));
     if (staging) ec_stage_end();
-    if (is_float(output.type))
-        for (int i = 0; i < g.vocab; ++i) h_logits[i] *= g.logit_scale;
     for (int i = g.vocab_unpadded; i < g.vocab; ++i) h_logits[i] = -INFINITY;
     ++pos;
     if (route_log) {

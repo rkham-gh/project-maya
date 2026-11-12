@@ -144,8 +144,9 @@ class Tokenizer:
         if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "inkling"):
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
                              "inkling" % pre)
-        # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
-        self.ignore_merges = pre in ("glm4", "glm5")
+        # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece; so does Inkling's
+        # tokenizer.json ("ignore_merges": true in Inkling-Small's and Inkling 2 Small's BPE model)
+        self.ignore_merges = pre in ("glm4", "glm5", "inkling")
         self.token_types = token_types
         self.special_ids = special_ids or {}
         self.ids = {t: i for i, t in enumerate(tokens)}

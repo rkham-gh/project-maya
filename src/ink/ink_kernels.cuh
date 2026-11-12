@@ -149,3 +149,46 @@ void swiglu_f32_rows(const float* gu, int n, int ff, float* h, cudaStream_t s);
 void sum_rows(const float* y, int n, int m, float* out, cudaStream_t s);
 
 }  // namespace ink::k
+
+// ================================================================================================ Inkling 2
+namespace ink::k {
+/// Block attention residual for T tokens: the states [the nb blocks (F32 b32 or F16 b16; block j's token t at
+/// j bstride + t E, already RMS-normed without weight), the partial [T][E] (normed here)], softmax over them of
+/// q . state / sqrt(E) for each of nq <= 3 queries [nq][E]; out (query i, token t at i oqs + t E) = the weighted sum.
+void attn_res(const float* b32, const __half* b16, size_t bstride, int nb, const float* partial, const float* q, int nq,
+              float* out, size_t oqs, int T, int E, cudaStream_t s);
+/// y = x * rsqrt(mean(x^2) + eps) for T rows of E (into y32 or, when set, y16).
+void unorm(const float* x, float* y32, __half* y16, int T, int E, float eps, cudaStream_t s);
+/// Each head of hd: x *= scale (per [heads][hd], may be null); x *= min(1, thr / (|x| + 1e-6)); x *= tau[row] (null: 1).
+void head_clip(float* x, const float* scale, float thr, const float* tau, int rows, int heads, int hd, cudaStream_t s);
+/// Each head of hd: x *= rsqrt(mean(x^2) + eps).
+void head_unorm(float* x, int rows, int heads, int hd, float eps, cudaStream_t s);
+/// x = (x + causal depthwise conv(x)) * scale in place (shortconv's arithmetic and state), T small.
+void sconv2(float* x, float* state, const float* kern, int T, int ch, int K, float scale, cudaStream_t s);
+/// y = (x + conv(x)) * scale over a chunk (the state read, not updated: sconv_state after).
+void sconv2_chunk(const float* x, float* y, const float* state, const float* kern, int T, int ch, int K, float scale,
+                  cudaStream_t s);
+/// The global layers' dynamic conv: y = (x + sum_lag (stat[lag][c] + dyn[t][head K + lag]) x(t - lag)) / sqrt(2K + 1).
+void dsconv(const float* x, float* y, const float* state, const float* stat, const float* dyn, int T, int ch, int nkv,
+            int K, cudaStream_t s);
+/// attn_decode (unfused) with each head's sink logit (sinks [H], may be null) in the softmax, the output times
+/// sigmoid(gate) (gate [H][hd], may be null), and its int8 rows (oq / od, may be null).
+void attn_decode2(const float* q, const __half* K, const __half* V, int rows, const int* dpos, int ring,
+                  const float* rel, int E, int H, int Hkv, int hd, float scale, const float* sinks, const float* gate,
+                  float* out, int8_t* oq, float* od, float* scratch, cudaStream_t s);
+/// attn_softmax with the band already scaled (no tau) and each row's sink sinks[token][h] in the sum.
+void attn_softmax2(float* S, int lds, __half* P, int ldp, int M, int nk, int G, int g, int ta, int pos0, int kp0,
+                   int window, const float* R, const float* proj, int E, int H, int d_rel, const float* sinks,
+                   cudaStream_t s);
+/// Routing: the top nu of sigmoid(RL) + bias; weights sigmoid / their sum x scale -> w [T][nu].
+void route2(const float* RL, int ld, const float* bias, int T, int ne, int nu, float scale, int* sel, float* w,
+            cudaStream_t s);
+/// h = tanh(g / gcap) gcap sigmoid(g) tanh(u / ucap) ucap from rows of gu [g ff | u ff] (into h16 or h32).
+void act_cap_rows(const float* gu, int n, int ff, float gcap, float ucap, __half* h16, float* h32, cudaStream_t s);
+/// x = res + (fo + conv(fo)) * scale, fo = the CPU lane's sum (flags[0]) + the VRAM experts' (flags[1]).
+void moe_tail2(float* x, const float* res, const float* cpu, const float* gpu, const int* flags, float* state,
+               const float* kern, int n, int K, float scale, cudaStream_t s);
+void gate_mul(float* o, const float* gate, size_t n, cudaStream_t s);
+void softcap(float* x, int n, float cap, cudaStream_t s);
+void add2(float* y, const float* a, const float* b, size_t n, cudaStream_t s);
+}  // namespace ink::k

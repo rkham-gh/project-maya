@@ -157,14 +157,15 @@ void CpuLane::begin(Pool& pool, const CpuLayer& L, int n_embd, int n_ff, const i
         done_gu_[i].store(0, std::memory_order_relaxed);
     }
     ready_.store(0, std::memory_order_relaxed);
-    same_ = L.tg == L.tu && L.act_g == L.act_u;
+    same_ = L.tg == L.tu && L.act_g == L.act_u && L.gcap <= 0.0f;
     ag_.resize(L.ab_g);
     au_.resize(L.ab_u);
     h_.resize((size_t) kMax * n_ff * 2);
     o_.resize((size_t) kMax * n_embd);
     hq_.resize((size_t) kMax * L.ab_d);
     dg::iq_cpu_quant(L.act_g, x, n_embd, ag_.data());
-    if (!same_) dg::iq_cpu_quant(L.act_u, x, n_embd, au_.data());
+    if (L.act_u != L.act_g || L.tg != L.tu) dg::iq_cpu_quant(L.act_u, x, n_embd, au_.data());
+    else au_ = ag_;
     bands_gu_ = (n_ff + kRowsGU - 1) / kRowsGU;
     bands_d_ = (n_embd + kRowsD - 1) / kRowsD;
     if (!fn_) fn_ = [this](int j) { job(j); };
@@ -187,9 +188,16 @@ void CpuLane::job(int j) {
             const void* actu = au_.data();
             dg::iq_cpu_rows(L.tg, L.gate + e * n_ff * L.rg, L.rg, n_embd, &act, 1, &hi, r0, r1);
             dg::iq_cpu_rows(L.tu, L.up + e * n_ff * L.ru, L.ru, n_embd, &actu, 1, &ui, r0, r1);
-            for (int r = r0; r < r1; ++r) {
-                const float g = hi[r];
-                hi[r] = g / (1.0f + std::exp(-g)) * ui[r];
+            if (L.gcap > 0.0f) {
+                for (int r = r0; r < r1; ++r) {
+                    const float g = hi[r], u = ui[r];
+                    hi[r] = std::tanh(g / L.gcap) * L.gcap / (1.0f + std::exp(-g)) * (std::tanh(u / L.ucap) * L.ucap);
+                }
+            } else {
+                for (int r = r0; r < r1; ++r) {
+                    const float g = hi[r];
+                    hi[r] = g / (1.0f + std::exp(-g)) * ui[r];
+                }
             }
         }
         // the expert's last band: its h as the down rows' activation

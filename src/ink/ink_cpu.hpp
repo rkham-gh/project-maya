@@ -43,6 +43,7 @@ struct CpuLayer {
     int act_g = 0, act_u = 0, act_d = 0;
     size_t ab_g = 0, ab_u = 0, ab_d = 0;   // bytes of an activation of each
     strata::ds4::gguf::IqCpu fmt;          // (gate / up with down: the rows' format)
+    float gcap = 0.0f, ucap = 0.0f;        // Inkling 2: h = tanh(g / gcap) gcap sigmoid(g) tanh(u / ucap) ucap
 };
 
 /// The layer's format from the GGUF's types; false (err) when the CPU rows take none for a type.
