@@ -192,6 +192,9 @@ struct Input {
                 std::lock_guard<std::mutex> lk(mu);
                 lines.push_back(l);
                 cv.notify_all();
+                // (QUIT is the last line read: a thread waiting in getline holds stdin's lock, which exit() takes
+                //  to flush the streams - on glibc the engine then never ended while its stdin stayed open)
+                if (l == "QUIT") return;
             }
             std::lock_guard<std::mutex> lk(mu);
             eof = true;
@@ -438,6 +441,7 @@ int main(int argc, char** argv) {
             eng.reset();
             hist.clear();
             last.clear();
+            have_snap = false;   // (reset() drops the engine's snapshot)
             reuse = 0;
         }
         if ((int) ids.size() >= eng.max_ctx()) {

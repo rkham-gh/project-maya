@@ -156,6 +156,14 @@ without the helper.
   2 tokens at a margin of 1.5, each swap's copy staged in 2 MB pieces while the CPU waits for the GPU; `--profile FILE`
   keeps the scores for the next start). Its settings are maya-ink's measured ones (`LING_CACHE_*`), not yet re-tuned
   for Ling's 512 experts.
+  A prompt chunk adds each expert's count of its tokens as it is: thousands after a long prompt, where a written
+  token adds 1 and an expert every token chose settles at 99. The refill after the prompt so holds what the prompt
+  used most, and no swap clears the bar (1.5 times the worst one in VRAM + 0.5) until those scores have decayed, some
+  hundred tokens on: the answer starts on the prompt's experts (under "Two cards" above: 22% of a token's in VRAM
+  after the long prompt on one card, 39% on a new one). `LING_CACHE_PROMPT=1` (off by default, not run yet; maya-ink's)
+  puts a chunk on the written tokens' scale: each expert gets its share of the chunk's tokens times what as many
+  written tokens leave to share (at most 99), so the refill takes the same experts and the swaps start with the first
+  tokens; `2` also decays what was there before the chunk, as its tokens written one by one would.
 - **The helper card** (`--helper-gpu N`, `--helper-gb G`; maya-nem's and maya-ink's, branches `nemotron-2gpu` and
   `inkling-2gpu`): a second card that holds routed experts only, in a cache of its own (slots by class as the main
   cache's; its free VRAM less `LING_HELPER_RESERVE_MIB`, 1024), filled with the best-scored experts the main card does
@@ -173,6 +181,11 @@ without the helper.
     on a second stream while the next tokens are written, and an expert is used from the first update after its copy
     (`LING_HELPER_BG=0`: copied at the swap, on the token's thread). At the start and after a prompt the fill is
     copied at once: after a prompt up to an eighth of its tokens (64 .. 4,096, `LING_HELPER_FILL`).
+  - The fills go through pinned staging of the helper's own, as the main cache's do (`hc_copy_many`, maya-ink's: the
+    CPU lane's threads into two 64 MB pinned buffers in turn, one DMA an expert from there; `LING_HELPER_STAGE=0`:
+    the driver's staging of the mapping, as before; another value: a buffer's MB). Not run on a GPU yet: the refill
+    after the long prompt (~2 s above) is what it should shorten. `LING_HELPER_VERIFY=1` reads every slot a fill
+    wrote back and compares it with the mapping's bytes.
   - Maya's server adds `--layer-split auto` when a config's `"gpu"` names two cards; this engine reads that as
     `--helper-gpu 1` (the second visible card), so `"gpu": [0, 1]` in the run config is all it takes
     (`LING_HELPER_GPU=-1` in its `env`: off).
@@ -187,7 +200,13 @@ without the helper.
   when it continues the tokens so far. The state at each prompt's end is also kept aside (`Engine::snapshot`: the KDA
   layers' states and convolutions, 283 MB of VRAM; `LING_SNAPSHOT=0`: not), so a next turn whose last answer the
   template renders differently from the tokens written (its whitespace, its thinking) goes on from the last prompt's
-  end - only the answer and the new message are read - instead of the whole conversation from the start.
+  end - only the answer and the new message are read - instead of the whole conversation from the start. `reset()`
+  drops the snapshot: it had stayed in place when the prompt after a reset was cut short (a `STOP` while it was
+  read, a prompt past the context), and a later request that continued the old prompt was then restored onto MLA
+  cache rows the other conversation had written.
+- `QUIT` is the last line the engine reads: the thread that reads stdin went back into `getline`, holding the lock
+  `exit()` takes to flush the streams, and on Linux the engine then never ended while its stdin stayed open (the
+  server waits `MAYA_ENGINE_QUIT_S`, then kills it).
 
 ## Use
 
@@ -223,6 +242,11 @@ A run config (`--engine maya --config ...`):
 
 - Correct and measured (above); runs as `switch-model.ps1 ling` (port 8086, 128K context; a start of ~17 s with the
   GGUF in the file cache, the routed experts' 160 GB touched in 11 s; ~24 GB of the RAM left free while it runs).
+- Not run on a GPU yet (2026-11-12, written in a session without one; built with CUDA 13.4's nvcc on Linux, the
+  same code run in maya-ink against a stand-in for the CUDA runtime): the helper's fills through pinned staging (on;
+  `LING_HELPER_VERIFY=1` once, then the first token after the long prompt with the helper), `LING_CACHE_PROMPT=1` /
+  `2` (off; ab.py's writing after the long prompt, 16.2 tok/s against 22.4 on new ones), the snapshot dropped at a
+  reset and `QUIT` (the chat checks).
 - Not done: the cache's settings for Ling confirmed on held-out prompts (maya-ink's for now: decay 0.99, adapting every
   2 tokens); the writing after a long prompt (16.2 tok/s against 22.4 on new ones, where llama.cpp doesn't slow down);
   the MTP layer (blk.72) for drafting; 256K context (the run config's is 128K).
