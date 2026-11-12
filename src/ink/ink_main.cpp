@@ -17,6 +17,8 @@
 // printed with the top --top (default 5) as id:log-probability (for a comparison with llama.cpp's).  --follow: the
 // given tokens fed instead of the greedy ones, each line ending with that token's own log-probability, so another
 // engine's continuation is scored position by position.  --dump-logits: the logits after the prompt (float32, vocab).
+// --restore-check (with INK_SNAPSHOT=1): after those steps the state goes back to the prompt's end (Engine::restore)
+// and the same tokens are fed again, each step's logits compared with the first pass's.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -185,6 +187,9 @@ struct Input {
                 std::lock_guard<std::mutex> lk(mu);
                 lines.push_back(l);
                 cv.notify_all();
+                // (QUIT is the last line read: a thread waiting in getline holds stdin's lock, which exit() takes
+                //  to flush the streams - on glibc the engine then never ended while its stdin stayed open)
+                if (l == "QUIT") return;
             }
             std::lock_guard<std::mutex> lk(mu);
             eof = true;
@@ -207,7 +212,7 @@ int main(int argc, char** argv) {
     ink::Options opt;
     std::string ids_arg, dump, follow_arg;
     int gen = 0, top = 5;
-    bool serve = false, by_step = false, bench = false;
+    bool serve = false, by_step = false, bench = false, restore_check = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -228,6 +233,7 @@ int main(int argc, char** argv) {
         else if (a == "--follow") follow_arg = val();
         else if (a == "--step") by_step = true;
         else if (a == "--bench-h2d") bench = true;
+        else if (a == "--restore-check") restore_check = true;
         else if (a == "--chunk") opt.chunk = std::max(64, std::atoi(val().c_str()));
         else if (a == "--stage") opt.stage = std::atoi(val().c_str());
         else if (a == "--cache-gb") opt.cache_gb = std::atof(val().c_str());
@@ -298,6 +304,10 @@ int main(int argc, char** argv) {
         // each step: the token chosen (greedy, or --follow's next one), then the top ones as id:log-probability
         const std::vector<int> follow = follow_arg.empty() ? std::vector<int>() : parse_ids(follow_arg);
         const int steps = follow.empty() ? gen : (int) follow.size();
+        // (--restore-check) the prompt's end kept; the tokens fed after it and the logits after each (the first 64)
+        const bool snapped = restore_check && eng.snapshot();
+        std::vector<int> fed;
+        std::vector<std::vector<float>> after;
         for (int n = 0; n < steps && lg; ++n) {
             std::vector<int> idx((size_t) V);
             for (int i = 0; i < V; ++i) idx[(size_t) i] = i;
@@ -315,6 +325,10 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             if (follow.empty() && pick == eos) break;
             lg = eng.step(pick);
+            if (snapped && lg && fed.size() < 64) {
+                fed.push_back(pick);
+                after.emplace_back(lg, lg + V);
+            }
         }
         const auto st = eng.stats();
         if (st.tokens > 0)
@@ -332,6 +346,35 @@ int main(int argc, char** argv) {
                          st.ms_total / st.tokens, st.ms_lane / st.tokens, (double) st.lane_layers / st.tokens,
                          st.ms_helper / st.tokens, (double) st.helper_layers / st.tokens, st.ms_update / st.tokens,
                          (st.ms_total - st.ms_lane - st.ms_helper - st.ms_update) / st.tokens);
+        if (restore_check) {
+            // Back to the prompt's end, the same tokens fed again: each step's logits against the first pass's.  The
+            // same bits when the same experts sit in VRAM both times (INK_CACHE_SWAPS=0, no helper card); otherwise
+            // they differ as any change of the experts' places makes them differ.
+            if (!snapped || !eng.restore()) {
+                std::fprintf(stderr, "maya-ink: --restore-check: no snapshot (INK_SNAPSHOT=1 keeps its room)\n");
+                return 1;
+            }
+            size_t same_top = 0;
+            double worst = 0.0;
+            bool ok = true;
+            for (size_t i = 0; i < fed.size() && ok; ++i) {
+                const float* l2 = eng.step(fed[i]);
+                ok = l2 != nullptr;
+                if (!ok) break;
+                const std::vector<float>& l1 = after[i];
+                same_top += argmax(l1.data(), V) == argmax(l2, V);
+                for (int v = 0; v < V; ++v)
+                    if (std::isfinite(l1[(size_t) v]) && std::isfinite(l2[v]))
+                        worst = std::max(worst, (double) std::fabs(l1[(size_t) v] - l2[v]));
+            }
+            std::fprintf(stderr,
+                         "maya-ink: --restore-check: %zu tokens fed again from the prompt's end: the top token the "
+                         "same at %zu, the logits' largest difference %.6g%s\n",
+                         fed.size(), same_top, worst, ok ? "" : " (a step failed)");
+            std::printf("RESTORE %zu %zu %.6g\n", fed.size(), same_top, worst);
+            std::fflush(stdout);
+            if (!ok) return 1;
+        }
         eng.save_profile();
         return 0;
     }
@@ -345,6 +388,12 @@ int main(int argc, char** argv) {
     in.start();
     std::vector<int> hist;   // the tokens the state holds (prompt and generated, the last sampled one not fed)
     std::vector<float> last; // the logits after hist
+    // the last prompt's end (Engine::snapshot, INK_SNAPSHOT=1): its tokens and the logits after them - a request that
+    // continues those but not hist (the last answer rendered without its thinking, or asked for again) goes on from
+    // there instead of from the start
+    std::vector<int> snap_hist;
+    std::vector<float> snap_last;
+    bool have_snap = false;
     std::mt19937_64 rng(std::random_device{}());
     std::string line;
     while (in.next(line)) {
@@ -373,14 +422,23 @@ int main(int argc, char** argv) {
             else if (k == "seed") sp.seed = std::atoll(v.c_str());
         }
         if (sp.seed >= 0) rng.seed((uint64_t) sp.seed);
-        // the prompt: what continues hist is read on from there, anything else from the start
+        // the prompt: what continues hist is read on from there, what continues the last prompt's end from there,
+        // anything else from the start
         size_t reuse = 0;
         if (ids.size() > hist.size() && std::equal(hist.begin(), hist.end(), ids.begin())) reuse = hist.size();
         else if (ids.size() == hist.size() && ids == hist && !last.empty()) reuse = hist.size();
+        else if (have_snap && !snap_hist.empty() && ids.size() >= snap_hist.size() &&
+                 std::equal(snap_hist.begin(), snap_hist.end(), ids.begin()) &&
+                 (ids.size() > snap_hist.size() || !snap_last.empty()) && eng.restore()) {
+            hist = snap_hist;
+            last = snap_last;
+            reuse = hist.size();
+        }
         if (reuse < hist.size() || (reuse == 0 && !hist.empty())) {
             eng.reset();
             hist.clear();
             last.clear();
+            have_snap = false;   // (reset() drops the engine's snapshot)
             reuse = 0;
         }
         if ((int) ids.size() >= eng.max_ctx()) {
@@ -403,6 +461,13 @@ int main(int argc, char** argv) {
             std::printf("PP %zu %zu %.0f %.1f %zu\n", i + m, todo, ms, (i + m) * 1000.0 / std::max(ms, 1.0), reuse);
             std::fflush(stdout);
             if (!lg || in.stop.load()) break;
+        }
+        // the prompt read whole: its end kept (the next turn's prompt holds this one and the answer, perhaps rendered
+        // apart from the tokens written now)
+        if (lg && hist.size() == ids.size() && !in.stop.load() && eng.snapshot()) {
+            snap_hist = hist;
+            snap_last.assign(lg, lg + V);
+            have_snap = true;
         }
         const double p1 = now_ms();
         int generated = 0;

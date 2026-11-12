@@ -157,7 +157,8 @@ tok/s on new prompts, 25.4 and 28.2 after the long prompt, and 43.5 and 44.0 on 
   one of two group buffers (each run of consecutive ones in one copy a tensor, through the engine's pinned staging, on
   a copy stream while the other group is multiplied), then each is decoded, multiplied for its tokens and added to
   theirs times their weights, in id order, then the shared experts: the same sums every run. Prompts under 48 new
-  tokens (`INK_MIN_CHUNK`) take the token path.
+  tokens (`INK_MIN_CHUNK`) take the token path. A chunk's embedding rows go up in staging-buffer pieces (a 16K
+  chunk's are 71 MB, more than a buffer: they went up a row a call).
 - **The VRAM expert cache**: the most-used routed experts, in slots sized by their layers' bytes (38 layers' 15.2 MB,
   one layer's 16.3 MB, one's 18.4 MB; each size's count its share of the layers; `INK_CACHE_POOLS=0`: all of the
   largest) in what VRAM is left less 1.5 GB, and in two kinds of lent VRAM: the prompt path's buffers, one 3.9 GB arena,
@@ -176,6 +177,14 @@ tok/s on new prompts, 25.4 and 28.2 after the long prompt, and 43.5 and 44.0 on 
   replays it, predicting 137.5 experts a token on the CPU where the engine measured 137.7): the first version's
   (decay 0.998, 4 swaps every 8 tokens) left the cache on what the last few hundred tokens had used, where what the
   last few dozen use predicts the next ones better.
+  A prompt chunk adds each expert's count of its tokens as it is: thousands after a long prompt, where a written
+  token adds 1 and an expert every token chose settles at 99. The refill after the prompt so holds what the prompt
+  used most, and no swap clears the bar (1.5 times the worst one in VRAM + 0.5) until those scores have decayed,
+  some hundred tokens on: the answer starts on the prompt's experts (under "Two cards" above: 49% of a token's in
+  VRAM after the long prompt on one card, 70% on new prompts). `INK_CACHE_PROMPT=1` (off by default, not run yet)
+  puts a chunk on the written tokens' scale: each expert gets its share of the chunk's tokens times what as many
+  written tokens leave to share (at most 99), so the refill takes the same experts and the swaps start with the
+  first tokens; `2` also decays what was there before the chunk, as its tokens written one by one would.
 - **The helper card** (`--helper-gpu N`, `--helper-gb G`; maya-nem's, branch `nemotron-2gpu`): a second card that
   holds routed experts only, in a cache of its own (slots by size as the main cache's; its free VRAM less
   `INK_HELPER_RESERVE_MIB`, 1024), filled with the best-scored experts the main card does not hold. A token's chosen
@@ -192,11 +201,47 @@ tok/s on new prompts, 25.4 and 28.2 after the long prompt, and 43.5 and 44.0 on 
     second stream while the next tokens are written, and an expert is used from the first update after its copy
     (`INK_HELPER_BG=0`: copied at the swap, on the token's thread). At the start and after a prompt the fill is
     copied at once: after a prompt up to an eighth of its tokens (64 .. 4,096, `INK_HELPER_FILL`).
+  - The fills go through pinned staging of the helper's own, as the main cache's do (`hc_copy_many`: the CPU lane's
+    threads into two 64 MB pinned buffers in turn, one DMA an expert from there; `INK_HELPER_STAGE=0`: the driver's
+    staging of the mapping, as before; another value: a buffer's MB). The driver's staging moved the helper's 23 GB
+    at ~5 GB/s after the long prompt (the 4.6 s above), where the prompt path's copies hold 14 this way. Not run on
+    a GPU yet. `INK_HELPER_VERIFY=1` reads every slot a fill wrote back and compares it with the mapping's bytes.
   - Maya's server adds `--layer-split auto` when a config's `"gpu"` names two cards; this engine reads that as
     `--helper-gpu 1` (the second visible card), so `"gpu": [0, 1]` in the run config is all it takes
     (`INK_HELPER_GPU=-1` in its `env`: off).
   - The kernels launched there (ds4_iq's GEMVs, ink's q8 / SwiGLU / row sums) keep no device state, so they run on
     whichever device is current; the build needs both cards' architectures (`-DCMAKE_CUDA_ARCHITECTURES=86;120`).
+
+- **A conversation's next turn** (`INK_SNAPSHOT=1`; off by default, not run on a GPU yet): a request is read on
+  from the engine's state only when it continues the tokens so far. A client that sends the last answer back without
+  its thinking does not: the template then writes that turn as its text block alone, the prompt parts from the tokens
+  written right after the last prompt's `<|message_model|>`, and the whole conversation is read again (a 32K-token
+  one: ~40 s a turn). With the snapshot the state at each prompt's end is kept aside (`Engine::snapshot`: every
+  layer's short-convolution states and the sliding layers' K / V rings, 79 MB of VRAM, 5 expert slots; the global
+  layers' caches need nothing, a row is only ever written at its position), and such a turn goes on from there: only
+  the answer as rendered and the new message are read, and the same prompt sent again reads nothing. maya-ling's
+  (src/ling), with `reset()` dropping the snapshot: after it the global layers' rows belong to another conversation.
+  `maya-ink --gguf <...> --ids @prompt.txt --gen 64 --restore-check` checks it: the state goes back to the prompt's
+  end, the same tokens are fed again, and each step's logits are compared with the first pass's (the same bits with
+  `INK_CACHE_SWAPS=0` and no helper card; otherwise they differ as the experts' places make them differ).
+- `QUIT` is the last line the engine reads: the thread that reads stdin went back into `getline`, holding the lock
+  `exit()` takes to flush the streams, and on Linux the engine then never ended while its stdin stayed open (the
+  server waits `MAYA_ENGINE_QUIT_S`, then kills it).
+
+## Not run on a GPU yet (2026-11-12)
+
+Written in a session with no GPU. All of it builds with CUDA 13.4's nvcc (Linux), and the host side was run against a
+stand-in for the CUDA runtime (device memory as host memory, a stream's copies made only when it is synchronized,
+kernels computing nothing) on a small synthetic GGUF, with and without a second device, also under AddressSanitizer:
+the slots' bytes after a fill, the staging buffers' turns, the serving loop's reuse over seven turns, the exit. That
+says nothing about the model's numbers or about speed. To be measured as the rest was:
+
+| | Switch | Default | The check |
+|---|---|---|---|
+| The helper's fills through pinned staging | `INK_HELPER_STAGE` | on | `INK_HELPER_VERIFY=1` once; then the first token after the 31.8K prompt (45.3 s with the helper, 40.7 s without) and the start's "experts into them in" line |
+| The state kept at each prompt's end | `INK_SNAPSHOT=1` | off | `--restore-check` with `INK_CACHE_SWAPS=0`: a difference of 0; then a second turn through the server without the answer's thinking: `PP`'s last field is the first prompt's length |
+| A prompt's choices on the written tokens' scale | `INK_CACHE_PROMPT=1`, `2` | off | ab.py's writing after the long prompt, `ink-deep.py`, the share of the experts in VRAM there; `INK_ROUTE_LOG`'s records are as before |
+| 16K chunks | `--chunk 16384` | 8192 | reading the 31.8K prompt (maya-ling reads 35% faster with them, maya-nem 42%; their new prompts' writing lost 1-2%) |
 
 ## The server
 
