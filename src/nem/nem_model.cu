@@ -38,11 +38,13 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <type_traits>
 
@@ -183,6 +185,13 @@ struct Engine::Impl {
     float *h_lat = nullptr, *h_rlog = nullptr, *h_tail = nullptr, *h_logits = nullptr;
     int* h_pos = nullptr;
     Stats st;
+    // (Engine::snapshot, NEM_SNAPSHOT=1) the Mamba-2 layers' convolution inputs and scan states at snap_pos, one buffer
+    // in VRAM (-1: none taken)
+    uint8_t* snap = nullptr;
+    size_t snap_bytes = 0;
+    int snap_pos = -1;
+    size_t conv_bytes() const { return (size_t) conv_ch * (g.d_conv - 1) * sizeof(float); }
+    size_t ssm_bytes() const { return (size_t) g.d_inner * g.d_state * sizeof(float); }
 
     template <class T> T* dalloc(size_t n) {
         void* p = nullptr;
@@ -424,6 +433,12 @@ struct Engine::Impl {
         // NEM_CACHE_DECAY / _EVERY / _SWAPS / _MARGIN change them)
         float decay = 0.99f, margin = 1.5f;
         int every = 2, per = 16;
+        // How a prompt chunk's choices count (NEM_CACHE_PROMPT; pf_score).  0: each expert's count of the chunk's
+        // tokens as it is - thousands after a long prompt, where a written token adds 1 and an expert every token
+        // chose settles at 99: the cache then holds what the prompt used most and no swap clears the bar until those
+        // scores have decayed, some hundred tokens on.  1 (off by default, not run yet): on the written tokens'
+        // scale; 2: what was there decayed too, as the chunk's tokens written one by one would.
+        int prompt = 0;
         float *u = nullptr, *routed = nullptr, *hd = nullptr, *y = nullptr;
         int8_t* hq = nullptr;
         cudaEvent_t copied = nullptr;
@@ -462,6 +477,7 @@ struct Engine::Impl {
         return ec.kv_row[(size_t) sl] >= ec.kv_hi;
     }
     void ec_kv_reserve(int rows);
+    void pf_score(int il, const int* cnt, int T);
     void ec_src_parts(int key, size_t off, size_t n, std::vector<std::pair<const uint8_t*, size_t>>& out) const;
     const uint8_t* ec_blob(int il, int e) const {
         const int sl = ec.slots ? ec.where[(size_t) il * ec.ne + e] : -1;
@@ -476,25 +492,60 @@ struct Engine::Impl {
     // card and the CPU lane do theirs, and their sum comes back to the host, where it is added to the CPU lane's.  The
     // main cache decides first (it adapts as before); the helper follows it: every `every` tokens up to `per` experts
     // change places (an expert the main card took is dropped, a better-scored one outside both comes in), and after a
-    // prompt up to `fill_cap`.  Nothing of the model's state lives there, so the prompt path and reset() ignore it.
+    // prompt up to `fill_cap`.  The fills at the start and after a prompt go through pinned staging the CPU lane's
+    // threads fill (hc_copy_many: as the main cache's fills; NEM_HELPER_STAGE=0: the driver's staging of the mapping,
+    // as before).  Nothing of the model's state lives there, so the prompt path and reset() ignore it.
     struct HC {
         int dev = -1, slots = 0;
-        cudaStream_t s = nullptr;
+        cudaStream_t s = nullptr, cs = nullptr;   // the experts' launches; the swaps' copies (the worker's)
         std::vector<uint8_t*> ptr;
-        std::vector<int> cls, owner, where;   // slot -> class; slot -> key or -1; key -> slot or -1
+        std::vector<int> cls, owner, where;   // slot -> class; slot -> key or -1; key -> slot, -1, or -2: on its way
+        std::vector<uint8_t> busy;            // slot -> 1 while its copy is on its way
         float *lat = nullptr, *qd = nullptr, *u = nullptr, *hd = nullptr, *y = nullptr, *routed = nullptr;
         int8_t *qq = nullptr, *hq = nullptr;
         float* h_out = nullptr;               // (pinned) the helper's sum
+        // the fills' staging (hc_copy_many): two pinned buffers in turn, each one's last DMA (an event of the helper's)
+        uint8_t* pin[2] = {nullptr, nullptr};
+        cudaEvent_t pev[2] = {nullptr, nullptr};
+        size_t pcap = 0;
+        int pk = 0;
+        bool stage = false;
         long hits = 0, copies = 0, tok = 0;
         // (measured 2026-11-11 on ab.py, RTX 5090 + RTX 3090: 16 swaps every 2 tokens wrote 48.2 tok/s on new prompts
         //  and 44.7 after a 34K prompt; every 8 tokens 45.6-47.8 and 33-40; every 4 46.7 and 42.0)
         int every = 2, per = 16, fill_cap = 4096;
+        float margin = -1.0f, bias = 0.5f;   // a swap's bar: score > margin * the slot's + bias (-1: the main cache's)
         size_t bytes = 0;
+        // (NEM_HELPER_BG=1; off by default, not run yet) maya-ink's swaps' thread: the swaps between tokens copied
+        // by a thread of their own on a second stream while the next tokens are written, an expert used from the first
+        // update after its copy is done - their copies leave the token's thread (0.4 ms a token here), so more of them
+        // cost a token nothing.  (key, slot) jobs from q, the copied ones to done (both under mu); inflight is the main
+        // thread's count of those it has not collected yet.
+        bool bg = false, quit = false;
+        std::thread th;
+        std::mutex mu;
+        std::condition_variable cv, cv_done;
+        std::vector<std::pair<int, int>> q, done;
+        size_t qhead = 0;
+        int inflight = 0;
+        ~HC() {
+            if (!th.joinable()) return;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                quit = true;
+            }
+            cv.notify_all();
+            th.join();
+        }
     } hc;
     bool hc_steal = false;
     long pf_tokens_open = 0;   // the tokens read through the prompt path since the last written token
     void hc_alloc();
-    void hc_update(int max_copies, bool hysteresis);
+    void hc_update(int max_copies, bool hysteresis, bool bg);
+    void hc_copy(int key, int slot, cudaStream_t st);
+    void hc_copy_many(const std::vector<std::pair<int, int>>& todo);
+    void hc_collect(bool wait);
+    void hc_worker();
     void hc_experts(const Layer& l, const int* slot, const float* w, int n);
 
     bool save_profile(const std::string& path) const;
@@ -529,9 +580,45 @@ const float* Engine::prefill(const int* ids, int n, void (*progress)(void*, int)
     return p->prefill(ids, n, progress, ctx);
 }
 
+// The Mamba-2 layers' part of the state: each one's convolution inputs and scan state.  The attention layers need
+// nothing: a K / V row is written once, at its position, so the rows below the snapshot's stay and those from it on are
+// written again before they are read.
+bool Engine::snapshot() {
+    Impl& m = *p;
+    if (!m.snap) return false;
+    uint8_t* at = m.snap;
+    for (const Layer& l : m.L) {
+        if (l.kind != kMamba) continue;
+        CK(cudaMemcpyAsync(at, l.conv_st, m.conv_bytes(), cudaMemcpyDeviceToDevice, m.s));
+        CK(cudaMemcpyAsync(at + m.conv_bytes(), l.ssm_st, m.ssm_bytes(), cudaMemcpyDeviceToDevice, m.s));
+        at += m.conv_bytes() + m.ssm_bytes();
+    }
+    CK(cudaStreamSynchronize(m.s));
+    m.snap_pos = m.pos;
+    return true;
+}
+
+bool Engine::restore() {
+    Impl& m = *p;
+    if (!m.snap || m.snap_pos < 0) return false;
+    const uint8_t* at = m.snap;
+    for (Layer& l : m.L) {
+        if (l.kind != kMamba) continue;
+        CK(cudaMemcpyAsync(l.conv_st, at, m.conv_bytes(), cudaMemcpyDeviceToDevice, m.s));
+        CK(cudaMemcpyAsync(l.ssm_st, at + m.conv_bytes(), m.ssm_bytes(), cudaMemcpyDeviceToDevice, m.s));
+        at += m.conv_bytes() + m.ssm_bytes();
+    }
+    CK(cudaStreamSynchronize(m.s));
+    m.pos = m.snap_pos;   // (ec.kv_hi stays: the K / V rows reserved up to the position reached are no slots again)
+    return true;
+}
+
+bool Engine::can_snapshot() const { return p->snap != nullptr; }
+
 void Engine::reset() {
     p->pos = 0;
-    p->ec.kv_hi = 0;   // (the K / V caches' slots usable again: empty, the next fill or swaps take them)
+    p->snap_pos = -1;   // (a snapshot is of the conversation that ends here)
+    p->ec.kv_hi = 0;    // (the K / V caches' slots usable again: empty, the next fill or swaps take them)
     const Geo& g = p->g;
     for (auto& l : p->L)
         if (l.kind == kMamba) {
@@ -783,6 +870,13 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     h_tail = halloc<float>((size_t) 4 + NL);
     h_logits = halloc<float>((size_t) g.vocab);
     h_pos = halloc<int>(1);
+    // the room for Engine::snapshot (NEM_SNAPSHOT=1; off by default, not run yet): every Mamba-2 layer's convolution
+    // inputs and scan state (173 MB for Nemotron 3.5 Super), taken before the expert cache sizes itself
+    if (const char* sv = std::getenv("NEM_SNAPSHOT"); sv && std::atoi(sv) != 0) {
+        for (const Layer& l : L)
+            if (l.kind == kMamba) snap_bytes += conv_bytes() + ssm_bytes();
+        if (snap_bytes) snap = dalloc<uint8_t>(snap_bytes);
+    }
 
     int threads = o.threads > 0 ? o.threads : (int) std::max(1u, std::thread::hardware_concurrency() / 2);
     pool.reset(new Pool(threads - 1));
@@ -831,7 +925,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
         const double th = now_ms();
         hc_alloc();
         if (hc.slots) {
-            hc_update(INT_MAX, false);
+            hc_update(INT_MAX, false, false);
             if (o.verbose)
                 std::fprintf(stderr,
                              "maya-nem: helper card CUDA%d: %d expert slots, %.2f GB of its VRAM; %ld experts into them in "
@@ -879,6 +973,7 @@ void Engine::Impl::ec_alloc() {
     if (const char* v = std::getenv("NEM_CACHE_EVERY")) ec.every = std::max(1, std::atoi(v));
     if (const char* v = std::getenv("NEM_CACHE_SWAPS")) ec.per = std::max(0, std::atoi(v));
     if (const char* v = std::getenv("NEM_CACHE_MARGIN")) ec.margin = (float) std::atof(v);
+    if (const char* v = std::getenv("NEM_CACHE_PROMPT")) ec.prompt = std::max(0, std::min(2, std::atoi(v)));
     if (const char* v = std::getenv("NEM_CACHE_DEFER")) ec.defer = std::atoi(v) != 0;
     if (const char* v = std::getenv("NEM_CACHE_STAGE_KB")) ec.piece = (size_t) std::max(64, std::atoi(v)) << 10;
     if (ec.defer) {
@@ -1109,7 +1204,7 @@ void Engine::Impl::ec_adapt() {
                 if (ec.where[(size_t) key] != -1 || ec.score[(size_t) key] <= 0.0f) continue;
                 // (an expert the helper card holds is off the CPU already: the main card's swaps go to the ones that
                 //  are not, and the helper's slots stay as they are; NEM_HELPER_STEAL=1: the main card takes them too)
-                if (hc.slots && !hc_steal && hc.where[(size_t) key] >= 0) continue;
+                if (hc.slots && !hc_steal && hc.where[(size_t) key] != -1) continue;   // (there, or on its way)
                 best.push_back(key);
                 std::push_heap(best.begin(), best.end(), by_score);
                 if ((int) best.size() > per) {
@@ -1191,6 +1286,31 @@ void Engine::Impl::ec_kv_reserve(int rows) {
             }
     }
     ec.kv_hi = hi;
+}
+
+// A prompt chunk's choices in layer il (cnt: the tokens of its T that chose each expert) into the scores.
+//   0: the counts as they are.
+//   1: on the written tokens' scale.  T tokens written one by one leave sum(decay^k, k = 1 .. T) of score to share
+//      for each of a token's choices (a token's choice adds 1, then every score decays by the token's end); the chunk
+//      gives each expert its share of that, cnt / T - what its tokens would have left had they chosen it evenly
+//      through the chunk.  A long chunk so adds at most 99 (decay 0.99), a 32-token one 0.85 a count.
+//   2: the same, the layer's scores first times decay^T, as T written tokens leave them.
+// (Integers and the same float operations in the same order every run: the same scores.)  maya-ink's.
+void Engine::Impl::pf_score(int il, const int* cnt, int T) {
+    const int ne = g.n_expert;
+    float* sc = ec.score.data() + (size_t) il * ne;
+    if (ec.prompt == 0 || T <= 0) {
+        for (int e = 0; e < ne; ++e)
+            if (cnt[e]) sc[e] += (float) cnt[e];
+        return;
+    }
+    const double d = std::min(std::max((double) ec.decay, 0.0), 1.0), dT = std::pow(d, (double) T);
+    const double mass = d < 1.0 ? d * (1.0 - dT) / (1.0 - d) : (double) T;
+    const float keep = (float) dT, per = (float) (mass / (double) T);
+    if (ec.prompt >= 2)
+        for (int e = 0; e < ne; ++e) sc[e] *= keep;
+    for (int e = 0; e < ne; ++e)
+        if (cnt[e]) sc[e] += (float) cnt[e] * per;
 }
 
 void Engine::Impl::ec_src_parts(int key, size_t off, size_t n,
@@ -1359,9 +1479,14 @@ void Engine::Impl::hc_alloc() {
     if (const char* v = std::getenv("NEM_HELPER_SWAPS")) hc.per = std::max(0, std::atoi(v));
     if (const char* v = std::getenv("NEM_HELPER_FILL")) hc.fill_cap = std::max(0, std::atoi(v));
     if (const char* v = std::getenv("NEM_HELPER_STEAL")) hc_steal = std::atoi(v) != 0;
+    if (const char* v = std::getenv("NEM_HELPER_BG")) hc.bg = std::atoi(v) != 0;
+    if (const char* v = std::getenv("NEM_HELPER_MARGIN")) hc.margin = (float) std::atof(v);
+    if (const char* v = std::getenv("NEM_HELPER_BIAS")) hc.bias = (float) std::atof(v);
+    if (hc.margin < 0.0f) hc.margin = ec.margin;
     const int NL = g.n_lat, ff = g.n_ff_exp, nc = (int) ec.cls_bytes.size();
     OnDev od(hc.dev);
     CK(cudaStreamCreate(&hc.s));
+    CK(cudaStreamCreate(&hc.cs));
     auto dev_alloc = [&](size_t bytes) {
         void* p = nullptr;
         CK(cudaMalloc(&p, bytes));
@@ -1378,6 +1503,25 @@ void Engine::Impl::hc_alloc() {
     hc.y = (float*) dev_alloc((size_t) 32 * NL * sizeof(float));
     hc.routed = (float*) dev_alloc((size_t) NL * sizeof(float));
     CK(cudaHostAlloc((void**) &hc.h_out, (size_t) NL * sizeof(float), cudaHostAllocPortable));
+    // the fills' pinned staging: its own buffers and events (an event belongs to its device; the prompt path's staging
+    // may still hold the main card's copies).  NEM_HELPER_STAGE: a buffer's MB, 64; 0: none - the driver's staging
+    const char* hsv = std::getenv("NEM_HELPER_STAGE");
+    if (!hsv || std::atoi(hsv) > 0) {
+        hc.pcap = (size_t) (hsv ? std::atoi(hsv) : 64) << 20;
+        hc.stage = cudaHostAlloc((void**) &hc.pin[0], hc.pcap, cudaHostAllocPortable) == cudaSuccess &&
+                   cudaHostAlloc((void**) &hc.pin[1], hc.pcap, cudaHostAllocPortable) == cudaSuccess;
+        if (hc.stage) {
+            CK(cudaEventCreateWithFlags(&hc.pev[0], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&hc.pev[1], cudaEventDisableTiming));
+        } else {
+            cudaGetLastError();
+            for (uint8_t*& b : hc.pin) {
+                if (b) cudaFreeHost(b);
+                b = nullptr;
+            }
+            std::fprintf(stderr, "maya-nem: no pinned staging for the helper card's fills (the driver's is used)\n");
+        }
+    }
     // the slots: this card's free VRAM less a reserve, each class's share by its layers (as the main cache's)
     std::vector<int> nl((size_t) nc, 0);
     int nmoe = 0;
@@ -1432,15 +1576,122 @@ void Engine::Impl::hc_alloc() {
     }
     hc.slots = (int) hc.ptr.size();
     hc.owner.assign((size_t) hc.slots, -1);
+    hc.busy.assign((size_t) hc.slots, 0);
     hc.where.assign((size_t) g.n_layer * ec.ne, -1);
+    if (hc.slots && hc.bg) hc.th = std::thread([this] { hc_worker(); });
+}
+
+// An expert's bytes (up | down, as the main cache's slots) into a helper slot, on st (the helper current)
+void Engine::Impl::hc_copy(int key, int slot, cudaStream_t st) {
+    const int il = key / ec.ne, e = key % ec.ne;
+    const CpuLayer& c = L[(size_t) il].cl;
+    const size_t ub = ub_of(c), db = db_of(c);
+    uint8_t* d = hc.ptr[(size_t) slot];
+    CK(cudaMemcpyAsync(d, c.up + (size_t) e * ub, ub, cudaMemcpyHostToDevice, st));
+    CK(cudaMemcpyAsync(d + ub, c.down + (size_t) e * db, db, cudaMemcpyHostToDevice, st));
+}
+
+// The swaps' thread: one expert at a time from the queue into its slot (no launch reads that slot until the main
+// thread has collected it)
+void Engine::Impl::hc_worker() {
+    CK(cudaSetDevice(hc.dev));
+    for (;;) {
+        std::pair<int, int> job;
+        {
+            std::unique_lock<std::mutex> lk(hc.mu);
+            hc.cv.wait(lk, [&] { return hc.quit || hc.qhead < hc.q.size(); });
+            if (hc.quit) return;
+            job = hc.q[hc.qhead++];
+            if (hc.qhead == hc.q.size()) {
+                hc.q.clear();
+                hc.qhead = 0;
+            }
+        }
+        hc_copy(job.first, job.second, hc.cs);
+        CK(cudaStreamSynchronize(hc.cs));
+        {
+            std::lock_guard<std::mutex> lk(hc.mu);
+            hc.done.push_back(job);
+        }
+        hc.cv_done.notify_one();
+    }
+}
+
+// The copied experts become usable (wait: all of those on their way first)
+void Engine::Impl::hc_collect(bool wait) {
+    if (hc.inflight == 0) return;
+    std::unique_lock<std::mutex> lk(hc.mu);
+    if (wait) hc.cv_done.wait(lk, [&] { return (int) hc.done.size() == hc.inflight; });
+    for (const auto& kv : hc.done) {
+        hc.busy[(size_t) kv.second] = 0;
+        hc.where[(size_t) kv.first] = kv.second;
+        ++hc.copies;
+    }
+    hc.inflight -= (int) hc.done.size();
+    hc.done.clear();
+}
+
+// A fill's experts (key, slot) into their helper slots, the helper current: ec_copy_many's way - as many as fill a
+// pinned buffer at a time, copied into it by the CPU lane's threads (1 MB pieces), then one DMA each on the helper's
+// stream from there.  The same bytes into the same slots as hc_copy's; called between tokens (the pool idle).
+void Engine::Impl::hc_copy_many(const std::vector<std::pair<int, int>>& todo) {
+    struct Part {
+        const uint8_t* src;
+        size_t off, len;
+    };
+    size_t i = 0;
+    while (i < todo.size()) {
+        // a batch: the experts that fit the buffer, laid out there as in their slots
+        std::vector<Part> parts;
+        std::vector<std::pair<size_t, size_t>> dma;   // (todo index, offset in the buffer)
+        size_t fill = 0;
+        for (; i < todo.size(); ++i) {
+            const int key = todo[i].first, il = key / ec.ne, e = key % ec.ne;
+            const CpuLayer& c = L[(size_t) il].cl;
+            const size_t ub = ub_of(c), db = db_of(c);
+            if (fill + ub + db > hc.pcap) {
+                if (fill == 0) {   // (an expert larger than the buffer: the driver's staging)
+                    hc_copy(key, todo[i].second, hc.s);
+                    continue;
+                }
+                break;
+            }
+            dma.push_back({i, fill});
+            const std::pair<const uint8_t*, size_t> rs[2] = {{c.up + (size_t) e * ub, ub}, {c.down + (size_t) e * db, db}};
+            for (const auto& r0 : rs) {
+                for (size_t o0 = 0; o0 < r0.second; o0 += (size_t) 1 << 20)
+                    parts.push_back({r0.first + o0, fill + o0, std::min((size_t) 1 << 20, r0.second - o0)});
+                fill += r0.second;
+            }
+        }
+        if (dma.empty()) continue;
+        CK(cudaEventSynchronize(hc.pev[hc.pk]));   // (that buffer's last DMA is done)
+        uint8_t* pin = hc.pin[hc.pk];
+        pool->run((int) parts.size(), [&](int j) {
+            const Part& p0 = parts[(size_t) j];
+            std::memcpy(pin + p0.off, p0.src, p0.len);
+        });
+        for (const auto& d : dma) {
+            const int key = todo[d.first].first, sl = todo[d.first].second;
+            const CpuLayer& c = L[(size_t) (key / ec.ne)].cl;
+            CK(cudaMemcpyAsync(hc.ptr[(size_t) sl], pin + d.second, ub_of(c) + db_of(c), cudaMemcpyHostToDevice, hc.s));
+        }
+        CK(cudaEventRecord(hc.pev[hc.pk], hc.s));
+        hc.pk ^= 1;
+    }
 }
 
 // The helper's slots brought up to date, at most max_copies experts copied: the slots whose expert the main card holds
 // (or is taking) are freed, then the best-scored experts outside both cards come in - into free slots, then in place
 // of the worst-scored ones (with hysteresis: only one that beats its slot's expert by the main cache's margin).  Called
-// between tokens, the helper idle.
-void Engine::Impl::hc_update(int max_copies, bool hysteresis) {
-    if (hc.slots == 0 || max_copies <= 0) return;
+// between tokens, the helper idle.  bg (with the swaps' thread): the copies go to the worker and count against
+// max_copies until they are done; otherwise they are made here, after the worker's.
+void Engine::Impl::hc_update(int max_copies, bool hysteresis, bool bg) {
+    if (hc.slots == 0) return;
+    bg = bg && hc.th.joinable();
+    hc_collect(!bg);
+    max_copies -= hc.inflight;
+    if (max_copies <= 0) return;
     std::vector<std::pair<int, int>> todo;   // (key, slot)
     auto better = [&](int a1, int b1) {
         return ec.score[(size_t) a1] > ec.score[(size_t) b1] || (ec.score[(size_t) a1] == ec.score[(size_t) b1] && a1 < b1);
@@ -1448,7 +1699,7 @@ void Engine::Impl::hc_update(int max_copies, bool hysteresis) {
     for (int c = 0; c < (int) ec.cls_bytes.size(); ++c) {
         std::vector<int> free_slots, res, cand;
         for (int sl = 0; sl < hc.slots; ++sl) {
-            if (hc.cls[(size_t) sl] != c) continue;
+            if (hc.cls[(size_t) sl] != c || hc.busy[(size_t) sl]) continue;
             const int ow = hc.owner[(size_t) sl];
             if (ow >= 0 && ec.where[(size_t) ow] != -1) {
                 hc.where[(size_t) ow] = -1;
@@ -1483,28 +1734,61 @@ void Engine::Impl::hc_update(int max_copies, bool hysteresis) {
                 if (wi >= nw) break;
                 const int w0 = res[wi];
                 const float rs = ec.score[(size_t) hc.owner[(size_t) w0]];
-                if (hysteresis ? ec.score[(size_t) key] <= ec.margin * rs + 0.5f : ec.score[(size_t) key] <= rs) break;
+                if (hysteresis ? ec.score[(size_t) key] <= hc.margin * rs + hc.bias : ec.score[(size_t) key] <= rs) break;
                 hc.where[(size_t) hc.owner[(size_t) w0]] = -1;
                 sl = w0;
                 ++wi;
             }
             hc.owner[(size_t) sl] = key;
-            hc.where[(size_t) key] = sl;
+            hc.where[(size_t) key] = bg ? -2 : sl;
             todo.push_back({key, sl});
         }
     }
     if (todo.empty()) return;
-    OnDev od(hc.dev);
-    for (const auto& kv : todo) {
-        const int il = kv.first / ec.ne, e = kv.first % ec.ne;
-        const CpuLayer& c = L[(size_t) il].cl;
-        const size_t ub = ub_of(c), db = db_of(c);
-        uint8_t* d = hc.ptr[(size_t) kv.second];
-        CK(cudaMemcpyAsync(d, c.up + (size_t) e * ub, ub, cudaMemcpyHostToDevice, hc.s));
-        CK(cudaMemcpyAsync(d + ub, c.down + (size_t) e * db, db, cudaMemcpyHostToDevice, hc.s));
-        ++hc.copies;
+    if (bg) {
+        for (const auto& kv : todo) hc.busy[(size_t) kv.second] = 1;
+        hc.inflight += (int) todo.size();
+        {
+            std::lock_guard<std::mutex> lk(hc.mu);
+            hc.q.insert(hc.q.end(), todo.begin(), todo.end());
+        }
+        hc.cv.notify_one();
+        return;
     }
+    OnDev od(hc.dev);
+    // (a fill - the start's, a prompt's - through the pinned staging; the swaps between tokens as before)
+    if (hc.stage && !hysteresis) hc_copy_many(todo);
+    else
+        for (const auto& kv : todo) hc_copy(kv.first, kv.second, hc.s);
+    hc.copies += (long) todo.size();
     CK(cudaStreamSynchronize(hc.s));
+    // (NEM_HELPER_VERIFY=1, a check) every slot just filled read back against the mapping's bytes
+    static const bool verify = std::getenv("NEM_HELPER_VERIFY") != nullptr;
+    if (verify) {
+        std::vector<uint8_t> back;
+        std::vector<std::pair<const uint8_t*, size_t>> parts;
+        for (const auto& kv : todo) {
+            const CpuLayer& c = L[(size_t) (kv.first / ec.ne)].cl;
+            const size_t bytes = ub_of(c) + db_of(c);
+            back.resize(bytes);
+            CK(cudaMemcpy(back.data(), hc.ptr[(size_t) kv.second], bytes, cudaMemcpyDeviceToHost));
+            parts.clear();
+            ec_src_parts(kv.first, 0, bytes, parts);
+            size_t at = 0;
+            for (const auto& pr : parts) {
+                if (std::memcmp(back.data() + at, pr.first, pr.second) != 0) {
+                    std::fprintf(stderr,
+                                 "maya-nem: NEM_HELPER_VERIFY: expert %d of layer %d differs in helper slot %d\n",
+                                 kv.first % ec.ne, kv.first / ec.ne, kv.second);
+                    std::abort();
+                }
+                at += pr.second;
+            }
+        }
+        std::fprintf(stderr,
+                     "maya-nem: NEM_HELPER_VERIFY: %zu experts in the helper's slots hold the mapping's bytes\n",
+                     todo.size());
+    }
 }
 
 // A token's experts on the helper card: the latent up from the host, its int8 rows, then gpu_experts' launches on the
@@ -1818,8 +2102,7 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
     const CpuLayer& c = l.cl;
     const size_t ub = ub_of(c), db = db_of(c);
     const int il = (int) (&l - L.data()), GE = pf.GE;
-    for (int e = 0; e < ne; ++e)
-        if (pf.h_cnt[e]) ec.score[(size_t) il * ne + e] += (float) pf.h_cnt[e];
+    pf_score(il, pf.h_cnt, T);
     // The experts in groups of GE: a group's used experts that are not in VRAM copied into one of two group buffers
     // (each run of consecutive ones in one copy a tensor), laid out [the ups | the downs] of the group's experts.
     for (int e0 = 0; e0 < ne; e0 += GE) {
@@ -1894,16 +2177,21 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
     ec_kv_reserve(pos0 + T);
     // the chunk's embedding rows gathered from the mapping into the pinned staging (or one by one without it)
     const size_t rb = embd.rb;
-    if (stg.on && (size_t) T * rb <= stg.cap) {
-        CK(cudaEventSynchronize(stg.ev[stg.k]));
-        uint8_t* pin = stg.pin[stg.k];
-        pool->run((T + 255) / 256, [&](int j) {
-            for (int t = j * 256; t < std::min(T, j * 256 + 256); ++t)
-                std::memcpy(pin + (size_t) t * rb, embd.w + (size_t) ids[t] * rb, rb);
-        });
-        CK(cudaMemcpyAsync(pf.Erows, pin, (size_t) T * rb, cudaMemcpyHostToDevice, s));
-        CK(cudaEventRecord(stg.ev[stg.k], s));
-        stg.k ^= 1;
+    if (stg.on && stg.cap >= rb) {
+        // (in staging-buffer pieces: a 16K chunk's Q8_0 rows are 71 MB, more than a buffer, and went up a row a call)
+        const int per = (int) std::min<size_t>((size_t) T, stg.cap / rb);   // (the rows a staging buffer holds)
+        for (int t0 = 0; t0 < T; t0 += per) {
+            const int n = std::min(per, T - t0);
+            CK(cudaEventSynchronize(stg.ev[stg.k]));
+            uint8_t* pin = stg.pin[stg.k];
+            pool->run((n + 255) / 256, [&](int j) {
+                for (int t = j * 256; t < std::min(n, j * 256 + 256); ++t)
+                    std::memcpy(pin + (size_t) t * rb, embd.w + (size_t) ids[t0 + t] * rb, rb);
+            });
+            CK(cudaMemcpyAsync(pf.Erows + (size_t) t0 * rb, pin, (size_t) n * rb, cudaMemcpyHostToDevice, s));
+            CK(cudaEventRecord(stg.ev[stg.k], s));
+            stg.k ^= 1;
+        }
     } else {
         for (int t = 0; t < T; ++t)
             CK(cudaMemcpyAsync(pf.Erows + (size_t) t * rb, embd.w + (size_t) ids[t] * rb, rb, cudaMemcpyHostToDevice, s));
@@ -2193,7 +2481,7 @@ const float* Engine::Impl::step(int token) {
         // The prompt changed the scores, and the main cache with them: the helper follows, with more copies after a
         // longer prompt (an eighth of its tokens, 64 .. fill_cap: a short turn waits ~30 ms for them, a long prompt
         // a second or two on top of its own reading).
-        hc_update(std::min(hc.fill_cap, std::max(64, (int) std::min<long>(pf_tokens_open / 8, INT_MAX))), false);
+        hc_update(std::min(hc.fill_cap, std::max(64, (int) std::min<long>(pf_tokens_open / 8, INT_MAX))), false, false);
         pf_tokens_open = 0;
     }
     if (moes.empty())
@@ -2229,7 +2517,7 @@ const float* Engine::Impl::step(int token) {
     }
     if (hc.slots && ++hc.tok % hc.every == 0) {
         const double u0 = now_ms();
-        hc_update(hc.per, true);
+        hc_update(hc.per, true, hc.bg);
         st.ms_update += now_ms() - u0;
     }
     st.ms_total += now_ms() - t0;

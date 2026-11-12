@@ -44,6 +44,13 @@ output head and the embedding Q8_0, the NextN block Q8_0 (3.1 GB).
   attention layers' K / V rows past the position lent to it between prompts, scores that count every choice and decay
   0.99 a token, up to 16 swaps every 2 tokens (margin 1.5; `NEM_CACHE_*`), the swaps' copies staged while the CPU
   waits for the GPU. `--profile FILE` keeps the scores for the next start.
+  A prompt chunk adds each expert's count of its tokens as it is: thousands after a long prompt, where a written
+  token adds 1 and an expert every token chose settles at 99. The refill after the prompt so holds what the prompt
+  used most, and no swap clears the bar (1.5 times the worst one in VRAM + 0.5) until those scores have decayed, some
+  hundred tokens on. `NEM_CACHE_PROMPT=1` (off by default, not run yet; maya-ink's) puts a chunk on the written
+  tokens' scale: each expert gets its share of the chunk's tokens times what as many written tokens leave to share
+  (at most 99), so the refill takes the same experts and the swaps start with the first tokens; `2` also decays what
+  was there before the chunk, as its tokens written one by one would.
 - **The helper card** (`--helper-gpu N`, branch `nemotron-2gpu`): a second card that holds routed experts only, in a
   cache of its own (slots by class, as the main cache's; its free VRAM less `NEM_HELPER_RESERVE_MIB`, 1024). It is
   filled with the best-scored experts the main card does not hold. A token's chosen experts are then split three
@@ -58,6 +65,17 @@ output head and the embedding Q8_0, the NextN block Q8_0 (3.1 GB).
   - The helper follows: up to 16 swaps every 2 tokens (`NEM_HELPER_SWAPS`, `NEM_HELPER_EVERY`), an expert the main
     card took dropped, a better-scored one from outside both taken in place of its worst (the main cache's margin);
     after a prompt, up to an eighth of the prompt's tokens (64 .. 4,096, `NEM_HELPER_FILL`).
+  - The fills at the start and after a prompt go through pinned staging of the helper's own, as the main cache's do
+    (`hc_copy_many`, maya-ink's: the CPU lane's threads into two 64 MB pinned buffers in turn, one DMA an expert
+    from there; `NEM_HELPER_STAGE=0`: the driver's staging of the mapping, as before; another value: a buffer's MB).
+    Not run on a GPU yet. `NEM_HELPER_VERIFY=1` reads every slot a fill wrote back and compares it with the
+    mapping's bytes.
+  - `NEM_HELPER_BG=1` (off by default, not run yet): maya-ink's and maya-ling's swaps' thread. The swaps between
+    tokens are copied by a thread of their own on a second stream while the next tokens are written, and an expert
+    is used from the first update after its copy is done: the copies (the 0.4 ms of a token below, 0.19 ms each)
+    leave the token's thread, so more of them a token cost it nothing (new prompts write 48 tok/s where long answers
+    reach 55, the helper taking new experts in at 8 a token). `NEM_HELPER_MARGIN` / `NEM_HELPER_BIAS` set a swap's
+    bar (the main cache's margin and 0.5, as before); maya-ling's helper runs 32 swaps every token this way.
   - Maya's server adds `--layer-split auto` when a config's `"gpu"` names two cards; this engine reads that as
     `--helper-gpu 1` (the second visible card), so `"gpu": [0, 1]` in the run config is all it takes.
   - The kernels it launches there (ds4_iq's GEMVs, nem's q8 / relu^2 / row sums) keep no device state, so they run
@@ -198,8 +216,22 @@ context, the AVX2 Q2_0 rows on. `ab.py` through Maya's server, every run from th
 - A prompt is read on from the engine's state only when it continues the tokens so far (the Mamba-2 state can't be
   rewound). A tool's result does (`test-results\2026-11-04-nemotron\nem-turns.py`: 473 of 511 tokens read on); a new
   user message doesn't, because the template drops the earlier thinking (`truncate_history_thinking`), so the
-  conversation is read again from the start. Keeping the state from before each prompt's generation prompt (where the
-  next turn's rendering first differs) would save that; not done.
+  conversation is read again from the start. `NEM_SNAPSHOT=1` (off by default, not run on a GPU yet) keeps the state
+  from just before each prompt's end, where the next turn's rendering first differs (`Engine::snapshot`: the Mamba-2
+  layers' convolution inputs and scan states, 173 MB of VRAM; the attention layers' K / V need nothing, a row is only
+  ever written at its position). The prompt ends with `<|im_start|>assistant\n<think>\n` and the next prompt writes
+  that turn as `...<think></think>` + the answer, so the snapshot is taken 4 tokens before the end
+  (`NEM_SNAPSHOT_TAIL`) and those last tokens are read one by one (the token path: their logits come from its int8
+  rows, not the prompt path's F16). A new user message then reads on from there: those tokens, the answer without its
+  thinking and the message, instead of the whole conversation; the same prompt sent again reads only the tail.
+  `maya-nem --gguf <...> --ids @prompt.txt --gen 64 --restore-check` checks it: the state goes back to the prompt's
+  end, the same tokens are fed again, and each step's logits are compared with the first pass's (the same bits with
+  `NEM_CACHE_SWAPS=0` and no helper card).
+- `QUIT` is the last line the engine reads: the thread that reads stdin went back into `getline`, holding the lock
+  `exit()` takes to flush the streams, and on Linux the engine then never ended while its stdin stayed open (the
+  server waits `MAYA_ENGINE_QUIT_S`, then kills it).
+- A prompt chunk's embedding rows go up in staging-buffer pieces (maya-ling's): a 16K chunk's are 71 MB, more than a
+  64 MB buffer, and went up a row a call (16,384 copies from pageable memory a full chunk).
 - `tools/strata_tokenizer.py` has the `tekken` pre-tokenizer; `tools/nem/make_pack.py` writes the tokenizer folder
   the server reads (with the template the GGUF carries):
 
@@ -219,6 +251,19 @@ A run config (`--engine maya --config ...`):
   "sampling": {"temperature": 1.0, "top_p": 0.95}
 }
 ```
+
+Not run on a GPU yet (2026-11-12): written in a session without one. All of it builds with CUDA 13.4's nvcc
+(Linux), and the host side was run against a stand-in for the CUDA runtime (device memory as host memory, a stream's
+copies made only when it is synchronized, kernels computing nothing) on a small synthetic GGUF, with and without a
+second device: the slots' bytes after a fill, the swaps' thread at 32 swaps a token, the serving loop's reuse over
+seven turns, the exit. That says nothing about the model's numbers or about speed. To be measured as the rest was:
+
+| | Switch | Default | The check |
+|---|---|---|---|
+| The helper's fills through pinned staging | `NEM_HELPER_STAGE` | on | `NEM_HELPER_VERIFY=1` once; then the first token of a short turn with the helper (2.24 s against 1.91 s without) |
+| The state kept before each prompt's end | `NEM_SNAPSHOT=1` | off | `--restore-check` with `NEM_CACHE_SWAPS=0`: a difference of 0; then `nem-turns.py`: a new user message reads from the last prompt's end less 4 tokens |
+| The swaps' thread | `NEM_HELPER_BG=1` | off | ab.py with the helper, new prompts (48.2 tok/s) and "the helper's swaps" in the token's times (0.4 ms); then `NEM_HELPER_SWAPS=32 NEM_HELPER_EVERY=1`, maya-ling's |
+| A prompt's choices on the written tokens' scale | `NEM_CACHE_PROMPT=1`, `2` | off | ab.py's writing after the long prompt (21.7 tok/s against 26.3 on new ones, Q4) |
 
 Not supported yet: pictures and video (the C-RADIO encoder isn't ported), the NextN block's speculative decoding.
 

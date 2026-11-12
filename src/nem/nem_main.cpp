@@ -186,6 +186,9 @@ struct Input {
                 std::lock_guard<std::mutex> lk(mu);
                 lines.push_back(l);
                 cv.notify_all();
+                // (QUIT is the last line read: a thread waiting in getline holds stdin's lock, which exit() takes
+                //  to flush the streams - on glibc the engine then never ended while its stdin stayed open)
+                if (l == "QUIT") return;
             }
             std::lock_guard<std::mutex> lk(mu);
             eof = true;
@@ -208,7 +211,7 @@ int main(int argc, char** argv) {
     nem::Options opt;
     std::string ids_arg, dump, follow_arg;
     int gen = 0, top = 5;
-    bool serve = false, by_step = false, bench = false;
+    bool serve = false, by_step = false, bench = false, restore_check = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -228,6 +231,7 @@ int main(int argc, char** argv) {
         else if (a == "--top") top = std::atoi(val().c_str());
         else if (a == "--follow") follow_arg = val();
         else if (a == "--step") by_step = true;
+        else if (a == "--restore-check") restore_check = true;
         else if (a == "--chunk") opt.chunk = std::max(64, std::atoi(val().c_str()));
         else if (a == "--stage") opt.stage = std::atoi(val().c_str());
         else if (a == "--cache-gb") opt.cache_gb = std::atof(val().c_str());
@@ -298,6 +302,11 @@ int main(int argc, char** argv) {
         // each step: the token chosen (greedy, or --follow's next one), then the top ones as id:log-probability
         const std::vector<int> follow = follow_arg.empty() ? std::vector<int>() : parse_ids(follow_arg);
         const int steps = follow.empty() ? gen : (int) follow.size();
+        // (--restore-check, with NEM_SNAPSHOT=1) the prompt's end kept; the tokens fed after it and the logits after
+        // each (the first 64)
+        const bool snapped = restore_check && eng.snapshot();
+        std::vector<int> fed;
+        std::vector<std::vector<float>> after;
         for (int n = 0; n < steps && lg; ++n) {
             std::vector<int> idx((size_t) V);
             for (int i = 0; i < V; ++i) idx[(size_t) i] = i;
@@ -315,6 +324,10 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
             if (follow.empty() && pick == eos) break;
             lg = eng.step(pick);
+            if (snapped && lg && fed.size() < 64) {
+                fed.push_back(pick);
+                after.emplace_back(lg, lg + V);
+            }
         }
         const auto st = eng.stats();
         if (st.tokens > 0)
@@ -332,6 +345,35 @@ int main(int argc, char** argv) {
                          st.ms_total / st.tokens, st.ms_lane / st.tokens, (double) st.lane_layers / st.tokens,
                          st.ms_helper / st.tokens, (double) st.helper_layers / st.tokens, st.ms_update / st.tokens,
                          (st.ms_total - st.ms_lane - st.ms_helper - st.ms_update) / st.tokens);
+        if (restore_check) {
+            // Back to the prompt's end, the same tokens fed again: each step's logits against the first pass's.  The
+            // same bits when the same experts sit in VRAM both times (NEM_CACHE_SWAPS=0, no helper card); otherwise
+            // they differ as any change of the experts' places makes them differ.
+            if (!snapped || !eng.restore()) {
+                std::fprintf(stderr, "maya-nem: --restore-check: no snapshot (NEM_SNAPSHOT=1 keeps its room)\n");
+                return 1;
+            }
+            size_t same_top = 0;
+            double worst = 0.0;
+            bool ok = true;
+            for (size_t i = 0; i < fed.size() && ok; ++i) {
+                const float* l2 = eng.step(fed[i]);
+                ok = l2 != nullptr;
+                if (!ok) break;
+                const std::vector<float>& l1 = after[i];
+                same_top += argmax(l1.data(), V) == argmax(l2, V);
+                for (int v = 0; v < V; ++v)
+                    if (std::isfinite(l1[(size_t) v]) && std::isfinite(l2[v]))
+                        worst = std::max(worst, (double) std::fabs(l1[(size_t) v] - l2[v]));
+            }
+            std::fprintf(stderr,
+                         "maya-nem: --restore-check: %zu tokens fed again from the prompt's end: the top token the "
+                         "same at %zu, the logits' largest difference %.6g%s\n",
+                         fed.size(), same_top, worst, ok ? "" : " (a step failed)");
+            std::printf("RESTORE %zu %zu %.6g\n", fed.size(), same_top, worst);
+            std::fflush(stdout);
+            if (!ok) return 1;
+        }
         eng.save_profile();
         return 0;
     }
@@ -345,6 +387,17 @@ int main(int argc, char** argv) {
     in.start();
     std::vector<int> hist;   // the tokens the state holds (prompt and generated, the last sampled one not fed)
     std::vector<float> last; // the logits after hist
+    // The state a few tokens before the last prompt's end (Engine::snapshot, NEM_SNAPSHOT=1): its tokens and the logits
+    // after them.  The template ends a prompt with `<|im_start|>assistant\n<think>\n` and writes that turn into the
+    // next prompt as `...<think></think>` + the answer (truncate_history_thinking), so the next prompt parts from this
+    // one just before its end: the snapshot is taken snap_tail tokens before it (NEM_SNAPSHOT_TAIL, 4), the tokens
+    // after it read one by one.  A request that continues the snapshot's tokens but not hist goes on from there
+    // instead of from the start.
+    std::vector<int> snap_hist;
+    std::vector<float> snap_last;
+    bool have_snap = false;
+    size_t snap_tail = 4;
+    if (const char* v = std::getenv("NEM_SNAPSHOT_TAIL")) snap_tail = (size_t) std::max(0, std::atoi(v));
     std::mt19937_64 rng(std::random_device{}());
     std::string line;
     while (in.next(line)) {
@@ -373,14 +426,23 @@ int main(int argc, char** argv) {
             else if (k == "seed") sp.seed = std::atoll(v.c_str());
         }
         if (sp.seed >= 0) rng.seed((uint64_t) sp.seed);
-        // the prompt: what continues hist is read on from there, anything else from the start
+        // the prompt: what continues hist is read on from there, what continues the snapshot's tokens from there,
+        // anything else from the start
         size_t reuse = 0;
         if (ids.size() > hist.size() && std::equal(hist.begin(), hist.end(), ids.begin())) reuse = hist.size();
         else if (ids.size() == hist.size() && ids == hist && !last.empty()) reuse = hist.size();
+        else if (have_snap && !snap_hist.empty() && ids.size() >= snap_hist.size() &&
+                 std::equal(snap_hist.begin(), snap_hist.end(), ids.begin()) &&
+                 (ids.size() > snap_hist.size() || !snap_last.empty()) && eng.restore()) {
+            hist = snap_hist;
+            last = snap_last;
+            reuse = hist.size();
+        }
         if (reuse < hist.size() || (reuse == 0 && !hist.empty())) {
             eng.reset();
             hist.clear();
             last.clear();
+            have_snap = false;   // (reset() drops the engine's snapshot)
             reuse = 0;
         }
         if ((int) ids.size() >= eng.max_ctx()) {
@@ -392,17 +454,33 @@ int main(int argc, char** argv) {
         const double p0 = now_ms();
         const float* lg = last.empty() ? nullptr : last.data();
         const size_t todo = ids.size() - reuse;
+        // (the snapshot's place: snap_tail tokens before the prompt's end, when it has more new tokens than that)
+        const size_t tail = eng.can_snapshot() && todo > snap_tail ? snap_tail : 0;
+        const size_t body = todo - tail;
         // the prompt's new tokens in pieces of nearly equal size, at most a chunk each (STOP is looked at between them)
-        const size_t pieces = (todo + (size_t) opt.chunk - 1) / (size_t) opt.chunk;
-        const size_t per = pieces ? (todo + pieces - 1) / pieces : 0;
-        for (size_t i = 0; i < todo; i += per) {
-            const size_t m = std::min(per, todo - i);
+        const size_t pieces = (body + (size_t) opt.chunk - 1) / (size_t) opt.chunk;
+        const size_t per = pieces ? (body + pieces - 1) / pieces : 0;
+        for (size_t i = 0; i < body; i += per) {
+            const size_t m = std::min(per, body - i);
             lg = eng.prefill(ids.data() + reuse + i, (int) m);
             hist.insert(hist.end(), ids.begin() + (long) (reuse + i), ids.begin() + (long) (reuse + i + m));
             const double ms = now_ms() - p0;
             std::printf("PP %zu %zu %.0f %.1f %zu\n", i + m, todo, ms, (i + m) * 1000.0 / std::max(ms, 1.0), reuse);
             std::fflush(stdout);
             if (!lg || in.stop.load()) break;
+        }
+        // all but the prompt's last tokens read: the state kept there, then those tokens (a few: the token path)
+        if (tail && lg && hist.size() == reuse + body && !in.stop.load()) {
+            if (eng.snapshot()) {
+                snap_hist = hist;
+                snap_last.assign(lg, lg + V);
+                have_snap = true;
+            }
+            lg = eng.prefill(ids.data() + reuse + body, (int) tail);
+            hist.insert(hist.end(), ids.begin() + (long) (reuse + body), ids.end());
+            const double ms = now_ms() - p0;
+            std::printf("PP %zu %zu %.0f %.1f %zu\n", todo, todo, ms, todo * 1000.0 / std::max(ms, 1.0), reuse);
+            std::fflush(stdout);
         }
         const double p1 = now_ms();
         int generated = 0;

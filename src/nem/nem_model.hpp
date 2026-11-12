@@ -61,6 +61,15 @@ public:
     /// logits after the last one (as step()), pos + n.  nullptr when they do not fit before max_ctx().  progress (when
     /// set) is called as the chunks go, with the tokens read so far.
     const float* prefill(const int* ids, int n, void (*progress)(void*, int) = nullptr, void* ctx = nullptr);
+    /// The Mamba-2 layers' states at pos() (each one's convolution inputs and its scan's state) copied aside in VRAM
+    /// (173 MB); restore() puts them back and the position with it.  The attention layers' K / V need nothing: a row is
+    /// only ever written at the position, so the rows below it are as they were.  The Mamba-2 state cannot go back
+    /// otherwise, so a conversation's next turn that does not continue the tokens so far - every new user message,
+    /// since the template drops the last answer's thinking - then goes on from the snapshot instead of from the start
+    /// (maya-ling's, src/ling).  false: no room was kept for it (NEM_SNAPSHOT=1 keeps it) or nothing taken yet.
+    bool snapshot();
+    bool restore();
+    bool can_snapshot() const;
 
     struct Stats {
         double ms_total = 0, ms_cpu = 0;   // step()'s time, and the CPU lane's part of it
