@@ -94,6 +94,44 @@ helper with an extra argument, and the JSON parser refuses the valid `1e400`. Th
 10 s limit, and the SAT solver ran past its 90 s. Both did the same in two more runs, and the engine uses no CPU
 between requests. Flash-Next on Strata scores 22 in 51 minutes, Qwen3.8-27B 20 in 130.
 
+### Two cards: an RTX 3090 as the helper card (2026-11-11)
+
+The RTX 5090 (PCIe 5.0 x8) with an RTX 3090 (PCIe 4.0 x8, limited to 320 W) as `--helper-gpu` (branch
+`inkling-2gpu`), UD-Q4_K_XL, 128K context. `ab.py` through Maya's server, every run from the same expert profile
+(`test-results\2026-11-11-two-gpu\fork-2gpu.ps1`); the one-card column is the same build without the helper. One run
+each, and single runs move: two earlier two-card runs with the swaps still on the token's thread wrote 35.5 and 35.4
+tok/s on new prompts, 25.4 and 28.2 after the long prompt, and 43.5 and 44.0 on the repeated prompt's third time.
+
+| | The 5090 alone | With the helper card |
+|---|---|---|
+| Writing, new prompts | 29.6 tok/s | **36.6 tok/s** |
+| Writing after the 31.8K prompt | 27.0 tok/s | 28.0 tok/s |
+| Reading that prompt | 788 tok/s (first token 40.7 s) | 735 tok/s (45.3 s) |
+| A repeated prompt, 1st and 3rd time | 31.4, 37.5 tok/s | 40.3, **47.5 tok/s** |
+| First token, short prompts | 1.93 s | 1.50 s |
+
+- **The same answers.** Fed llama.cpp's own tokens (`fork-ref.py ink` there: `ink-ref.py compare` with this build),
+  the top token is llama.cpp's at 86 of 88 positions (23/24, 24/24, 23/24, 16/16; one card: 87 of 88). Both misses
+  are near ties between the same two tokens (llama.cpp's -0.57 against -0.90, and -0.65 against -0.78), and
+  llama.cpp's tokens' log-probabilities differ by at most 0.33, as on one card: the helper's sum joins the CPU lane's
+  in another order. The chat checks pass 6 of 6 and `derail.py` finds 0 of 20 derailed (295 s).
+- **What it buys.** The helper holds 1,527 experts (23.4 GB) beside the main card's 1,601, of 10,240. On one 600-token
+  answer 83.8% of a token's routed experts were then in VRAM instead of 69.8%, and the CPU lane ran in 22.6 of the 40
+  MoE layers a token instead of 30.7: 36.0 tok/s against 27.1.
+- **Where a token's 27.8 ms goes there:** the CPU lane 17.0 ms (it is bound by the RAM: ~0.3 ms for each 15 MB
+  expert), the wait for the helper after it 2.5, and 8.3 ms for the main card's own layers and syncs.
+- **Right after a long prompt it gains little** (28.0 against 27.0 through the server; 22.6 against 19.3 on a direct
+  400-token run with thinking on). The prompt's counts fill both caches with what the prompt used, few swaps follow
+  for some hundred tokens (as on one card, above), and 71% of the experts are in VRAM instead of 49%. The helper's
+  refill after a long prompt copies all its slots again: 4.6 s more before the first token.
+- **The swaps had to leave the token's thread.** A 15 MB expert from the mapping takes ~0.8 ms to copy, and the tier
+  below the main card's experts changes all the time: at 4 swaps every 2 tokens the helper spent 2.3 to 2.6 ms of
+  every token copying (16 every 2 tokens: 3.7 ms and no more hits). A thread of its own copies them now (0.04 ms a
+  token left), though the CPU lane then shares the RAM with it and takes ~1.3 ms longer: 31.4 against 30.6 tok/s on
+  one 300-token answer. Asking more of a swap (`INK_HELPER_BIAS` 0.5 / 2 / 4 / 8: 35.4 / 36.0 / 34.6 / 34.2 tok/s
+  on the 600-token answer) is within what single runs move; 2 is the default.
+- Both cards stayed cool through these runs: 67 and 50 degrees C at most, 158 and 79 W on average while working.
+
 ## The engine
 
 - **The token path** (`Engine::step`): everything but the routed experts on the GPU, int8-activation GEMVs from
@@ -138,6 +176,27 @@ between requests. Flash-Next on Strata scores 22 in 51 minutes, Qwen3.8-27B 20 i
   replays it, predicting 137.5 experts a token on the CPU where the engine measured 137.7): the first version's
   (decay 0.998, 4 swaps every 8 tokens) left the cache on what the last few hundred tokens had used, where what the
   last few dozen use predicts the next ones better.
+- **The helper card** (`--helper-gpu N`, `--helper-gb G`; maya-nem's, branch `nemotron-2gpu`): a second card that
+  holds routed experts only, in a cache of its own (slots by size as the main cache's; its free VRAM less
+  `INK_HELPER_RESERVE_MIB`, 1024), filled with the best-scored experts the main card does not hold. A token's chosen
+  experts are then split three ways: the main card's, the helper's and the CPU lane's. The helper gets the layer's
+  input from the host (it is there after the layer's sync), runs the same gate / up, SwiGLU and down launches on its
+  own stream while the main card and the CPU lane do theirs, and returns its sum to the host, which adds it to the
+  CPU lane's before the main card's next graph reads both. No state of the model lives there, so the prompt path,
+  `reset()` and the graphs are as before, and without `--helper-gpu` the engine runs as it did.
+  - The main cache decides first and leaves the helper's experts alone: its swaps take only experts on neither card
+    (`INK_HELPER_STEAL=1`: the helper's too).
+  - The helper follows: every 2 tokens (`INK_HELPER_EVERY`) up to 4 swaps (`INK_HELPER_SWAPS`), an expert the main
+    card took dropped, and one from outside both taken in place of its worst when it scores more than the main
+    cache's margin times that one's + 2 (`INK_HELPER_MARGIN`, `INK_HELPER_BIAS`). A thread of its own copies them on a
+    second stream while the next tokens are written, and an expert is used from the first update after its copy
+    (`INK_HELPER_BG=0`: copied at the swap, on the token's thread). At the start and after a prompt the fill is
+    copied at once: after a prompt up to an eighth of its tokens (64 .. 4,096, `INK_HELPER_FILL`).
+  - Maya's server adds `--layer-split auto` when a config's `"gpu"` names two cards; this engine reads that as
+    `--helper-gpu 1` (the second visible card), so `"gpu": [0, 1]` in the run config is all it takes
+    (`INK_HELPER_GPU=-1` in its `env`: off).
+  - The kernels launched there (ds4_iq's GEMVs, ink's q8 / SwiGLU / row sums) keep no device state, so they run on
+    whichever device is current; the build needs both cards' architectures (`-DCMAKE_CUDA_ARCHITECTURES=86;120`).
 
 ## The server
 
