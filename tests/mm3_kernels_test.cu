@@ -1,7 +1,8 @@
 // tests/mm3_kernels_test.cu - maya-mm3's MSA, candidate and sampling kernels on one GPU against references:
 //   block_scores / select_blocks vs a CPU reference (the same bits), a NaN query's kept list (no crash);
 //   sparse_attn split 16 ways vs one block vs an F64 reference, and INT8 K / V with and without the rotation vs BF16;
-//   topk_rows vs host_cands (the same lists); markov_sample's distribution and draw; wait_pull.
+//   topk_rows vs host_cands (the same lists); markov_sample's distribution and draw; wait_pull; project_out (--ablate)
+//   vs an F64 reference.
 //     nvcc -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_120,code=sm_120 -Isrc/mm3 \
 //          tests/mm3_kernels_test.cu src/mm3/mm3_kernels.cu -o build/mm3_kernels_test && build/mm3_kernels_test
 #include <cmath>
@@ -487,6 +488,77 @@ int main() {
         bool same = true;
         for (int i = 0; i < 16 * 6144; ++i) same &= h[(size_t) i] == (float) i;
         check(waited && same, "waits for the counter, then the rows are the host's");
+    }
+    std::printf("project_out (--ablate)\n");
+    for (int D : {8, 1000, 6144})   // (one block's lanes, a partial last pass, the model's width)
+        for (int T : {1, 3, 64})
+            for (float s : {1.0f, 1.5f}) {
+                std::vector<float> r((size_t) D), y((size_t) T * D);
+                double nn = 0.0;
+                for (float& v : r) {
+                    v = nd(rng);
+                    nn += (double) v * v;
+                }
+                for (float& v : r) v = (float) (v / std::sqrt(nn));
+                for (float& v : y) v = nd(rng);
+                float* rd = dev(r);
+                float* yd = dev(y);
+                k::project_out(yd, rd, s, T, D, 0);
+                cudaDeviceSynchronize();
+                const auto got = host(yd, y.size());
+                double worst = 0.0, along = 0.0;
+                for (int t = 0; t < T; ++t) {
+                    double dot = 0.0, dot2 = 0.0;
+                    for (int e = 0; e < D; ++e) dot += (double) r[(size_t) e] * y[(size_t) t * D + e];
+                    for (int e = 0; e < D; ++e) {
+                        const double want = y[(size_t) t * D + e] - s * dot * r[(size_t) e];
+                        worst = std::max(worst, std::fabs(got[(size_t) t * D + e] - want));
+                        dot2 += (double) r[(size_t) e] * got[(size_t) t * D + e];
+                    }
+                    along = std::max(along, std::fabs(dot2 - (1.0 - s) * dot));   // (s 1: none left; above 1: -0.5 r.y)
+                }
+                char buf[96];
+                std::snprintf(buf, sizeof buf, "D %d, T %d, scale %.1f: within 1e-4 of F64, r.y' = (1 - s) r.y", D, T, s);
+                check(cudaGetLastError() == cudaSuccess && worst < 1e-4 && along < 1e-3, buf);
+                cudaFree(rd);
+                cudaFree(yd);
+            }
+    // the per-request switch (GEN ablate=0|1): a multi step's rows projected a run of one setting at a time - each
+    // projected row the same bits as in one launch of all the rows (the startup flag's), each other row untouched
+    std::printf("project_out by runs of rows (the per-request switch)\n");
+    for (int D : {1000, 6144}) {
+        const int T = 7;
+        const bool on[T] = {true, false, false, true, true, false, true};
+        std::vector<float> r((size_t) D), y((size_t) T * D);
+        double nn = 0.0;
+        for (float& v : r) {
+            v = nd(rng);
+            nn += (double) v * v;
+        }
+        for (float& v : r) v = (float) (v / std::sqrt(nn));
+        for (float& v : y) v = nd(rng);
+        float* rd = dev(r);
+        float* all = dev(y);
+        float* runs = dev(y);
+        k::project_out(all, rd, 1.0f, T, D, 0);
+        for (int t = 0; t < T;) {   // (mm3_model.cu's ablate(): runs of rows of one setting)
+            int u = t + 1;
+            while (u < T && on[u] == on[t]) ++u;
+            if (on[t]) k::project_out(runs + (size_t) t * D, rd, 1.0f, u - t, D, 0);
+            t = u;
+        }
+        cudaDeviceSynchronize();
+        const auto a = host(all, y.size()), b = host(runs, y.size());
+        bool exact = true;
+        for (int t = 0; t < T; ++t)
+            exact = exact && std::memcmp(b.data() + (size_t) t * D, (on[t] ? a.data() : y.data()) + (size_t) t * D,
+                                         (size_t) D * sizeof(float)) == 0;
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "D %d: rows on = one launch's bits, rows off untouched", D);
+        check(cudaGetLastError() == cudaSuccess && exact, buf);
+        cudaFree(rd);
+        cudaFree(all);
+        cudaFree(runs);
     }
     std::printf("%s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
