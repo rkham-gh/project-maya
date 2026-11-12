@@ -137,6 +137,12 @@ public:
         int64_t pool_slots = 0, pool_used = 0, ram_slots = 0, ram_used = 0;
         double pool_gb = 0, ram_gb = 0;
         double all_gb = 0;   // every routed expert of this model, in GB (the Monitor's SSD-only share is what VRAM and RAM do not hold)
+        // the expert helper (MAYA_GLM_EXPERT_HELPER): the experts it held and computed, the routes it took part in,
+        // the host's time in those routes (the CPU lane's share of them included), the time waiting for it beside the
+        // CPU lane (MAYA_GLM_HELPER_OVERLAP), its swaps and the boundaries' time spent choosing and copying them
+        int64_t helper_held = 0;
+        uint64_t helper_experts = 0, helper_routes = 0, helper_swaps = 0;
+        double helper_ms = 0, helper_wait_ms = 0, helper_adapt_ms = 0;
     };
     FastStats fast_stats() const;
     /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total
@@ -693,6 +699,10 @@ public:
     // a batched verify window's layer on both window lanes, each distinct expert read once (glm_fast_path.cu)
     void win_cpu_merged(int il, int nb, const strata::kernels::glmf::MoeRequest* const* rq,
                         strata::kernels::glmf::CpuAnswer* const* ans, const unsigned int* seq);
+    // MAYA_GLM_HELPER_ROWS: a batched verify window's layer with the expert helper - one helper call for every row,
+    // the CPU lane's experts row by row beside it, then each row's answer (glm_fast_path.cu)
+    void fast_helper_rows(int nb, const strata::kernels::glmf::MoeRequest* const* rq,
+                          strata::kernels::glmf::CpuAnswer* const* ans, const unsigned int* seq);
     // ---- the NextN (MTP) draft block (the last half carries it; layer index n_layers)
     int mtp_il_ = -1;                                      // its layer index here, -1: not on this half
     int mtp_src_ = -1;                                     // the shard of MAYA_GLM_MTP_GGUF's block, -1: the model's

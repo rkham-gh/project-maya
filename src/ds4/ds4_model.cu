@@ -14844,6 +14844,19 @@ struct Model::Impl {
             ok = ok && cudaGetLastError() == cudaSuccess && gg::launch_errors() == e0 && x3::launch_errors() == ex0;
             if (ok) signal_seq(helper_flags + kRing + slot, sq, helper_st);
             ok = ok && cudaGetLastError() == cudaSuccess;
+#ifdef _WIN32
+            // Windows' driver (WDDM) can hold queued launches until the host waits on the GPU or asks about it, and
+            // nothing waits here: the service thread watches the flag in mapped memory.  The query submits this
+            // layer's launches (helper_take's poll first) without waiting.  MAYA_DS4_HELPER_FLUSH=0: not (A/B)
+            static const bool flush = [] {
+                const char* v = ds4_env("DS4_HELPER_FLUSH");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            if (ok && flush) {
+                (void) cudaStreamQuery(helper_st);
+                (void) cudaGetLastError();   // (a busy stream's cudaErrorNotReady is no error)
+            }
+#endif
         }
         cudaSetDevice(cur);
         if (ok) return;

@@ -31,6 +31,13 @@ public:
     bool reserve(int keys, size_t requested_bytes, std::string& err);
     bool insert(int key, const uint8_t* host, size_t bytes, size_t stride, std::string& err);
     bool replace(int out, int in, const uint8_t* host, std::string& err);
+    /// replace() without waiting (a discrete helper; MAYA_GLM_HELPER_BG): the ownership changes at once, the copy runs
+    /// on a stream of its own, and a call that uses the new expert waits for its copy on the device (an event of its
+    /// slot).  host must stay as it is until copies_done(): the caller's next boundary, before its tiers change.
+    bool replace_async(int out, int in, const uint8_t* host, std::string& err);
+    /// every replace_async copy landed (a synchronize, when one is pending) and its slot's event released
+    bool copies_done(std::string& err);
+    bool copies_pending() const { return !copy_keys_.empty(); }
     struct Swap { uint32_t gain; int in, out; };
     std::vector<Swap> swaps(const std::vector<uint32_t>& usage, const std::vector<int>& primary,
                             int experts_per_layer, int max_swaps) const;
@@ -64,6 +71,14 @@ public:
                       const int* keys, const float* weights, const float* x,
                       float* out, std::string& err);
     bool wait(std::string& err);
+    /// enqueue for several tokens at once (a verify window's rows of one layer: MAYA_GLM_HELPER_ROWS, native GGUF
+    /// experts): row r's ne[r] experts (0: none) from keys / weights [r * 8 + i] on input x[r].  One copy up for all
+    /// the inputs and plans, one quantization, each row's experts as enqueue's, one copy back; wait() finishes it and
+    /// row r's sum is then at rows_out(r) (garbage for a row of no experts).  Every row's sum is enqueue's for it alone.
+    static constexpr int kRowsMax = 16;
+    bool enqueue_rows(int gu_type, int d_type, size_t down_off, float limit, int rows, const int* ne,
+                      const int* keys, const float* weights, const float* const* x, std::string& err);
+    const float* rows_out(int r) const { return rows_out_h_ + (size_t) r * (size_t) n_embd_; }
     bool pending() const { return pending_.load(std::memory_order_acquire); }
     /// the last waited call's GPU time (its stages' events, ms) with MAYA_GLM_PROF, else -1
     double last_gpu_ms() const { return last_gpu_ms_; }
@@ -87,9 +102,26 @@ private:
     double last_gpu_ms_ = -1.0;
     struct Region { const uint8_t* host; uint8_t* mapped; size_t bytes; };
     std::vector<Region> regions_;
-    struct Slot { uint8_t* host = nullptr; uint8_t* device = nullptr; size_t bytes = 0; };
+    // ready: replace_async's copy into the slot, until copies_done (a call that reads the slot waits for it)
+    struct Slot { uint8_t* host = nullptr; uint8_t* device = nullptr; size_t bytes = 0; cudaEvent_t ready = nullptr; };
     std::vector<Slot> slots_;
     std::vector<uint8_t> owned_;
+    // replace_async: the copies' stream and events (one a copy, reused once copies_done has run), and the keys whose
+    // slot holds one of them
+    cudaStream_t copy_stream_ = nullptr;
+    std::vector<cudaEvent_t> copy_ev_;
+    std::vector<int> copy_keys_;
+    // enqueue_rows: kRowsMax rows of inputs, their q8_1 rows, plans and sums on the device; the inputs, the plans
+    // ([ptr x 8 | w x 8] a row) and the sums in pinned host memory
+    float *rows_x_ = nullptr, *rows_out_ = nullptr;
+    void* rows_xq_ = nullptr;
+    unsigned long long* rows_ptr_ = nullptr;
+    float* rows_w_ = nullptr;
+    float *rows_x_h_ = nullptr, *rows_out_h_ = nullptr;
+    unsigned long long* rows_ptr_h_ = nullptr;
+    float* rows_w_h_ = nullptr;
+    uint8_t* rows_host_ = nullptr;   // (one pinned block: rows_x_h_, rows_out_h_, rows_ptr_h_, rows_w_h_)
+    uint8_t* rows_arena_ = nullptr;  // (one device block: rows_x_, rows_out_, rows_xq_, rows_ptr_, rows_w_)
     bool integrated_ = false;
     uint8_t* pool_ = nullptr;
     size_t capacity_ = 0, used_ = 0;

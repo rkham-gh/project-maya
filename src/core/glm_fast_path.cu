@@ -2336,6 +2336,7 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         if (F->helper.integrated()) R.st[(size_t) rs] = FastState::kRHelper;
         ++resident;
     }
+    F->helper_held = resident;
     if (!glmfast::cuda_ok(cudaMalloc((void**) &F->helper_owned_d, (size_t) F->n_keys), "GLM helper ownership", err) ||
         !glmfast::cuda_ok(cudaMemcpy(F->helper_owned_d, F->helper.owners().data(), (size_t) F->n_keys,
                                     cudaMemcpyHostToDevice), "GLM helper ownership upload", err)) return false;
@@ -2561,6 +2562,26 @@ bool Glm5Model::fast_helper_check(std::string& err) {
 bool Glm5Model::fast_helper_adapt(std::string& err) {
     FastState* F = fast_;
     if (F->helper.device() < 0 || F->bg_hold) return true;
+    // MAYA_GLM_HELPER_SWAPS=<n> (8; 0 = the start's experts stay) swaps at most, every MAYA_GLM_HELPER_EVERY=<n> (1)
+    // boundaries: the scan below reads every key's count, and each swap's copy waits on this thread
+    static const int max_swaps = [] {
+        const char* v = getenv("MAYA_GLM_HELPER_SWAPS");
+        return v != nullptr ? std::max(0, std::min(256, std::atoi(v))) : 8;
+    }();
+    static const int every = [] {
+        const char* v = getenv("MAYA_GLM_HELPER_EVERY");
+        return v != nullptr ? std::max(1, std::atoi(v)) : 1;
+    }();
+    if (max_swaps == 0 || ++F->helper_bounds % (uint64_t) every != 0) return true;
+    const auto adapt_t0 = std::chrono::steady_clock::now();
+    struct AdaptTime {   // (every way out of the scan counts its time)
+        FastState* F;
+        std::chrono::steady_clock::time_point t0;
+        ~AdaptTime() {
+            F->helper_adapt_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+        }
+    } adapt_time{F, adapt_t0};
     auto primary = F->slot_of;
     for (const auto& m : F->bg) if (m.up) primary[(size_t) m.key] = m.vslot;
     // A pending RAM read/copy is not a candidate until it lands.
@@ -2570,14 +2591,25 @@ bool Glm5Model::fast_helper_adapt(std::string& err) {
         const auto& R = F->rc[(size_t) F->layer_rc[key / g_.n_expert]];
         if (R.st[(size_t) rs] != FastState::kRHold && R.st[(size_t) rs] != FastState::kRHelper) primary[key] = 0;
     }
-    const auto swaps = F->helper.swaps(F->cnt, primary, g_.n_expert, 8);
+    auto swaps = F->helper.swaps(F->cnt, primary, g_.n_expert, max_swaps);
+    // MAYA_GLM_HELPER_BG=1 (a discrete helper): the copies of the experts in the RAM tier go on the helper's copy
+    // stream instead of waiting here, in layer order (a call waits for its own expert's copy, and the next token
+    // reaches the low layers first); fast_boundary lands them before the RAM tier changes.  A disk-only one is read
+    // into the staging buffer and copied as before
+    static const bool bg_swaps = [] {
+        const char* v = getenv("MAYA_GLM_HELPER_BG");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    if (bg_swaps) std::sort(swaps.begin(), swaps.end(), [](const auto& a, const auto& b) { return a.in < b.in; });
     for (const auto& s : swaps) {
         const int il = s.in / g_.n_expert;
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
         const int rs = F->ram_of[(size_t) s.in];
         const uint8_t* src = rs >= 0 ? R.slot((size_t) rs) : F->stage[0];
         if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, s.in % g_.n_expert, role, F->stage[0], 0, 1);
-        if (!F->helper.replace(s.out, s.in, src, err)) return false;
+        if (!(bg_swaps && rs >= 0 && !F->helper.integrated() ? F->helper.replace_async(s.out, s.in, src, err)
+                                                               : F->helper.replace(s.out, s.in, src, err)))
+            return false;
         if (F->helper.integrated()) {
             const int dst = F->ram_of[(size_t) s.out];
             if (rs >= 0) {
@@ -4733,6 +4765,15 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
         s.miss_ms += (double) F->miss_us.load() / 1000.0;
         s.disk_ms += (double) F->disk_us.load() / 1000.0;
         s.pool_slots += F->pool_slots;
+        if (F->helper.device() >= 0) {
+            s.helper_held += F->helper_held;
+            s.helper_experts += F->helper_experts.load();
+            s.helper_routes += F->helper_routes.load();
+            s.helper_swaps += F->helper_swaps;
+            s.helper_ms += (double) F->helper_us.load() / 1000.0;
+            s.helper_wait_ms += (double) F->helper_ovl_wait_us.load() / 1000.0;
+            s.helper_adapt_ms += (double) F->helper_adapt_us.load() / 1000.0;
+        }
         s.pool_gb += (double) F->pool_bytes / 1073741824.0;
         s.ram_gb += (double) F->ram_bytes / 1073741824.0;
         s.all_gb += (double) F->all_bytes / 1073741824.0;
@@ -4789,6 +4830,79 @@ std::vector<Glm5Model::VramReport> Glm5Model::vram_report() const {
     return out;
 }
 
+// MAYA_GLM_HELPER_ROWS: a batched verify window's routes of one layer (fast_service holds them until the layer's last
+// row), answered with ONE call of the expert helper for all of them instead of one a row - their inputs and plans go
+// up together and their sums come back together (GlmExpertHelper::enqueue_rows) - while the CPU lane computes each
+// row's own experts.  Each row's answer is the per-route path's (MAYA_GLM_HELPER_OVERLAP's) bit for bit: the helper's
+// sum, the CPU lane's added once per value.  A failed helper call leaves its part out, as the per-route path does
+// (helper_failed then fails the decode).
+void Glm5Model::fast_helper_rows(int nb, const gf::MoeRequest* const* rqs, gf::CpuAnswer* const* ans,
+                                 const unsigned int* seq) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    const auto t0 = std::chrono::steady_clock::now();
+    const int E = g.n_embd;
+    int hn[kWinMax] = {}, ne[kWinMax] = {};
+    int keys[kWinMax * 8];
+    float hw[kWinMax * 8], cw[kWinMax][8];
+    const uint8_t* blob[kWinMax][8];
+    const float* xs[kWinMax];
+    int rows_h = 0, helped_n = 0;
+    for (int r = 0; r < nb; ++r) {
+        const gf::MoeRequest* rq = rqs[r];
+        const unsigned int cm = rq->cpu_mask;
+        for (int i = 0; i < g.n_exp_used; ++i)
+            if ((cm >> i) & 1u) {
+                const int key = rq->layer * g.n_expert + rq->ids[i];
+                if (F->helper.owns(key)) {
+                    keys[r * 8 + hn[r]] = key;
+                    hw[r * 8 + hn[r]++] = rq->w[i];
+                } else {
+                    blob[r][ne[r]] = (const uint8_t*) rq->cpu_src[i];
+                    cw[r][ne[r]++] = rq->w[i];
+                }
+            }
+        xs[r] = rq->x;
+        rows_h += hn[r] > 0;
+        helped_n += hn[r];
+    }
+    const auto& ly = F->L[(size_t) rqs[0]->layer];
+    bool queued = false;
+    if (rows_h > 0 && !F->helper_failed.load(std::memory_order_acquire)) {
+        queued = F->helper.enqueue_rows(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, nb, hn, keys, hw, xs,
+                                        F->helper_error);
+        if (!queued) F->helper_failed.store(true, std::memory_order_release);
+    }
+    static thread_local std::vector<float> cpu_part;
+    cpu_part.resize((size_t) kWinMax * (size_t) E);
+    for (int r = 0; r < nb; ++r) {
+        if (ne[r] == 0) continue;
+        const auto c0 = std::chrono::steady_clock::now();
+        fast_cpu_experts(rqs[r]->layer, ne[r], blob[r], cw[r], xs[r], cpu_part.data() + (size_t) r * E);
+        F->cpu_experts.fetch_add((uint64_t) ne[r], std::memory_order_relaxed);
+        F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
+        F->cpu_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - c0).count(), std::memory_order_relaxed);
+    }
+    bool helped = queued;
+    if (queued && !F->helper.wait(F->helper_error)) {
+        helped = false;
+        F->helper_failed.store(true, std::memory_order_release);
+    }
+    for (int r = 0; r < nb; ++r) {
+        float* part = ans[r]->part;
+        const float* h = helped && hn[r] > 0 ? F->helper.rows_out(r) : nullptr;
+        const float* c = ne[r] > 0 ? cpu_part.data() + (size_t) r * E : nullptr;
+        for (int j = 0; j < E; ++j) part[j] = (h != nullptr ? h[j] : 0.0f) + (c != nullptr ? c[j] : 0.0f);
+        std::atomic_thread_fence(std::memory_order_release);
+        ans[r]->seq = seq[r];
+    }
+    F->helper_experts.fetch_add((uint64_t) helped_n, std::memory_order_relaxed);
+    F->helper_routes.fetch_add((uint64_t) rows_h, std::memory_order_relaxed);
+    F->helper_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+}
+
 // ---------------------------------------------------------------- the service thread
 //
 // Consumes every route the device publishes, in order: LFU counts, the promotions the device made (an expert
@@ -4833,11 +4947,21 @@ void Glm5Model::fast_service() {
     gf::CpuAnswer* w_ans[kWinMax];
     unsigned int w_seq[kWinMax];
     int w_n = 0, w_held = 0;   // the held routes with CPU-lane experts; all the held routes
+    bool w_helper = false;     // MAYA_GLM_HELPER_ROWS: the held routes go to fast_helper_rows (not the window lanes)
     const auto win_flush = [&] {
-        if (w_n > 0) win_cpu_merged(w_rq[0]->layer, w_n, w_rq, w_ans, w_seq);
+        if (w_n > 0) {
+            if (w_helper) fast_helper_rows(w_n, w_rq, w_ans, w_seq);
+            else win_cpu_merged(w_rq[0]->layer, w_n, w_rq, w_ans, w_seq);
+        }
         F->processed.fetch_add((uint64_t) w_held, std::memory_order_release);
         w_n = w_held = 0;
     };
+    // MAYA_GLM_HELPER_ROWS=1: a batched verify window's routes held the same way when the expert helper is on, and its
+    // experts of all of them taken in one call (fast_helper_rows) - not an EXL3 pack's, nor a rows step's
+    static const bool helper_rows = [] {
+        const char* v = getenv("MAYA_GLM_HELPER_ROWS");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
     unsigned int polls = 0;
     const unsigned int ring_n = F->md.ring_n, ring_stride = F->md.ring_stride;   // (fast_setup: the ring's shape)
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
@@ -4930,10 +5054,15 @@ void Glm5Model::fast_service() {
         // (the lanes are made at the CPU lane's setup, after this thread started; an EXL3 pack's merged rows with them)
         // A batched rows step's group (MAYA_GLM_GROUP_EXPERTS, win_rows) is held the same way and merged on this part's
         // own pool - the other part works on its own group meanwhile; not with a helper GPU (it answers per route)
-        const bool held = win_merge && rq->win_n > 0 && F->cpu_ans_h != nullptr && !F->cpu_win.dn.empty() &&
-                          (!exl3_ || !F->cpu_win.x3.empty()) &&
-                          (rq->win_rows != 0 ? F->cpu_pool != nullptr && F->helper.device() < 0
-                                             : F->win_lane[0] != nullptr && F->win_lane[1] != nullptr);
+        const bool held_lanes = win_merge && rq->win_n > 0 && F->cpu_ans_h != nullptr && !F->cpu_win.dn.empty() &&
+                                (!exl3_ || !F->cpu_win.x3.empty()) &&
+                                (rq->win_rows != 0 ? F->cpu_pool != nullptr && F->helper.device() < 0
+                                                   : F->win_lane[0] != nullptr && F->win_lane[1] != nullptr);
+        // (the expert helper stops the window lanes, so with it on only MAYA_GLM_HELPER_ROWS holds a window's routes)
+        const bool held_h = !held_lanes && helper_rows && rq->win_n > 1 && rq->win_rows == 0 && !exl3_ &&
+                            F->helper.device() >= 0 && F->cpu_ans_h != nullptr;
+        const bool held = held_lanes || held_h;
+        if (held) w_helper = held_h;   // (a layer's rows all come one after another, held the same way)
         if (rq->error != 0) {
             if (held) {   // a window token's invalid route: nothing to compute, but it may be the layer's last
                 ++w_held;
@@ -5567,6 +5696,8 @@ bool Glm5Model::fast_boundary(std::string& err) {
     const Glm5Geometry& g = g_;
     while (F->processed.load(std::memory_order_acquire) < F->expected) cpu_relax();
     std::lock_guard<std::mutex> lk(F->mu);
+    // MAYA_GLM_HELPER_BG: the last boundary's helper copies land before anything below changes the RAM tier they read
+    if (F->helper.copies_pending() && !F->helper.copies_done(err)) return false;
     int nu = 0;
     bool ok = true;
     const auto flush = [&] {

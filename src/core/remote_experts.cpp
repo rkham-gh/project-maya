@@ -129,10 +129,34 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
     plan_.plan_w = (float*) take(8 * sizeof(float));
     plan_.cpu_flag = (int*) take(64);
     if (!check(cudaMemset(plan_.cpu_flag, 0, 64), "helper flags", err, device)) return false;
+    // MAYA_GLM_HELPER_ROWS: enqueue_rows' buffers, before reserve() measures the free VRAM (~0.6 MB on the device for
+    // kRowsMax rows of 4096, as much pinned)
+    if (const char* rv = std::getenv("MAYA_GLM_HELPER_ROWS"); rv != nullptr && std::atoi(rv) != 0) {
+        const auto al = [](size_t b) { return (b + 255u) & ~(size_t) 255u; };
+        const size_t xb = al((size_t) kRowsMax * (size_t) n_embd * sizeof(float));
+        const size_t qb = al((size_t) kRowsMax * (size_t) (n_embd / 32) * 36);
+        const size_t pb = al((size_t) kRowsMax * 8 * sizeof(unsigned long long)), wb = al((size_t) kRowsMax * 8 * sizeof(float));
+        void* h = nullptr;
+        if (!check(cudaMalloc((void**) &rows_arena_, 2 * xb + qb + pb + wb), "helper rows", err, device) ||
+            !check(cudaHostAlloc(&h, 2 * xb + pb + wb, cudaHostAllocPortable), "helper rows staging", err, device))
+            return false;
+        rows_x_ = (float*) rows_arena_;
+        rows_out_ = (float*) (rows_arena_ + xb);
+        rows_xq_ = rows_arena_ + 2 * xb;
+        rows_ptr_ = (unsigned long long*) (rows_arena_ + 2 * xb + qb);
+        rows_w_ = (float*) (rows_arena_ + 2 * xb + qb + pb);
+        rows_host_ = (uint8_t*) h;
+        rows_x_h_ = (float*) rows_host_;
+        rows_out_h_ = (float*) (rows_host_ + xb);
+        rows_ptr_h_ = (unsigned long long*) (rows_host_ + 2 * xb);
+        rows_w_h_ = (float*) (rows_host_ + 2 * xb + pb);
+    }
     // zero-copy on an integrated helper (the Qwen helper's MAYA_REMOTE_ZEROCOPY pattern): its device reads the host's
-    // memory as its own, so the input, the plan and the result stay in one mapped pinned block
+    // memory as its own, so the input, the plan and the result stay in one mapped pinned block.  A discrete helper
+    // copies unless MAYA_GLM_HELPER_ZEROCOPY=1: its kernels then read the input (16 KB) and the plan over PCIe once and
+    // write the result there (one store a value: moe_down's combine) - three copies and their calls fewer a route
     const char* zc = std::getenv("MAYA_GLM_HELPER_ZEROCOPY");
-    if (integrated_ && !(zc != nullptr && zc[0] == '0')) {
+    if (integrated_ ? !(zc != nullptr && zc[0] == '0') : (zc != nullptr && zc[0] == '1')) {
         const size_t xb = (size_t) n_embd * sizeof(float);
         void* block = nullptr;
         if (!check(cudaHostAlloc(&block, 2 * xb + 8 * sizeof(unsigned long long) + 8 * sizeof(float),
@@ -228,6 +252,10 @@ bool GlmExpertHelper::replace(int out, int in, const uint8_t* host, std::string&
     else {
         DeviceScope scope(device_);
         if (!scope.ok) { err = scope.error(device_); return false; }
+        // (a replace_async copy into this slot not known to have landed: this one lands after it)
+        if (s.ready != nullptr && !check(cudaStreamWaitEvent(stream_, s.ready, 0), "cache replace order", err, device_))
+            return false;
+        s.ready = nullptr;
         if (!check(cudaMemcpyAsync(s.device, host, s.bytes, cudaMemcpyHostToDevice, stream_), "cache replace", err, device_))
             return false;
         claim.idle = false;
@@ -240,6 +268,60 @@ bool GlmExpertHelper::replace(int out, int in, const uint8_t* host, std::string&
     owned_[(size_t) out] = 0;
     owned_[(size_t) in] = 1;
     return true;
+}
+
+// MAYA_GLM_HELPER_BG: the copy on copy_stream_, not waited for here.  The ownership changes at once (no call reads the
+// slot until the next route, and the caller uploads the device's copy of the ownership before it); the slot's event
+// makes a call that reads it wait for the copy on the device (start).  copies_done at the caller's next boundary
+// synchronizes the copies before the host tier that `host` lies in may change, and frees the events for reuse.
+bool GlmExpertHelper::replace_async(int out, int in, const uint8_t* host, std::string& err) {
+    if (integrated_) return replace(out, in, host, err);   // (an integrated helper exchanges ownership, not bytes)
+    bool free_now = false;
+    if (!pending_.compare_exchange_strong(free_now, true, std::memory_order_acq_rel)) {
+        err = "GLM expert helper: cache replacement while a call is pending"; return false;
+    }
+    Claim claim{pending_};   // (released on the way out: the copy's stream is not the calls' stream)
+    if (out < 0 || (size_t) out >= slots_.size() || in < 0 || (size_t) in >= slots_.size() || !owns(out) || owns(in)) {
+        err = "GLM expert helper: invalid cache replacement"; return false;
+    }
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    if (copy_stream_ == nullptr &&
+        !check(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking), "helper copy stream", err, device_))
+        return false;
+    if (copy_keys_.size() == copy_ev_.size()) {
+        cudaEvent_t e = nullptr;
+        if (!check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "helper copy event", err, device_)) return false;
+        copy_ev_.push_back(e);
+    }
+    Slot s = slots_[(size_t) out];   // (a copy pending into it already: the same stream, so this one lands after it)
+    if (!check(cudaMemcpyAsync(s.device, host, s.bytes, cudaMemcpyHostToDevice, copy_stream_), "cache replace (async)",
+               err, device_))
+        return false;   // (nothing queued: the helper is as it was)
+    cudaEvent_t ev = copy_ev_[copy_keys_.size()];
+    const bool recorded = check(cudaEventRecord(ev, copy_stream_), "cache replace event", err, device_);
+    if (!recorded) {
+        // the copy is queued and nothing can wait for it: wait here, then the slot is in's as below (err stays set)
+        std::string e2;
+        check(cudaStreamSynchronize(copy_stream_), "cache replace (async) finish", e2, device_);
+    }
+    s.ready = recorded ? ev : nullptr;
+    slots_[(size_t) in] = s;
+    slots_[(size_t) out] = {};
+    owned_[(size_t) out] = 0;
+    owned_[(size_t) in] = 1;
+    if (recorded) copy_keys_.push_back(in);
+    return recorded;
+}
+
+bool GlmExpertHelper::copies_done(std::string& err) {
+    if (copy_keys_.empty()) return true;
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    const cudaError_t done = cudaStreamSynchronize(copy_stream_);
+    for (int key : copy_keys_) slots_[(size_t) key].ready = nullptr;   // (a slot swapped out since: empty, harmless)
+    copy_keys_.clear();
+    return check(done, "cache replace (async) finish", err, device_);
 }
 
 // PR #578: complement the primary cache, replacing a cold helper expert only
@@ -295,6 +377,88 @@ bool GlmExpertHelper::enqueue_exl3(const strata::kernels::exl3::ExpertLayout& la
 
 bool GlmExpertHelper::wait(std::string& err) { return finish(err, true); }
 
+// MAYA_GLM_HELPER_ROWS: a verify window's rows in one call - the inputs and plans up in one copy each, one quantization
+// of every row, row r's experts by enqueue's kernels (gate/up, down into its own row of the sums; hq_ is reused row
+// after row on the one stream), the sums back in one copy.  The same claim on pending_ as enqueue's, wait() ends it.
+bool GlmExpertHelper::enqueue_rows(int gu_type, int d_type, size_t down_off, float limit, int rows, const int* ne,
+                                   const int* keys, const float* weights, const float* const* x, std::string& err) {
+    namespace gf = strata::kernels::glmf;
+    bool free_now = false;
+    if (!pending_.compare_exchange_strong(free_now, true, std::memory_order_acq_rel)) {
+        err = "GLM expert helper: a call before this one was not waited for, or a cache replacement runs";
+        return false;
+    }
+    Claim claim{pending_};
+    if (device_ < 0 || rows_arena_ == nullptr || rows < 1 || rows > kRowsMax || !gf::moe_supported(gu_type) ||
+        !gf::moe_supported(d_type)) {
+        err = "GLM expert helper: a rows call it cannot take (MAYA_GLM_HELPER_ROWS at its start, up to " +
+              std::to_string(kRowsMax) + " rows of native GGUF experts)";
+        return false;
+    }
+    const size_t E = (size_t) n_embd_;
+    size_t bytes = 0;
+    int total = 0;
+    for (int r = 0; r < rows; ++r) {
+        if (ne[r] < 0 || ne[r] > 8) {
+            err = "GLM expert helper: unsupported route width";
+            return false;
+        }
+        for (int i = 0; i < 8; ++i) {
+            const int key = i < ne[r] ? keys[r * 8 + i] : -1;
+            if (i < ne[r] && (key < 0 || (size_t) key >= slots_.size() || !owns(key))) {
+                err = "GLM expert helper: expert not owned by helper";
+                return false;
+            }
+            rows_ptr_h_[r * 8 + i] = i < ne[r] ? (unsigned long long) slots_[(size_t) key].device : 0ull;
+            rows_w_h_[r * 8 + i] = i < ne[r] ? weights[r * 8 + i] : 0.0f;
+            if (i < ne[r]) bytes += slots_[(size_t) key].bytes;
+        }
+        std::memcpy(rows_x_h_ + (size_t) r * E, x[r], E * sizeof(float));
+        total += ne[r];
+    }
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto failed = [&] {   // (err is set)
+        claim.idle = cudaStreamSynchronize(stream_) == cudaSuccess;
+        return false;
+    };
+    const auto mark = [&](int k) { return !prof_ || check(cudaEventRecord(ev_[k], stream_), "helper profile event", err, device_); };
+    if (!mark(0)) return failed();
+    for (int r = 0; r < rows; ++r)   // (replace_async's copies of these experts first)
+        for (int i = 0; i < ne[r]; ++i)
+            if (cudaEvent_t ready = slots_[(size_t) keys[r * 8 + i]].ready)
+                if (!check(cudaStreamWaitEvent(stream_, ready, 0), "helper copy wait", err, device_)) return failed();
+    if (!check(cudaMemcpyAsync(rows_x_, rows_x_h_, (size_t) rows * E * sizeof(float), cudaMemcpyHostToDevice, stream_),
+               "helper rows input", err, device_) ||
+        !check(cudaMemcpyAsync(rows_ptr_, rows_ptr_h_, (size_t) rows * 8 * sizeof(unsigned long long),
+                               cudaMemcpyHostToDevice, stream_), "helper rows pointers", err, device_) ||
+        !check(cudaMemcpyAsync(rows_w_, rows_w_h_, (size_t) rows * 8 * sizeof(float), cudaMemcpyHostToDevice, stream_),
+               "helper rows weights", err, device_) ||
+        !mark(1))
+        return failed();
+    gf::quantize_q8_1(rows_x_, rows_xq_, rows * n_embd_, stream_);   // (blocks of 32: row r's start at r * E / 32)
+    if (!mark(2) || !mark(3)) return failed();   // (the rows' gate/up and down interleave: their time counts as down's)
+    const size_t qb = E / 32 * 36;
+    for (int r = 0; r < rows; ++r) {
+        if (ne[r] == 0) continue;
+        gf::MoeDev pr = plan_;
+        pr.plan_ptr = rows_ptr_ + (size_t) r * 8;
+        pr.plan_w = rows_w_ + (size_t) r * 8;
+        gf::moe_gate_up(gu_type, pr, ne[r], n_embd_, n_ff_, limit, (const uint8_t*) rows_xq_ + (size_t) r * qb, hq_,
+                        nullptr, 0, nullptr, 0, nullptr, stream_);
+        gf::moe_down(d_type, pr, ne[r], n_embd_, n_ff_, down_off, hq_, nullptr, rows_out_ + (size_t) r * E, stream_);
+    }
+    if (!mark(4) ||
+        !check(cudaMemcpyAsync(rows_out_h_, rows_out_, (size_t) rows * E * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+               "helper rows result", err, device_) ||
+        !mark(5))
+        return failed();
+    pend_ = Pending{false, 0, total, bytes, nullptr, t0, std::chrono::steady_clock::now()};
+    claim.keep = true;   // (finish() releases it)
+    return true;
+}
+
 // The first half of a call - xl: an EXL3 pack's layout (compute_exl3), null: native GGUF experts of gu_type / d_type
 // (compute): the input and the plan up, the kernels, and the result's copy into out, all on the helper's stream.  The
 // call holds pending_ from here to its wait (Claim), so no replace or other call overlaps it.  A failure after anything
@@ -335,6 +499,10 @@ bool GlmExpertHelper::start(const strata::kernels::exl3::ExpertLayout* xl, int g
         return false;
     };
     if (prof_ && !check(cudaEventRecord(ev_[0], stream_), "helper profile event", err, device_)) return failed();
+    // an expert replace_async put in since the last copies_done: its copy first (on the device, nothing waits here)
+    for (int i = 0; i < ne; ++i)
+        if (cudaEvent_t r = slots_[(size_t) keys[i]].ready)
+            if (!check(cudaStreamWaitEvent(stream_, r, 0), "helper copy wait", err, device_)) return failed();
     if (zero_copy_) {
         std::memcpy(x_h_, x, (size_t) n_embd_ * sizeof(float));
         std::memcpy(plan_ptr_h_, ptr, (size_t) ne * sizeof(ptr[0]));
@@ -414,7 +582,8 @@ bool GlmExpertHelper::finish(std::string& err, bool split) {
         return false;
     }
     const auto t2 = std::chrono::steady_clock::now();
-    if (zero_copy_) std::memcpy(p.out, out_h_, (size_t) n_embd_ * sizeof(float));   // (the result's copy, on the host)
+    if (zero_copy_ && p.out != nullptr)   // (the result's copy, on the host; enqueue_rows' are in rows_out)
+        std::memcpy(p.out, out_h_, (size_t) n_embd_ * sizeof(float));
     const auto t3 = std::chrono::steady_clock::now();
     last_gpu_ms_ = -1.0;
     if (prof_) {
@@ -455,13 +624,26 @@ void GlmExpertHelper::close() {
     DeviceScope scope(device_);
     if (scope.ok) {
         if (stream_) cudaStreamSynchronize(stream_);
+        if (copy_stream_) cudaStreamSynchronize(copy_stream_);   // (replace_async's copies land before the pool goes)
         if (arena_) cudaFree(arena_);
         if (pool_) cudaFree(pool_);
         if (stream_) cudaStreamDestroy(stream_);
+        if (copy_stream_) cudaStreamDestroy(copy_stream_);
         for (auto& e : ev_)
             if (e) cudaEventDestroy(e);
+        for (auto& e : copy_ev_)
+            if (e) cudaEventDestroy(e);
         if (zc_host_) cudaFreeHost(zc_host_);
+        if (rows_arena_) cudaFree(rows_arena_);
+        if (rows_host_) cudaFreeHost(rows_host_);
     }
+    copy_stream_ = nullptr;
+    copy_ev_.clear();
+    copy_keys_.clear();
+    rows_arena_ = rows_host_ = nullptr;
+    rows_x_ = rows_out_ = rows_w_ = rows_x_h_ = rows_out_h_ = rows_w_h_ = nullptr;
+    rows_xq_ = nullptr;
+    rows_ptr_ = rows_ptr_h_ = nullptr;
     zero_copy_ = prof_ = false;
     zc_host_ = nullptr;
     x_h_ = out_h_ = x_z_ = out_z_ = plan_w_h_ = nullptr;

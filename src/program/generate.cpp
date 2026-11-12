@@ -2265,23 +2265,40 @@ static int glm_pack_generate(const Options& o) {
     std::vector<int32_t> follow_ids;
     const char* follow_save = getenv("MAYA_GLM_SPEC_FOLLOW_SAVE");
     if (follow_save != nullptr && follow_save[0] == '\0') follow_save = nullptr;
-    if (const char* fp = getenv("MAYA_GLM_SPEC_FOLLOW"); fp != nullptr && fp[0] != '\0') {
+    const char* follow_path = getenv("MAYA_GLM_SPEC_FOLLOW");
+    if (follow_path != nullptr && follow_path[0] == '\0') follow_path = nullptr;
+    const auto read_follow = [&](const char* fp, std::string& e) {
         std::ifstream input(fp);
         std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
         std::vector<int64_t> v;
-        std::string e;
-        if (!input && !input.eof()) e = "cannot read it";
-        else if (!parse_i64_list(text.c_str(), v, e)) e = "not a list of token ids: " + e;
+        if (!input && !input.eof()) {
+            e = "cannot read it";
+        } else if (text.find_first_of("0123456789") == std::string::npos) {
+            follow_ids.clear();   // (an empty file: no continuation - with _EACH, the next requests make their own picks)
+            return true;
+        } else if (!parse_i64_list(text.c_str(), v, e)) {
+            e = "not a list of token ids: " + e;
+        }
         for (const int64_t t : v)
             if (e.empty() && t >= n_vocab) e = "token " + std::to_string(t) + " is past the vocabulary";
-        if (!e.empty()) {
-            std::fprintf(stderr, "maya generate: MAYA_GLM_SPEC_FOLLOW %s: %s\n", fp, e.c_str());
+        if (e.empty()) follow_ids.assign(v.begin(), v.end());
+        return e.empty();
+    };
+    if (follow_path != nullptr) {
+        std::string e;
+        if (!read_follow(follow_path, e)) {
+            std::fprintf(stderr, "maya generate: MAYA_GLM_SPEC_FOLLOW %s: %s\n", follow_path, e.c_str());
             return 2;
         }
-        follow_ids.assign(v.begin(), v.end());
         std::fprintf(stderr, "glm follow: every request decodes the %zu tokens of %s (MAYA_GLM_SPEC_FOLLOW)\n",
-                     follow_ids.size(), fp);
+                     follow_ids.size(), follow_path);
     }
+    // MAYA_GLM_SPEC_FOLLOW_EACH=1: the file is read again at each request, so one start can follow the continuations
+    // of several prompts (a test writes each one there before its request: the top-token agreement of two setups)
+    static const bool follow_each = [] {
+        const char* v = getenv("MAYA_GLM_SPEC_FOLLOW_EACH");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
     const auto run_request = [&](const std::vector<int64_t>& ids, int64_t max_new,
                                  const strata::kernels::SamplerParams& rq_in) -> int {
         strata::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
@@ -2289,6 +2306,15 @@ static int glm_pack_generate(const Options& o) {
         pause_req.store(false);
         pause_keep.store(false);
         model.force_next(-1);
+        if (follow_each && follow_path != nullptr) {
+            std::string e;
+            if (!read_follow(follow_path, e)) {
+                std::printf("ERR MAYA_GLM_SPEC_FOLLOW %s: %s\n", follow_path, e.c_str());
+                std::fflush(stdout);
+                return 1;
+            }
+            std::fprintf(stderr, "glm follow: this request decodes the %zu tokens of %s\n", follow_ids.size(), follow_path);
+        }
         model.set_follow(follow_ids);   // MAYA_GLM_SPEC_FOLLOW: this request's tokens (empty: its own picks)
         if (!follow_ids.empty()) max_new = std::min<int64_t>(max_new, (int64_t) follow_ids.size());
         bool in_think = req_think_budget > 0 && req_think_end >= 0;
@@ -2538,6 +2564,16 @@ static int glm_pack_generate(const Options& o) {
             if (st2.disk_skips > st1.disk_skips)
                 std::fprintf(stderr, "glm skip: %.2f disk-only experts/tok left out (MAYA_GLM_DISK_SKIP_W / _FROM)\n",
                              (double) (st2.disk_skips - st1.disk_skips) / n);
+            if (st2.helper_held > 0)   // (the expert helper, MAYA_GLM_EXPERT_HELPER: this decode's share)
+                std::fprintf(stderr,
+                             "glm helper stat: %.2f experts/tok in %.2f routes/tok, %.2f ms/tok in those routes, %.2f "
+                             "ms/tok waiting for it beside the CPU lane | %.2f swaps/tok, %.2f ms/tok choosing and "
+                             "copying them | %lld experts held\n",
+                             (double) (st2.helper_experts - st1.helper_experts) / n,
+                             (double) (st2.helper_routes - st1.helper_routes) / n, (st2.helper_ms - st1.helper_ms) / n,
+                             (st2.helper_wait_ms - st1.helper_wait_ms) / n,
+                             (double) (st2.helper_swaps - st1.helper_swaps) / n,
+                             (st2.helper_adapt_ms - st1.helper_adapt_ms) / n, (long long) st2.helper_held);
             if (model.spec_steps_ > spec0)
                 std::fprintf(stderr, "glm spec: %llu of %llu drafts accepted (%.1f%%)\n",
                              (unsigned long long) (model.spec_hits_ - hits0),

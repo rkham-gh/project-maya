@@ -3952,6 +3952,8 @@ struct RouteArgs {
                                 // (0: all); the top-1 always runs, the kept weights are renormalised when the model's are
     int norm_mode;              // glm-dsa B5.1: kRouteNormClamp (Maya, llama.cpp) or kRouteNormHf (glm-dsa, + 1e-20)
     unsigned long long rand_seed = 0;   // glm-dsa B15.7: MAYA_GLM_RANDOM_ROUTING's seed (0: the router's own ids)
+    int helper_noskip = 0;      // MAYA_GLM_HELPER_NOSKIP (CHANGES THE ANSWERS): an expert the expert helper holds is
+                                // exempt from skip_from's and miss_skip_w's skips - it is on a GPU, not missing
 };
 
 // kExt: the glm-dsa additions to the route - the HF weight normalisation (norm_mode, B5.1) and the bench mode's random
@@ -4268,8 +4270,12 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             s_cs[i] = 0ull;
             if (dropped) {
                 ptr = 0ull;   // RESIDENT_SKIP_W / _TOPK: left out (a null plan entry, no fetch, no CPU work, weight 0)
-            } else if (ptr == 0ull && (i >= skip_from || light_miss(i))) {
-                // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess)
+            } else if (ptr == 0ull && (i >= skip_from || light_miss(i)) &&
+                       !(a.helper_noskip && skip_from > 0 &&
+                         (a.fast ? s_ho[i] != 0 : a.d.helper_owned && a.d.helper_owned[key]))) {
+                // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess).
+                // MAYA_GLM_HELPER_NOSKIP: an expert the helper holds is not missing - it takes the branch below
+                // (not for a token past a wrong draft, whose skip_from is 0, nor for the draft block)
             } else if (ptr == 0ull && (a.fast ? s_ho[i] != 0 : a.d.helper_owned && a.d.helper_owned[key])) {
                 // A helper resident is claimed BEFORE PCIe quotas, promotion or disk skipping.
                 // cpu_src stays zero: the host resolves this key in the helper's own cache.
@@ -6680,6 +6686,14 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
     }();
     a.res_w = resident_ok ? res_w : 0.0f;
     a.res_k = resident_ok ? res_k : 0;
+    // MAYA_GLM_HELPER_NOSKIP=1 (changes the answers, opt-in): the trunk's experts the expert helper holds are computed
+    // there even where MAYA_GLM_TRUNK_KEEP(_MAP) or MAYA_GLM_MISS_SKIP_W would leave a missing expert out - those skips
+    // were tuned for experts that would come from RAM.  Not the draft block's routes (resident_ok false)
+    static const bool helper_noskip = [] {
+        const char* v = getenv("MAYA_GLM_HELPER_NOSKIP");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    a.helper_noskip = helper_noskip && resident_ok && d.helper_owned != nullptr ? 1 : 0;
     // MAYA_GLM_ROUTE_RANK=0: the selections by topk_warp's serial rounds again (A/B); topk_rank needs whole warps of
     // experts that one block's threads cover and at most 8 picks
     static const bool rank_on = [] {

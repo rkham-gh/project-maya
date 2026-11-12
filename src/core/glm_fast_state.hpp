@@ -734,6 +734,9 @@ struct Glm5Model::FastState {
     GlmExpertHelper helper;   // opt-in, independent expert ownership on the secondary GPU
     uint8_t* helper_owned_d = nullptr;   // primary router excludes these experts from PCIe admission/prefetch
     uint64_t helper_swaps = 0;
+    uint64_t helper_bounds = 0;                 // boundaries seen by fast_helper_adapt (MAYA_GLM_HELPER_EVERY)
+    std::atomic<uint64_t> helper_adapt_us{0};   // its scans and swaps, on the token's thread between tokens
+    int helper_held = 0;                        // the experts the helper holds (a swap keeps the count)
     std::atomic<bool> helper_failed{false};
     std::string helper_error;
     std::atomic<uint64_t> helper_experts{0}, helper_routes{0}, helper_us{0};
