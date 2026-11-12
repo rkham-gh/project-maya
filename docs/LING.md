@@ -88,6 +88,45 @@ context, would give them room for about 1.4 GB more of VRAM, but hasn't been tri
 tokens calling a satisfiable formula unsatisfiable, and the regex engine rejects a valid `?`. Inkling-Small on maya-ink
 also scores 21, in 279 minutes, and Flash-Next on Strata 22 in 51.
 
+### Two cards: an RTX 3090 as the helper card (2026-11-11)
+
+The RTX 5090 (PCIe 5.0 x8) with an RTX 3090 (PCIe 4.0 x8, limited to 320 W) as `--helper-gpu` (branch `ling-2gpu`),
+IQ2_XS, 131K context, the run config's 16K chunks and prefetch. `ab.py` through Maya's server, every run from the same
+expert profile (`test-results\2026-11-11-two-gpu\fork-2gpu.ps1`), two runs each; the one-card column is the same build
+without the helper.
+
+| | The 5090 alone | With the helper card |
+|---|---|---|
+| Writing, new prompts | 21.2, 21.3 tok/s | **24.7, 24.8 tok/s** |
+| Writing after the 35.5K prompt | 15.2, 15.2 tok/s | 15.4, 14.6 tok/s |
+| Reading that prompt | 850, 864 tok/s (first token 41.8, 41.1 s) | 626, 631 tok/s (56.7, 56.3 s) |
+| A repeated prompt, 1st and 3rd time | 20.3, 23.6 and 20.4, 24.8 tok/s | 24.0, 25.0 and 23.9, 26.1 tok/s |
+| First token, short prompts | 2.49, 2.54 s | 2.35, 2.34 s |
+
+- **The same answers.** Fed llama.cpp's own tokens through the token path (`fork-ref.py ling --step` there:
+  `ling-ref.py compare` with this build, every prompt token a step, so the helper works from the first one), the top
+  token is llama.cpp's at 90 of 90 positions, its log-probability within 0.38 (one card's token path on the long
+  prompt: 0.44). The chat checks pass 7 of 7 and `derail.py` finds 0 of 20 derailed (617 s).
+- **What it buys: 17% on new prompts.** The helper holds 5,088 experts (23.4 GB) beside the main card's 3,919, of
+  34,816. On one 284-token answer 66% of a token's 544 routed experts were then in VRAM instead of 39%: 22.1 tok/s
+  against 17.9. The CPU lane still runs in 63 of the 68 MoE layers a token (67.8 on one card), because 8 experts a
+  layer rarely all sit in VRAM, and each such layer costs its fixed part: the lane takes 27.3 ms of a token's 45.2
+  instead of 39.5 of 56.0, the wait for the helper 2.2 ms, the main card's own layers and syncs 15.5.
+- **The helper's swaps are fast here**: an IQ2_XS expert is 4.6 MB, and the swaps' thread copies them while the next
+  tokens are written. On that answer 4 swaps every 2 tokens wrote 19.8 tok/s, 16 every 2 tokens 21.5, 32 every token
+  21.8 to 22.3 (the default; 64 the same, and a margin of 1.1 instead of 1.5 no better).
+- **Right after a long prompt it gains nothing** (15.4 and 14.6 against 15.2). Both caches then hold what the prompt
+  used: on a direct 200-token run 35% of the experts were in VRAM instead of 22%, the CPU lane fell from 47.6 to 40.7
+  ms a token, and the wait for the helper (6.3 ms) took most of that back.
+- **Reading a long prompt is slower with two cards, and why is open.** With two CUDA devices visible to the process
+  the prefetch's copier waits 6.5 s a 16K chunk for its pinned buffers' copies to the 5090 instead of 0.9 s (its
+  memcpy the same 10.9 s), with the helper off too (`--helper-gpu` not given, both cards visible: 53 to 55 s for the
+  prompt against 42.5 with `CUDA_VISIBLE_DEVICES=0`). The link is not slower (maya-ink's `--bench-h2d`: 28.8 GB/s
+  from pinned memory either way), `cudaDeviceScheduleSpin` and polling the event instead of waiting change nothing,
+  and without the prefetch two visible cards cost nothing (52.7 against 51.0 s). So with the helper the prefetch
+  buys no more than it costs; maya-ink's prompt path, which has no copier thread, reads as fast with two cards.
+  The helper's refill after the prompt (up to 4,096 experts) adds ~2 s more.
+
 ## The engine
 
 - **The token path** (`Engine::step`): everything but the routed experts on the GPU, int8-activation GEMVs from
@@ -117,6 +156,28 @@ also scores 21, in 279 minutes, and Flash-Next on Strata 22 in 51.
   2 tokens at a margin of 1.5, each swap's copy staged in 2 MB pieces while the CPU waits for the GPU; `--profile FILE`
   keeps the scores for the next start). Its settings are maya-ink's measured ones (`LING_CACHE_*`), not yet re-tuned
   for Ling's 512 experts.
+- **The helper card** (`--helper-gpu N`, `--helper-gb G`; maya-nem's and maya-ink's, branches `nemotron-2gpu` and
+  `inkling-2gpu`): a second card that holds routed experts only, in a cache of its own (slots by class as the main
+  cache's; its free VRAM less `LING_HELPER_RESERVE_MIB`, 1024), filled with the best-scored experts the main card does
+  not hold. A token's chosen experts are then split three ways: the main card's, the helper's and the CPU lane's. The
+  helper gets the layer's input from the host (it is there after the layer's sync), runs the same gate / up, clamped
+  SwiGLU and down launches on its own stream while the main card and the CPU lane do theirs, and returns its sum to
+  the host, which adds it to the CPU lane's before the main card's next graph reads both. No state of the model lives
+  there, so the prompt path, `reset()`, the snapshot and the graphs are as before, and without `--helper-gpu` the
+  engine runs as it did.
+  - The main cache decides first and leaves the helper's experts alone: its swaps take only experts on neither card
+    (`LING_HELPER_STEAL=1`: the helper's too).
+  - The helper follows: every token (`LING_HELPER_EVERY`) up to 32 swaps (`LING_HELPER_SWAPS`), an expert the main
+    card took dropped, and one from outside both taken in place of its worst when it scores more than the main
+    cache's margin times that one's + 0.5 (`LING_HELPER_MARGIN`, `LING_HELPER_BIAS`). A thread of its own copies them
+    on a second stream while the next tokens are written, and an expert is used from the first update after its copy
+    (`LING_HELPER_BG=0`: copied at the swap, on the token's thread). At the start and after a prompt the fill is
+    copied at once: after a prompt up to an eighth of its tokens (64 .. 4,096, `LING_HELPER_FILL`).
+  - Maya's server adds `--layer-split auto` when a config's `"gpu"` names two cards; this engine reads that as
+    `--helper-gpu 1` (the second visible card), so `"gpu": [0, 1]` in the run config is all it takes
+    (`LING_HELPER_GPU=-1` in its `env`: off).
+  - The kernels launched there (ds4_iq's GEMVs, ling's q8 / SwiGLU / row sums) keep no device state, so they run on
+    whichever device is current; the build needs both cards' architectures (`-DCMAKE_CUDA_ARCHITECTURES=86;120`).
 - **The CPU lane**: maya-ink's (one spinning pool run a layer: (expert, band of gate / up rows) jobs, then bands of down
   rows summed over the experts), with Ling's clamp form in its epilogue (iq_cpu_gate_up's clamp is DeepSeek's, on g
   before the SiLU: used only where there is no clamp).

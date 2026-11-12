@@ -239,6 +239,14 @@ int main(int argc, char** argv) {
         else if (a == "--sub") opt.sub = std::max(16, std::atoi(val().c_str()));
         else if (a == "--stage") opt.stage = std::atoi(val().c_str());
         else if (a == "--cache-gb") opt.cache_gb = std::atof(val().c_str());
+        else if (a == "--helper-gpu") opt.helper_gpu = std::atoi(val().c_str());
+        else if (a == "--helper-gb") opt.helper_gb = std::atof(val().c_str());
+        // (Maya's server adds `--layer-split auto` when a config names several GPUs: here the second visible card
+        //  becomes the helper card - this engine's layers all stay on the first)
+        else if (a == "--layer-split") {
+            (void) val();
+            if (opt.helper_gpu < 0) opt.helper_gpu = 1;
+        }
         else if (a == "--profile") opt.profile = val();
         else if (a == "--dump-logits") dump = val();
         else if (a == "--quiet") opt.verbose = false;
@@ -257,6 +265,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: maya-ling --gguf <first shard> (--serve | --ids @file [--gen N]) | --selftest\n");
         return 2;
     }
+    if (const char* v = std::getenv("LING_HELPER_GPU")) opt.helper_gpu = std::atoi(v);   // (-1: no helper card)
     ling::Engine eng;
     std::string err;
     if (!eng.load(opt, err)) {
@@ -316,10 +325,19 @@ int main(int argc, char** argv) {
         const auto st = eng.stats();
         if (st.tokens > 0)
             std::fprintf(stderr,
-                         "maya-ling: %ld tokens at %.2f tok/s (the CPU lane %.0f%% of the time; %.1f%% of the experts in "
-                         "VRAM, %ld slots, %ld copies)\n",
+                         "maya-ling: %ld tokens at %.2f tok/s (the CPU lane and the helper card's wait %.0f%% of the time; "
+                         "%.1f%% of the experts in VRAM, %ld slots, %ld copies; %.1f%% on the helper card, %ld slots, %ld "
+                         "copies)\n",
                          st.tokens, st.tokens * 1000.0 / st.ms_total, 100.0 * st.ms_cpu / st.ms_total,
-                         st.lookups ? 100.0 * st.hits / st.lookups : 0.0, st.cache_slots, st.cache_copies);
+                         st.lookups ? 100.0 * st.hits / st.lookups : 0.0, st.cache_slots, st.cache_copies,
+                         st.lookups ? 100.0 * st.hits_helper / st.lookups : 0.0, st.helper_slots, st.helper_copies);
+        if (st.tokens > 0)
+            std::fprintf(stderr,
+                         "maya-ling: a token's %.2f ms: the CPU lane %.2f (%.1f MoE layers a token), the wait for the helper "
+                         "card after it %.2f (%.1f layers), the helper's swaps %.2f, the rest (the main card) %.2f\n",
+                         st.ms_total / st.tokens, st.ms_lane / st.tokens, (double) st.lane_layers / st.tokens,
+                         st.ms_helper / st.tokens, (double) st.helper_layers / st.tokens, st.ms_update / st.tokens,
+                         (st.ms_total - st.ms_lane - st.ms_helper - st.ms_update) / st.tokens);
         return true;
     };
 
@@ -479,8 +497,11 @@ int main(int argc, char** argv) {
         else last.clear();
         // (a generated end token is not fed: the next prompt carries the turn's end itself)
         const auto st = eng.stats();
-        std::printf("STAT ling cache_hit=%.3f cache_slots=%ld cache_copies=%ld\n",
-                    st.lookups ? (double) st.hits / st.lookups : 0.0, st.cache_slots, st.cache_copies);
+        std::printf("STAT ling cache_hit=%.3f cache_slots=%ld cache_copies=%ld helper_hit=%.3f helper_slots=%ld "
+                    "helper_copies=%ld tok_s=%.2f\n",
+                    st.lookups ? (double) st.hits / st.lookups : 0.0, st.cache_slots, st.cache_copies,
+                    st.lookups ? (double) st.hits_helper / st.lookups : 0.0, st.helper_slots, st.helper_copies,
+                    st.ms_total > 0 ? st.tokens * 1000.0 / st.ms_total : 0.0);
         std::printf("DONE %d %zu %.1f %.1f %s 0 0 %zu\n", generated, ids.size(), p1 - p0, now_ms() - p1, finish.c_str(),
                     reuse);
         std::fflush(stdout);
