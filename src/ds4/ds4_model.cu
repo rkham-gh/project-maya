@@ -1598,6 +1598,13 @@ struct Model::Impl {
     size_t helper_prof = 0;                       // (of helper_used: profiled experts; the rest recent slots or reserved slack)
     int helper_n = 0;                             // experts it holds
     std::atomic<bool> helper_dead{false};
+    // the requests its thread was given (helper_window: the seq, by ring slot).  The service thread waits for the
+    // helper's flag only for those: a request of a layer with experts in its pool that no helper_window covered was
+    // waited for until kHelperWaitMs and ended the helper for the run (seen on Windows when a request's first short
+    // prompt took the timed pick's chunked pass: "no answer to request 2 in 10000 ms") - now the CPU lane takes that
+    // request's picks and the helper stays.  MAYA_DS4_HELPER_GIVEN=0: every request waited for, as before
+    std::array<std::atomic<unsigned>, kRing> helper_given{};
+    std::atomic<bool> helper_ungiven_said{false};
     uint8_t* helper_pool = nullptr;
     cudaStream_t helper_st = nullptr;
     unsigned long long* helper_plan = nullptr;    // device [kWin][kPicks]: a request's picks it holds (0: not its)
@@ -14755,7 +14762,10 @@ struct Model::Impl {
         {
             std::lock_guard<std::mutex> lk(hq_mu);
             for (int il = 0; il < g.nl; ++il)
-                if (L[(size_t) il].helper_tab != nullptr) hq.push_back({il, wp.seq[il], T});
+                if (L[(size_t) il].helper_tab != nullptr) {
+                    helper_given[wp.seq[il] % kRing].store(wp.seq[il], std::memory_order_release);   // (before it is published)
+                    hq.push_back({il, wp.seq[il], T});
+                }
         }
         hq_cv.notify_one();
     }
@@ -14844,6 +14854,17 @@ struct Model::Impl {
             ok = ok && cudaGetLastError() == cudaSuccess && gg::launch_errors() == e0 && x3::launch_errors() == ex0;
             if (ok) signal_seq(helper_flags + kRing + slot, sq, helper_st);
             ok = ok && cudaGetLastError() == cudaSuccess;
+            // Windows (WDDM) holds queued launches back until the host waits on the stream or queries it, and nothing
+            // here does: the service thread watches the flag in mapped memory.  Without this the helper never answers
+            // there (an RTX 3090 beside an RTX 5090: "no answer to request 2 in 10000 ms" at the first decoded
+            // token, the CPU lane taking its picks from then on).  win_submit queries the stream (no wait), which
+            // submits this layer's launches; elsewhere it does nothing.  MAYA_DS4_HELPER_SUBMIT=0 (or DS4_WIN_SUBMIT=0):
+            // off, as before (A/B)
+            static const bool submit = [] {
+                const char* v = ds4_env("DS4_HELPER_SUBMIT");
+                return v == nullptr || std::atoi(v) != 0;
+            }();
+            if (ok && submit) win_submit(helper_st);
         }
         cudaSetDevice(cur);
         if (ok) return;
@@ -15227,7 +15248,19 @@ struct Model::Impl {
                 std::vector<std::pair<int, int>> picks;   // (expert, t * kPicks + i), CPU-lane only
                 // the helper's (DS4_HELPER: a layer with experts in its pool, while it works) - its own lane: not the
                 // CPU lane's cache hits, RAM tier, disk skip or stream
-                const bool hon = l.helper_tab != nullptr && !helper_dead.load(std::memory_order_relaxed);
+                bool hon = l.helper_tab != nullptr && !helper_dead.load(std::memory_order_relaxed);
+                if (hon && helper_given[next % kRing].load(std::memory_order_acquire) != next) {
+                    static const bool given_rule = [] {
+                        const char* v = ds4_env("DS4_HELPER_GIVEN");
+                        return v == nullptr || std::atoi(v) != 0;
+                    }();
+                    if (given_rule) {   // (not one of its thread's: nothing would answer - the CPU lane's, this once)
+                        hon = false;
+                        if (!helper_ungiven_said.exchange(true))
+                            std::fprintf(stderr, "ds4: helper CUDA%d: request %u (layer %d, %d rows) was not given to it - the "
+                                                 "CPU lane takes such a request's picks (said once)\n", helper_id, next, li, T);
+                    }
+                }
                 hpicks.clear();
                 const bool dsk_rule = disk_skip_w > 0.0f && !l.mtp && li >= disk_skip_from && li < g.nl;
                 // (DISK_SKIP_AUTO: skipping now; its counts only then - the routed experts computed either way, of them
