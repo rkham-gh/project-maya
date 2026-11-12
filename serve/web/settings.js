@@ -12,7 +12,7 @@ import {DEFAULTS, LEVELS, P, PENALTIES, PRESETS, S, confirmDialog, copyText, emi
 import {usd} from "./sidebar.js";
 import {GLM_KV_BYTES, confirmContext, confirmPort, ctxEstimate, ctxHint, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
         budgetError, loadThinkBudget, saveThinkBudget, loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
-import {chatInstructions, clearBrowser, estimateTokens, updateCtxMeter} from "./chats.js";
+import {ablateOf, chatInstructions, clearBrowser, estimateTokens, setAblate, updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
 import {openModelSheet} from "./models.js";
 import {TurboButton} from "./turbo.js";
@@ -131,7 +131,7 @@ function ThinkBudget() {
   const bad = budgetError(text), changed = text.trim() !== String(tb.budget);
   return html`<div class="set-block">
     <label class="field"><span class="field__label">Thinking budget</span>
-      <span class="set-row__sub">Tokens, 0 = no limit. Thinking stops at this many tokens and the answer starts.${tb.saved ? "" : " Not saved: this server runs without a config."}</span>
+      <span class="set-row__sub">Tokens, 0 = no limit. Thinking stops at this many tokens and the answer starts.${(tb.max_level ? ` A Max you pick yourself (in a chat, or as Thinking above) may think longer, up to ${fmt(tb.max_level)}, while this is the default; a number saved here applies at every level.` : "") + (tb.saved ? "" : " Not saved: this server runs without a config.")}</span>
       <span class="set-row__ctl"><input id="set-think-budget" class="input input--num" inputmode="numeric" value=${text}
         aria-invalid=${changed && bad ? "true" : "false"} aria-label="Thinking budget in tokens"
         onInput=${(e) => setText(e.target.value.replace(/\D/g, ""))}
@@ -141,10 +141,23 @@ function ThinkBudget() {
 }
 
 // ------------------------------------------------------------------ Chat defaults (sampling)
+// a change saves at once: a small "Saved" after the title says so, then fades (it keeps its room on the title's line, so
+// nothing moves; the status region stays, so a screen reader hears each save)
+export const SAVED_MS = 1600;
+function useSaved() {
+  const [on, setOn] = useState(false), timer = useRef(null);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const flash = () => { setOn(true); clearTimeout(timer.current); timer.current = setTimeout(() => setOn(false), SAVED_MS); };
+  return [on, flash];
+}
+const Saved = ({on}) => html`<span class=${`set-saved${on ? " is-on" : ""}`}>
+  <span class="set-saved__mark" aria-hidden="true"><${Icon} name="check" sm/>Saved</span>
+  <span class="set-saved__say" role="status" aria-live="polite">${on ? "Saved" : ""}</span></span>`;
 function ChatDefaults() {
   const t = +P.temperature, greedy = t === 0, preset = presetOf(P);
   const titles = thinkTitles();
-  const set = (patch) => { savePrefs(patch); syncShared(); };
+  const [saved, flashSaved] = useSaved();
+  const set = (patch) => { savePrefs(patch); syncShared(); flashSaved(); };
   // the running model's recommended values (its run config: the model card's) say so
   const isDefault = (k) => !greedy && Math.abs(+P[k] - (+DEFAULTS[k] || 0)) < 1e-9;
   const sliders = [
@@ -167,7 +180,8 @@ function ChatDefaults() {
   const sharedNow = S.shared.on && S.shared.now && Object.keys(S.shared.now).length
     ? "API clients get now: " + Object.entries(S.shared.now).map(([k, v]) => `${names[k] || k} ${v}`).join(", ")
     : "API clients get them for anything they don't set themselves.";
-  return html`<${Head} title="Chat defaults" intro=${`How ${modelName(S.health.model)} writes new answers. Each model keeps its own.`}>
+  return html`<${Head} title=${html`Chat defaults<${Saved} on=${saved}/>`}
+      intro=${`How ${modelName(S.health.model)} writes new answers. Each model keeps its own.`}>
       <${TurboButton}/><//>
     <${ModelCtx}/>
     <${Group} cap="Sampling">
@@ -196,6 +210,9 @@ function ChatDefaults() {
           onInput=${(e) => set({seed: e.target.value.replace(/\D/g, "")})}/></label>
     </div>
     <${ThinkBudget}/>
+    ${(S.health.ablate || {}).available && html`<${Row} label="Refusal ablation (this chat)"
+        sub="Projects the model's refusal direction out of its answers. Off by default; the model's own default is on the Models page.">
+      <${Switch} label="Refusal ablation (this chat)" on=${ablateOf() === true} onChange=${setAblate}/><//>`}
     <div class="set-block set-block--pens"><span class="set-row__sub">Penalties: none by default (no model has any as a standard). Set one to discourage repeats.</span>
     <div class="set-pair set-pair--3">
       ${[["repetition_penalty", "Repetition", "1.0 off, e.g. 1.1"], ["frequency_penalty", "Frequency", "0 off, e.g. 0.3"],
@@ -353,11 +370,11 @@ function Savings() {
 }
 
 // ------------------------------------------------------------------ About and updates
-// supporting Maya (GitHub Sponsors): one warm line, never a popup - on About, and as a row of its own under an update's
-// button (a little more visible there, still only where the update shows)
-const SupportLine = ({cls = "set-support"}) => html`<p class=${cls}><${Icon} name="heart" sm/><span>Maya is free and open, made by one
-  person with help from a small community. If it makes your work a little easier,${" "}<a class="support-link" href=${SUPPORT_URL}
-  target="_blank" rel="noopener" title="Sponsor Maya on GitHub">sponsoring it</a>, in any amount, helps it keep growing. Thank you.</span></p>`;
+// supporting Maya (GitHub Sponsors): one warm line on About, never a popup (the sidebar's heart is the other way in).  No
+// leading heart icon: the line ends with one
+const SupportLine = () => html`<p class="set-support"><span>I build Maya because I believe everyone should have access to great
+  local AI. If you enjoy what I'm building, consider${" "}<a class="support-link" href=${SUPPORT_URL} target="_blank" rel="noopener"
+  title="Sponsor Maya on GitHub">supporting me</a>. Every little bit helps keep the project alive and growing. ❤️</span></p>`;
 function UpdateCard() {
   const u = S.update, w = S.updateWatch;
   if (!w && (!u || !u.enabled)) return null;
@@ -398,8 +415,7 @@ function UpdateCard() {
   }
   return html`<div class=${`update${tone ? ` update--${tone}` : ""}`} aria-live="polite"><${Icon} name=${icon}/>
     <span class="update__text"><b>${title}</b>${text ? html`<span>${text}</span>` : null}${how ? html`<span class="update__how">${how}</span>` : null}</span>
-    ${acts ? html`<span class="update__acts">${acts}</span>` : null}
-    ${u && u.newer && !w && !(state && state.state) ? html`<${SupportLine} cls="update__support"/>` : null}</div>`;
+    ${acts ? html`<span class="update__acts">${acts}</span>` : null}</div>`;
 }
 // "Tesla V100 + Tesla V100" (the server's list) -> "2 × Tesla V100"; mixed cards stay listed
 function gpuNames(name, count) {
@@ -470,10 +486,9 @@ function About() {
     if (log != null) { setLog(null); return; }
     try { setLog(await fetchReport()); } catch (e) { toast("error", "No report", e.message, 5000); }
   };
-  const newer = S.update && S.update.newer && !S.updateWatch;   // (then the ask is beside the update instead)
   return html`<${Head} title="About and updates"/>
     <${UpdateCard}/>
-    ${newer ? null : html`<${SupportLine}/>`}
+    <${SupportLine}/>
     <${Group} cap="This server"><dl class="facts">${facts().map(([k, v]) => html`<div class="facts__row"><dt>${k}</dt><dd>${v}</dd></div>`)}</dl><//>
     <${Group}>
     <div class="set-row set-row--top">

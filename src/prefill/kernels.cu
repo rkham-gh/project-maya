@@ -19,14 +19,32 @@ constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
 constexpr int S = 128, HK = 16, HV = 48, C = 10240;
 
 __device__ __forceinline__ float warp_sum(float v) {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0xb1, 0xf, 0xf, false));
+    return v;
+#else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+#endif
 }
 __device__ __forceinline__ float warp_max(float v) {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0xb1, 0xf, 0xf, false)));
+    return v;
+#else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
+#endif
 }
 __device__ __forceinline__ uint16_t bf(float f) {
     uint32_t u = __float_as_uint(f);
@@ -527,8 +545,7 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
         if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * 256 + d] = h;
         return;
     }
-    float a = fabsf(x);
-    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+    float a = warp_max(fabsf(x));
     __shared__ float wm[2];
     if ((threadIdx.x & 31) == 0) wm[threadIdx.x >> 5] = a;
     __syncthreads();
@@ -632,7 +649,7 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
     check("gdn_gates");
 }
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream) {
-    static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
+    static const bool serial = std::getenv("MAYA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
     if (serial || T <= CONV_TILE) {
         gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
     } else {
@@ -645,7 +662,7 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
-    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
+    static const bool serial = std::getenv("MAYA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
     if (serial || T <= 0) {
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
     } else {

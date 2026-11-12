@@ -252,6 +252,10 @@ if(STRATA_BUILD_TESTS)
   # maya-ds4 --serve's watchdog: it fires on a request that stopped moving, never on a long one still moving (#539)
   add_executable(ds4_watchdog_test tests/ds4_watchdog_test.cpp)
   add_test(NAME ds4_watchdog_test COMMAND ds4_watchdog_test)
+  # DS4_LENT_RAM_GB's failure paths: a failed copy into the RAM copies drops them and the lend goes on (#884)
+  add_executable(ds4_lent_fallback_test tests/ds4_lent_fallback_test.cpp)
+  target_include_directories(ds4_lent_fallback_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4)
+  add_test(NAME ds4_lent_fallback_test COMMAND ds4_lent_fallback_test)
   # maya-ds4's restore points: the one a prompt goes back to, the ones a read keeps (marks= / shared=), the cases
   add_executable(ds4_marks_test tests/ds4_marks_test.cpp)
   target_link_libraries(ds4_marks_test PRIVATE strata_warnings)
@@ -268,6 +272,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(ds4_ablate_test tests/ds4_ablate_test.cpp)
   target_link_libraries(ds4_ablate_test PRIVATE strata_artifact)
   add_test(NAME ds4_ablate_test COMMAND ds4_ablate_test)
+  # ... and maya-mm3's, which takes a control vector only
+  add_executable(mm3_ablate_test tests/mm3_ablate_test.cpp)
+  target_link_libraries(mm3_ablate_test PRIVATE strata_artifact)
+  add_test(NAME mm3_ablate_test COMMAND mm3_ablate_test)
   # maya-ds4's trunk expert placement (src/ds4/ds4_place.hpp): the shipped profile on the 2.25bpw EXL3 pack's experts
   # gives the slots and statics a real load printed, the functions match the engine's own code, and DS4_RECENT_FIT=1 /
   # 2 keep a recent slot in every layer of 3 or more slots within the budget (host code only, no model, no GPU)
@@ -306,7 +314,7 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_cpu_prepare_rows_test.cpp")
   target_link_libraries(ds4_cpu_prepare_stub_test PRIVATE strata_warnings)
   add_test(NAME ds4_cpu_prepare_stub_test COMMAND ds4_cpu_prepare_stub_test)
 endif()
-# STRATA_HIPBLASLT_TUNING's table list: ':' on Linux, ';' on Windows with drive letters kept (host code only, so a
+# MAYA_HIPBLASLT_TUNING's table list: ':' on Linux, ';' on Windows with drive letters kept (host code only, so a
 # build without HIP builds it by name)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hipblaslt_table_list_test.cpp")
   add_executable(hipblaslt_table_list_test EXCLUDE_FROM_ALL tests/hipblaslt_table_list_test.cpp)
@@ -321,6 +329,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/env_report_test.cpp")
   target_include_directories(env_report_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
   target_link_libraries(env_report_test PRIVATE strata_warnings)
   add_test(NAME env_report_test COMMAND env_report_test)
+endif()
+# the NO_* on/off switches (include/strata/platform/env_switch.hpp, #860: =0 / off / false / no is off); host code only
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/env_switch_test.cpp")
+  add_executable(env_switch_test EXCLUDE_FROM_ALL tests/env_switch_test.cpp)
+  target_include_directories(env_switch_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_link_libraries(env_switch_test PRIVATE strata_warnings)
+  add_test(NAME env_switch_test COMMAND env_switch_test)
 endif()
 
 # ---- idle_gate_test --------------------------------------------------------
@@ -460,6 +475,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_test(NAME exl3_mv_generic_test COMMAND ${CMAKE_COMMAND} -E env DS4_EXL3_MV1=0 $<TARGET_FILE:exl3_test>)
       set_tests_properties(exl3_mv1_test exl3_mv_generic_test PROPERTIES TIMEOUT 120)
     endif()
+    if(NOT STRATA_ENABLE_HIP)
+      # v1.1.8's kernels with the FP32 weight decode (MAYA_GLM_EXL3_DECODE=legacy-f32): every case as with the FP16
+      # decode; and the legacy cases' outputs (exl3_test --dump-legacy) bit for bit the FP16 decode's.  The FP32 decode
+      # is built for sm_6x only: on sm_70+ legacy-f32 runs the FP16 kernels, which these check too.  The bits test writes
+      # its dumps to a directory of its own under exl3_dump (removed when it passes): runs at once do not collide
+      add_test(NAME exl3_legacy_f32_test
+               COMMAND ${CMAKE_COMMAND} -E env MAYA_GLM_EXL3_DECODE=legacy-f32 $<TARGET_FILE:exl3_test>)
+      add_test(NAME exl3_legacy_f32_bits
+               COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:exl3_test> -DOUT=${CMAKE_CURRENT_BINARY_DIR}/exl3_dump
+                       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/exl3_dump_compare.cmake)
+      set_tests_properties(exl3_legacy_f32_test PROPERTIES TIMEOUT 120)
+      set_tests_properties(exl3_legacy_f32_bits PROPERTIES TIMEOUT 300)
+    endif()
     # the same decoders against exllamav3 itself (tools/exl3_exllamav3_fixture.py's tiles): the same bits
     add_test(NAME exl3_exllamav3 COMMAND exl3_test --exllamav3 ${CMAKE_CURRENT_SOURCE_DIR}/data/exl3-exllamav3)
     set_tests_properties(exl3_exllamav3 PROPERTIES TIMEOUT 60)
@@ -479,7 +507,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_rows_kernels_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_rows_kernels_test COMMAND glm_rows_kernels_test)
     set_tests_properties(glm_rows_kernels_test PROPERTIES TIMEOUT 120)
-    # the rows' DSA attention in one launch (STRATA_GLM_ROWS_ATTN) against mla() a row, resident and streamed caches
+    # the rows' DSA attention in one launch (MAYA_GLM_ROWS_ATTN) against mla() a row, resident and streamed caches
     add_executable(glm_rows_attn_test tests/glm_rows_attn_test.cu)
     target_link_libraries(glm_rows_attn_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_rows_attn_test COMMAND glm_rows_attn_test)
@@ -506,7 +534,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(qsa_prompt_attn_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
-  # the Volta grouped-WMMA prompt experts (STRATA_PF_WMMA) against a double reference over the same FP16 weights
+  # the Volta grouped-WMMA prompt experts (MAYA_PF_WMMA) against a double reference over the same FP16 weights
   # (GPU, synthetic, no model); skips with 77 below sm_70
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
     add_executable(pf_wmma_parity src/kernels/pf_wmma_parity.cpp)
@@ -576,7 +604,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
-    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu)
+    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu src/core/glm_ablate.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(WIN32 AND STRATA_ENABLE_CUDA)
@@ -591,6 +619,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_ENABLE_HIP)
       target_link_libraries(glm_dflash_test PRIVATE strata_prefill)
     endif()
+    # --ablate on the GLM engine (src/core/glm_ablate.hpp): the projection against a CPU reference, the runs of a
+    # step's rows against one launch, untouched rows untouched (a few MB of GPU; none: skipped, exit 77)
+    add_executable(glm_ablate_test tests/glm_ablate_test.cu)
+    target_include_directories(glm_ablate_test PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(glm_ablate_test PRIVATE strata_engine ${_strata_gpu_runtime_target})
+    if(STRATA_ENABLE_HIP)
+      target_link_libraries(glm_ablate_test PRIVATE strata_prefill)
+    endif()
+    add_test(NAME glm_ablate_test COMMAND glm_ablate_test)
+    set_tests_properties(glm_ablate_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
     # the fast path's multi-column GEMV: every column against the single-column call, and its time (needs a GPU)
@@ -714,7 +752,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # DS4_CPU_SPLIT_COLS: the CPU lane's EXL3 experts with a small call's pieces cut by columns against the uncut
     # schedule, bit for bit - K 2 and 2.5, 1-6 entries of 1-8 tokens, one and two parts, several thread counts, steps
     # and flow (synthetic weights, no GPU, no model; the EXL3 CPU kernels are x86 only).  It tests the kernels' tier this
-    # CPU picks (printed); _avx2 holds an AVX-512 CPU on AVX2 (STRATA_FORCE_AVX2=1; without AVX-512 the same run twice).
+    # CPU picks (printed); _avx2 holds an AVX-512 CPU on AVX2 (MAYA_FORCE_AVX2=1; without AVX-512 the same run twice).
     # Tier 2 (AVX-512 without VNNI) cannot be forced on a VNNI CPU.
     if(STRATA_BUILD_TESTS AND STRATA_CPU_X86 AND NOT WIN32)
       add_executable(ds4_cpu_split_test tests/ds4_cpu_split_test.cpp)
@@ -722,7 +760,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       enable_testing()
       add_test(NAME ds4_cpu_split_test COMMAND ds4_cpu_split_test)
       add_test(NAME ds4_cpu_split_test_avx2 COMMAND ds4_cpu_split_test)
-      set_tests_properties(ds4_cpu_split_test_avx2 PROPERTIES ENVIRONMENT STRATA_FORCE_AVX2=1)
+      set_tests_properties(ds4_cpu_split_test_avx2 PROPERTIES ENVIRONMENT MAYA_FORCE_AVX2=1)
       set_tests_properties(ds4_cpu_split_test ds4_cpu_split_test_avx2 PROPERTIES TIMEOUT 600)
     endif()
     # the CPU lane's MXFP4 rows: every tier this CPU runs (and ggml-cpu's dot) at the experts' real size (no GPU)
@@ -776,7 +814,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(ds4_multi_attn_test PRIVATE ${_strata_gpu_include_directories} include)
     target_link_libraries(ds4_multi_attn_test PRIVATE ${_strata_gpu_runtime_target})
     # DS4_INDEX_TC: the indexer's scores on the tensor cores (RDNA 3: WMMAs) against the CUDA cores' kernel, and their
-    # times (needs a GPU, no model; built by name, run with DS4_INDEX_TC=1)
+    # times (needs a GPU, no model; built by name, run with DS4_INDEX_TC=1 - on CUDA it is opt-in, on RDNA 3 the default)
     add_executable(ds4_index_score_tc EXCLUDE_FROM_ALL tests/ds4_index_score_tc.cu src/ds4/ds4_kernels.cu
                                       src/ds4/ds4_host_ar.cpp)
     target_include_directories(ds4_index_score_tc PRIVATE ${_strata_gpu_include_directories} include src/ds4)
@@ -1513,7 +1551,7 @@ if(STRATA_NATIVE_EXPERTS)
     target_link_libraries(glm_mv_nt_test PRIVATE strata_kernels ggml-base ${_strata_gpu_runtime_target})
     add_test(NAME glm_mv_nt_test COMMAND glm_mv_nt_test)
     add_test(NAME glm_mv_nt_generic COMMAND glm_mv_nt_test)
-    set_tests_properties(glm_mv_nt_generic PROPERTIES ENVIRONMENT STRATA_GLM_MV_GENERIC=1)
+    set_tests_properties(glm_mv_nt_generic PROPERTIES ENVIRONMENT MAYA_GLM_MV_GENERIC=1)
     set_tests_properties(glm_mv_nt_test glm_mv_nt_generic PROPERTIES TIMEOUT 300)
   endif()
   if(STRATA_ENABLE_CUDA)
@@ -1579,7 +1617,7 @@ if(STRATA_NATIVE_EXPERTS)
     if(_strata_mmq_glu)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_GLU=1)
     endif()
-    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)   # q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts (docs/QUANT-PLAN.md)
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k q5_0)   # q8_0: the drafter's matrices (E-9); iq1_s, k-quants: GLM experts (docs/QUANT-PLAN.md)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
     target_include_directories(strata_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
@@ -1621,7 +1659,7 @@ if(STRATA_NATIVE_EXPERTS)
       "${_strata_mmq}/quantize.cu"
       "${_strata_mmq}/convert.cu")
     target_compile_definitions(strata_engine PRIVATE STRATA_HIP_PREFILL_FUSED=1)
-    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)
+    foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k q5_0)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
@@ -1712,8 +1750,8 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME exl3_cpu_w16_test COMMAND exl3_cpu_w16_test)
     add_test(NAME exl3_cpu_w16_test_avx2 COMMAND exl3_cpu_w16_test)
     set_tests_properties(exl3_cpu_w16_test exl3_cpu_w16_test_avx2 PROPERTIES TIMEOUT 600)
-    set_tests_properties(exl3_cpu_w16_test_avx2 PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX2=1")
-    # STRATA_EXL3_AVX2_SHUF (the AVX2 tier's byte-aligned trellis windows by byte shuffles) against the shifts and the
+    set_tests_properties(exl3_cpu_w16_test_avx2 PROPERTIES ENVIRONMENT "MAYA_FORCE_AVX2=1")
+    # MAYA_EXL3_AVX2_SHUF (the AVX2 tier's byte-aligned trellis windows by byte shuffles) against the shifts and the
     # scalar tier, bit for bit: every bitrate, 1-8 activations, the bands, the split-K rows with column runs, the GEMM
     # (synthetic weights, no GPU). Both entries keep an AVX-512 host on AVX2; the second starts with the variable set,
     # so the kernels' own start check runs. Exit 77 (skipped) where the lane does not run the AVX2 tier
@@ -1723,8 +1761,8 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME exl3_cpu_shuf_test COMMAND exl3_cpu_shuf_test)
     add_test(NAME exl3_cpu_shuf_test_env COMMAND exl3_cpu_shuf_test --env)
     set_tests_properties(exl3_cpu_shuf_test exl3_cpu_shuf_test_env PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
-    set_tests_properties(exl3_cpu_shuf_test PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX2=1")
-    set_tests_properties(exl3_cpu_shuf_test_env PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX2=1;STRATA_EXL3_AVX2_SHUF=1")
+    set_tests_properties(exl3_cpu_shuf_test PROPERTIES ENVIRONMENT "MAYA_FORCE_AVX2=1")
+    set_tests_properties(exl3_cpu_shuf_test_env PROPERTIES ENVIRONMENT "MAYA_FORCE_AVX2=1;MAYA_EXL3_AVX2_SHUF=1")
   endif()
 
   if(WIN32)
@@ -1744,6 +1782,10 @@ if(STRATA_BUILD_TESTS)
   # split's order, put - host code only, no GPU
   add_executable(ds4_store_test tests/ds4_store_test.cpp)
   target_include_directories(ds4_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4)
+  if(WIN32)
+    # (ds4_os.hpp's Windows half includes strata/platform/commit.hpp)
+    target_include_directories(ds4_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  endif()
   target_link_libraries(ds4_store_test PRIVATE strata_warnings Threads::Threads)
   add_test(NAME ds4_store_test COMMAND ds4_store_test ${CMAKE_CURRENT_BINARY_DIR})
   set_tests_properties(ds4_store_test PROPERTIES TIMEOUT 120)
@@ -1756,3 +1798,6 @@ if(STRATA_BUILD_TESTS)
     add_subdirectory(tests)
   endif()
 endif()
+
+# the glm-dsa (GLM-5.3) sources and tests, kept in their own file
+include(cmake/glm_dsa.cmake OPTIONAL)
