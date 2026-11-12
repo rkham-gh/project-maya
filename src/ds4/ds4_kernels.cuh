@@ -120,6 +120,12 @@ void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float*
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s);
 /// The same for T activations x[t] = x + t ldx into y + t ldy, each weight read once for all of them; each output is
 /// gemv_f16's bit for bit.
+#if defined(STRATA_USE_HIP)
+/// (DS4_PROMPT_F16) rows of n values an FP16-out GEMM left as FP16 at the start of each FP32 row (ldy floats apart), widened
+/// in place (exact); count_bad: the values that are not finite counted (widen_bad_take, the current device)
+void widen_rows_f16(float* y, int n, size_t ldy, int rows, cudaStream_t s, int count_bad = 0);
+unsigned long long widen_bad_take();
+#endif
 void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha, float* y, size_t ldy,
                    cudaStream_t s);
 /// The router's weights on the device: F32 (f), or the pack's BF16 rows as they are (h; half the bytes to read, each
@@ -192,8 +198,8 @@ struct Rows {
 /// with candidates p = cand[t][i / blk] * blk + i % blk for i < lim.k[t] * blk; positions >= lim.n[t] (or past the
 /// query's candidates) -> -inf.  q rows heads * hd apart, w rows 64, cand rows cand_stride, out rows out_stride; the keys
 /// k rows of format kfmt (the cache's kKvFp4p, or kKvBf16).
-/// With kKvFp4p keys and DS4_INDEX_TC=1 (and tc) the tensor cores' kernel (on RDNA 3 its WMMAs): the same products, FP32
-/// sums in another order.
+/// With kKvFp4p keys (and tc) the tensor cores' kernel where it is on: HIP gfx11 (RDNA 3 / 3.5, its WMMAs) by default,
+/// DS4_INDEX_TC=0 off; CUDA (8.0+) with DS4_INDEX_TC=1. The same products, FP32 sums in another order.
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
                  int cand_stride, int blk, const Rows& lim, float* out, long long out_stride, cudaStream_t s,
                  int kfmt = kKvFp4p, bool tc = true);
@@ -408,7 +414,7 @@ struct RoutePair {
     const float *a_logits = nullptr, *a_bias = nullptr;   // route_ahead's
     int a_n = 0, m = 0, off = 0;
     int T = 1;   // (=2: a window's rows, 1 .. kWin)
-    float rs_w = 0.0f;   // (route_pair sets these from STRATA_DS4_RESIDENT_SKIP_W / _TOPK)
+    float rs_w = 0.0f;   // (route_pair sets these from MAYA_DS4_RESIDENT_SKIP_W / _TOPK)
     int rs_k = 0;
 };
 bool route_pair(const RoutePair& a, cudaStream_t s);

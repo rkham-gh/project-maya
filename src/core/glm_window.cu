@@ -12,9 +12,12 @@
 // through the convolution and the recurrence alone.  The DSA caches take all T positions; a rejected one is
 // rewritten when its position is processed again, before any query reads it (a pooled indexer key is built from the
 // cached keys when its pool's last position is processed, and queries read only completed pools).
+#include "glm_dsa_fast.hpp"   // glm-dsa L1-4: the mixer's window rows
 #include "glm_fast_state.hpp"
+#include "glm_residual.hpp"   // glm-dsa L1-4: the plain residual's embed / head for a window's rows
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/exl3.hpp"
+#include "strata/core/glm_req_knobs.hpp"   // glm-dsa request knobs
 #include "strata/kernels/glm_fast.hpp"
 
 #include "ggml.h"
@@ -27,6 +30,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <iterator>
@@ -58,33 +62,19 @@ struct KdaIn {
     float *proj[3], *fa, *ga, *beta;
 };
 
-#if defined(STRATA_USE_HIP)
-static bool is_gfx906_device_cached(int dev) {
-    if (dev < 0 || dev >= 16) return false;
-    static int arch_cache[16] = {};   // 0: unknown, 1: gfx906, -1: other
-    int cached = __atomic_load_n(&arch_cache[dev], __ATOMIC_ACQUIRE);
-    if (cached != 0) return cached > 0;
-    hipDeviceProp_t prop{};
-    const bool ok = (hipGetDeviceProperties(&prop, dev) == hipSuccess) &&
-                    (std::strncmp(prop.gcnArchName, "gfx906", 6) == 0);
-    __atomic_store_n(&arch_cache[dev], ok ? 1 : -1, __ATOMIC_RELEASE);
-    return ok;
-}
-
-static bool is_gfx906_p2p_enabled(int dev_a, int dev_b) {
+static bool is_p2p_enabled() {
     static const bool p2p_env = []() {
         const char* val = std::getenv("MAYA_GLM_P2P");
-        if (val == nullptr) val = std::getenv("STRATA_GLM_P2P");
         return val != nullptr && std::atoi(val) != 0;
     }();
-    return p2p_env && is_gfx906_device_cached(dev_a) && is_gfx906_device_cached(dev_b);
+    return p2p_env;
 }
 
 static std::mutex p2p_mu;
 static float* p2p_slot_buf[16] = {};
 static size_t p2p_slot_bytes[16] = {};
 
-static void free_gfx906_p2p_buf(int dev) {
+static void free_p2p_buf(int dev) {
     if (dev < 0 || dev >= 16) return;
     std::lock_guard<std::mutex> lk(p2p_mu);
     if (p2p_slot_buf[dev] != nullptr) {
@@ -98,15 +88,15 @@ static void free_gfx906_p2p_buf(int dev) {
     }
 }
 
-static bool enable_gfx906_peer_cached(int dst_dev, int src_dev) {
+static bool enable_peer_cached(int dst_dev, int src_dev) {
     if (dst_dev < 0 || dst_dev >= 16 || src_dev < 0 || src_dev >= 16 || dst_dev == src_dev) return false;
-    if (!is_gfx906_p2p_enabled(dst_dev, src_dev)) return false;
-    static int peer_cache[16][16] = {};   // 0: unknown, 1: enabled, -1: unsupported
-    int cached = __atomic_load_n(&peer_cache[dst_dev][src_dev], __ATOMIC_ACQUIRE);
+    if (!is_p2p_enabled()) return false;
+    static std::atomic<int> peer_cache[16][16]{};   // 0: unknown, 1: enabled, -1: unsupported
+    int cached = peer_cache[dst_dev][src_dev].load(std::memory_order_acquire);
     if (cached != 0) return cached > 0;
     static std::mutex peer_mu;
     std::lock_guard<std::mutex> lk(peer_mu);
-    cached = __atomic_load_n(&peer_cache[dst_dev][src_dev], __ATOMIC_RELAXED);
+    cached = peer_cache[dst_dev][src_dev].load(std::memory_order_relaxed);
     if (cached != 0) return cached > 0;
     int can_peer = 0;
     bool ok = false;
@@ -121,10 +111,9 @@ static bool enable_gfx906_peer_cached(int dst_dev, int src_dev) {
     } else {
         (void) cudaGetLastError();
     }
-    __atomic_store_n(&peer_cache[dst_dev][src_dev], ok ? 1 : -1, __ATOMIC_RELEASE);
+    peer_cache[dst_dev][src_dev].store(ok ? 1 : -1, std::memory_order_release);
     return ok;
 }
-#endif
 
 KdaIn kda_in(const Glm5Geometry& g, float* base, int tmax, int t) {
     const size_t DI = (size_t) g.d_inner(), T = (size_t) tmax;
@@ -341,7 +330,7 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
             err = "glm window: the window's events did not create";
             return false;
         }
-    if (getenv("STRATA_GLM_WIN_UNION") != nullptr) {
+    if (getenv("MAYA_GLM_WIN_UNION") != nullptr) {
         const size_t nu = (size_t) (l1_ - l0_) * (size_t) tmax * 8;
         if (cudaMalloc((void**) &W.uid, nu * sizeof(int)) != cudaSuccess) {
             cudaGetLastError();
@@ -349,6 +338,8 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
         }
         W.uid_h.assign(nu, -1);
     }
+    // glm-dsa L1-4: the mixer's own row buffers for a window, with the window's (before the expert pool is sized)
+    if (g.arch == GlmArch::GlmDsa && F->dsa && !glmdsa::win_rows_begin(*F->dsa, 0, 1, kWinMax, F->cs, err)) return false;
     W.tmax = tmax;
     return true;
 }
@@ -413,9 +404,7 @@ void Glm5Model::win_free() {
     if (fast_->rep) cudaFree(fast_->rep);
     fast_->rep = nullptr;
     kda_bak_cur_ = false;
-#if defined(STRATA_USE_HIP)
-    free_gfx906_p2p_buf(dev_);
-#endif
+    free_p2p_buf(dev_);
 }
 
 // tokens t0 .. t0 + T - 1 of the window (a staggered window's group; all of it: t0 0)
@@ -447,7 +436,7 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
                 0, E, g.idx_key);
     j[4] = cols({Ly.idx_proj, nullptr, x0, W.iw + (size_t) t0 * g.idx_heads, nullptr, prescale, gf::kTypeBF16, E,
                  g.idx_heads}, 0, E, g.idx_heads);
-    static const bool prof = getenv("STRATA_GLM_WIN_PROF") != nullptr;
+    static const bool prof = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     const auto mark = [&](const char* nm) {
         if (prof) W.mark(nm, s);
     };
@@ -497,9 +486,9 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
     mark("dsa_q_mv");
     // the absorbed MLA: wk_b . q of every token at once, each token's attention over its own selected cells, then
     // wv_b . ctx of every token at once (mla()'s arithmetic; the head-wise weights read once, not T times).
-    // STRATA_GLM_WIN_MLA=0: mla() per token (A/B)
+    // MAYA_GLM_WIN_MLA=0: mla() per token (A/B)
     static const bool mla_batch = [] {
-        const char* v = getenv("STRATA_GLM_WIN_MLA");
+        const char* v = getenv("MAYA_GLM_WIN_MLA");
         return v == nullptr || std::atoi(v) != 0;
     }();
     const int64_t qd = (int64_t) g.n_head * g.qk_nope, ad = (int64_t) g.n_head * g.kv_lora;
@@ -590,12 +579,16 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
     cudaStream_t s = F->cs;
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd, FFs = g.n_ff_exp * g.n_shared;
-    static const bool prof = getenv("STRATA_GLM_WIN_PROF") != nullptr;
+    static const bool prof = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     if (part != 2) {
         gf::MvJob j[3];
         const void* xq0 = (const uint8_t*) W.xq + (size_t) t0 * W.xq_s;
         j[0] = {Ly.router, nullptr, W.x + (size_t) t0 * E, W.rlog + (size_t) t0 * g.n_expert, nullptr, 1.0f, gf::kTypeBF16, E,
                 g.n_expert};
+        if (g.arch == GlmArch::GlmDsa) {   // glm-dsa L1-4: the router the token path reads (F32 / BF16, router_type)
+            j[0].w = Ly.router_w;
+            j[0].type = Ly.router_type;
+        }
         const float* x0 = W.x + (size_t) t0 * E;
         j[1] = {Ly.sh_gate.q, xq0, x0, W.sh_g + (size_t) t0 * FFs, nullptr, 1.0f, Ly.sh_gate.type, E, FFs};
         j[2] = {Ly.sh_up.q, xq0, x0, W.sh_u + (size_t) t0 * FFs, nullptr, 1.0f, Ly.sh_up.type, E, FFs};
@@ -628,18 +621,19 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
         return a;
     };
     const bool lane = (F->cpu_plan != 0ull || F->helper.device() >= 0) && F->cpu_fmt[(size_t) il].n_ff > 0;
-    // STRATA_GLM_TRUNK_KEEP / _MAP: a window token leaves out the same experts the token path would (8: none)
+    // MAYA_GLM_TRUNK_KEEP / _MAP: a window token leaves out the same experts the token path would (8: none)
     const int keep = il == mtp_il_ ? 8 : glmfast::trunk_skip_from(il);
-    static const int promote_min = [] {
-        const char* v = getenv("STRATA_GLM_PROMOTE_MIN");
+    static const int promote_min_start = [] {
+        const char* v = getenv("MAYA_GLM_PROMOTE_MIN");
         return v ? std::max(0, std::atoi(v)) : 0;
     }();
+    const int promote_min = glmknob::get(glmknob::PromoteMin, promote_min_start);   // glm-dsa request knobs: GEN promote_min=
     const float* ah_bias[gf::kAhead] = {nullptr, nullptr, nullptr, nullptr};
     // the batched window's routes on two window lanes (both sockets' pools answer it, win_lane): every RAM-tier expert
     // to the CPU - the calibrated plan priced one pool against PCIe, and a merged layer has two (a 3090's 2.1 ms PCIe
-    // fetch is several experts' CPU time there).  STRATA_GLM_WIN_ALLCPU=0: the calibrated plan
+    // fetch is several experts' CPU time there).  MAYA_GLM_WIN_ALLCPU=0: the calibrated plan
     static const bool all_cpu_env = [] {
-        const char* v = getenv("STRATA_GLM_WIN_ALLCPU");
+        const char* v = getenv("MAYA_GLM_WIN_ALLCPU");
         return v == nullptr || std::atoi(v) != 0;
     }();
     unsigned long long win_plan = F->cpu_plan;
@@ -649,19 +643,19 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
     }
     // the batched MoE: every token's route, tiers and fetch first (each into its own plan, CPU answer slot and seq
     // word; the scratch slots once each), then each distinct expert once for all of them (gf::moe_win_experts), then
-    // the CPU lane's answers - which ran while the GPU computed.  STRATA_GLM_WIN_BATCH=0: token by token (A/B).  Off by
+    // the CPU lane's answers - which ran while the GPU computed.  MAYA_GLM_WIN_BATCH=0: token by token (A/B).  Off by
     // default on AMD: the batched experts' kernels are the generic ones, the token path's are RDNA3's (the Halo APUs'
     // expert kernels) - a Radeon 8065S's MTP decode (Maya-S, 256-token answers) ran 26.7 / 25.7 tok/s token by token,
     // 22.7 / 22.3 batched (and 17.2 / 16.5 batched and staggered, below), the same tokens
-    static const bool batch_env = glmfast::off_by_default_on_amd("STRATA_GLM_WIN_BATCH");
-    static const bool prof_b = getenv("STRATA_GLM_WIN_PROF") != nullptr;
+    static const bool batch_env = glmfast::off_by_default_on_amd("MAYA_GLM_WIN_BATCH");
+    static const bool prof_b = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     // ... and with it off (AMD): the routes as the batched MoE takes them (each token its own plan), then every token's
     // experts on the token path's kernels in one gate/up and one down launch (gf::moe_experts_multi) - each token's
     // arithmetic its own, the blocks of all the tokens for a chunk of rows side by side, so an expert two of them route
     // is read from DRAM once (a Radeon 8065S's window layer: ~19 distinct experts of ~24 routed).
-    // STRATA_GLM_WIN_MULTI=0: one token after another (A/B)
+    // MAYA_GLM_WIN_MULTI=0: one token after another (A/B)
     static const bool multi_env = [] {
-        const char* v = getenv("STRATA_GLM_WIN_MULTI");
+        const char* v = getenv("MAYA_GLM_WIN_MULTI");
         return v == nullptr || std::atoi(v) != 0;
     }();
     const bool multi = !batch_env && multi_env && !Ly.exl3 && part == 0 && T > 1;
@@ -692,7 +686,8 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
                           g.norm_w != 0, il, W.x + (size_t) t * E, E, mt, W.sh_g + (size_t) t * FFs,
                           W.sh_u + (size_t) t * FFs, g.swiglu_shexp, FFs, (uint8_t*) W.sh_hq + (size_t) t * W.sh_hq_s, s,
                           nullptr, nullptr, 0, nullptr, ah_bias, 0, keep, lane ? win_plan : 0ull, promote_min, 0, 0, t,
-                          scr, t0 + T);
+                          scr, t0 + T, 8, 0.0f, 0.0f, 0, true,
+                          g.arch == GlmArch::GlmDsa ? gf::kRouteNormHf : gf::kRouteNormClamp);   // glm-dsa L1-4 (B5.1)
             ++F->expected;
             // (every expert in VRAM: the wait and the fetch are no-ops - fast_moe's all_resident, 2 launches a token)
             if (!F->all_resident) {
@@ -752,9 +747,9 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
             sh_out = W.sh_out + (size_t) t0 * E;
         }
         // EXL3: each distinct expert once for all its tokens (exl3::win_experts, gf::moe_win_experts' groups);
-        // STRATA_GLM_WIN_X3=0: each token's routed experts on the token path's kernels (A/B - the same bits)
+        // MAYA_GLM_WIN_X3=0: each token's routed experts on the token path's kernels (A/B - the same bits)
         static const bool x3_batch = [] {
-            const char* v = getenv("STRATA_GLM_WIN_X3");
+            const char* v = getenv("MAYA_GLM_WIN_X3");
             return v == nullptr || std::atoi(v) != 0;
         }();
         if (Ly.exl3 && x3_batch && W.wh != nullptr && x3::several_ok()) {
@@ -847,7 +842,8 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
         gf::moe_route(W.rlog + (size_t) t * g.n_expert, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale,
                       g.norm_w != 0, il, x, E, md, W.sh_g + (size_t) t * FFs, W.sh_u + (size_t) t * FFs,
                       g.swiglu_shexp, FFs, F->sh_hq, s, nullptr, nullptr, 0, nullptr, ah_bias, 0, keep,
-                      lane ? F->cpu_plan : 0ull, promote_min);
+                      lane ? F->cpu_plan : 0ull, promote_min, 0, 0, 0, nullptr, 0, 8, 0.0f, 0.0f, 0, true,
+                      g.arch == GlmArch::GlmDsa ? gf::kRouteNormHf : gf::kRouteNormClamp);   // glm-dsa L1-4 (B5.1)
         ++F->expected;
         if (!F->all_resident) {
             gf::moe_wait(md, E, s);
@@ -878,6 +874,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
 }
 
 bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
+    if (!g_.mhc()) return fast_window_layers_plain(p0, T, err);   // glm-dsa L1-4: plain residual (glm_residual.cu)
     FastState* F = fast_;
     auto& W = F->win;
     const Glm5Geometry& g = g_;
@@ -905,6 +902,9 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     };
     const auto hc_rows = [&](int il, bool attn, int rc, int t0, int n) {
         const auto& Ly = F->L[(size_t) il];
+        // (--ablate: the window's rows are the bound conversation's - their writes lose the direction first)
+        if (!attn) ablate(W.mixer + (size_t) t0 * E, n, s);
+        else if (il != l0_) ablate(W.ffn + (size_t) t0 * E, n, s);
         for (int t = t0; t < t0 + n; ++t) {
             gf::HcArgs h;
             h.block_out = attn ? (il == l0_ ? nullptr : W.ffn + (size_t) t * E) : W.mixer + (size_t) t * E;
@@ -930,7 +930,7 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
             gf::hc(h, s);
         }
     };
-    static const bool prof = getenv("STRATA_GLM_WIN_PROF") != nullptr;
+    static const bool prof = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     const auto mark = [&](const char* nm) {
         if (prof) W.mark(nm, s);
     };
@@ -1008,12 +1008,12 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     // answers one group's experts the device runs the other group's attention and routes, where it used to wait.
     // One stream: the order alone keeps every dependency (B's attention reads A's caches and recurrent state at the
     // layer; the routes reach the host in order A(l), B(l), A(l + 1), ..), and each token's arithmetic is the same.
-    // STRATA_GLM_WIN_STAGGER=0: all the tokens a layer at a time (A/B)
+    // MAYA_GLM_WIN_STAGGER=0: all the tokens a layer at a time (A/B)
     static const bool stagger_env = [] {
-        const char* v = getenv("STRATA_GLM_WIN_STAGGER");
+        const char* v = getenv("MAYA_GLM_WIN_STAGGER");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    static const bool batch_env = glmfast::off_by_default_on_amd("STRATA_GLM_WIN_BATCH");   // (fast_moe_window's)
+    static const bool batch_env = glmfast::off_by_default_on_amd("MAYA_GLM_WIN_BATCH");   // (fast_moe_window's)
     const bool stagger = stagger_env && batch_env && T >= 2 && !W.per_token && W.mplan_ptr != nullptr;
     if (stagger) {
         const int ka = (T + 1) / 2, kb = T - ka;
@@ -1030,6 +1030,7 @@ bool Glm5Model::fast_window_layers(int64_t p0, int T, std::string& err) {
     }
     // the last layer's write half: R (in the other buffer) = post x ffn + comb . R
     const int rc = rc_in[(size_t) (l1_ - l0_)];
+    ablate(W.ffn, T, s);
     for (int t = 0; t < T; ++t)
         gf::hc_post(W.ffn + (size_t) t * E, W.R[rc] + (size_t) t * hcE, W.post + (size_t) t * 8,
                     W.comb + (size_t) t * 16, E, W.R[rc ^ 1] + (size_t) t * hcE, s);
@@ -1056,7 +1057,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         err = "glm window: past the context";
         return false;
     }
-    static const bool hprof = getenv("STRATA_GLM_WIN_PROF") != nullptr;
+    static const bool hprof = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     using hclk = std::chrono::steady_clock;
     auto h0 = hclk::now();
     const auto hlap = [&](double& acc) {
@@ -1116,25 +1117,25 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         }
         cudaMemcpyAsync(W.emb, W.emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, F->cs);
         for (int t = 0; t < T; ++t)
-            gf::embed_streams(W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, E, F->cs);
+            if (g.mhc())
+                gf::embed_streams(W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, E, F->cs);
+            else   // glm-dsa L1-4: the plain residual's row
+                glmres::res_embed(g, W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, F->cs);
     }
     if (!fast_window_layers(p0, T, err)) return false;
-    // each later part: the rows cross over through the previous part's pinned buffer (or direct P2P BAR when enabled)
+    // each later part: the rows cross over through the previous part's pinned buffer (or direct peer copies when enabled)
     Glm5Model* tail = this;
     for (Glm5Model* B = split_next_.get(); B != nullptr; B = B->split_next_.get()) {
         auto& WA = tail->fast_->win;
         auto& WB = B->fast_->win;
         const size_t bytes = (size_t) T * hcE * sizeof(float);
-#if defined(STRATA_USE_HIP)
-        if (enable_gfx906_peer_cached(B->dev_, tail->dev_)) {
+        if (enable_peer_cached(B->dev_, tail->dev_)) {
             cudaSetDevice(tail->dev_);
             cudaEventRecord(WA.ev_hop, tail->fast_->cs);
             cudaSetDevice(B->dev_);
             cudaStreamWaitEvent(B->fast_->cs, WA.ev_hop, 0);
             cudaMemcpyPeerAsync(WB.R[0], B->dev_, WA.R[WA.out], tail->dev_, bytes, B->fast_->cs);
-        } else
-#endif
-        {
+        } else {
             cudaSetDevice(tail->dev_);
             cudaMemcpyAsync(WA.hop_h, WA.R[WA.out], bytes, cudaMemcpyDeviceToHost, tail->fast_->cs);
             cudaEventRecord(WA.ev_hop, tail->fast_->cs);
@@ -1150,8 +1151,12 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
     auto& WT = FT->win;
     cudaSetDevice(tail->dev_);
     for (int t = 0; t < T; ++t)
-        gf::head_prep(WT.R[WT.out] + (size_t) t * hcE, tail->w_.at("output_norm.weight"), g.norm_eps, E,
-                      WT.head_x + (size_t) t * E, (uint8_t*) WT.head_xq + (size_t) t * WT.xq_s, FT->cs);
+        if (g.mhc())
+            gf::head_prep(WT.R[WT.out] + (size_t) t * hcE, tail->w_.at("output_norm.weight"), g.norm_eps, E,
+                          WT.head_x + (size_t) t * E, (uint8_t*) WT.head_xq + (size_t) t * WT.xq_s, FT->cs);
+        else   // glm-dsa L1-4: the plain residual's head (the token path's res_head)
+            glmres::res_head(g, WT.R[WT.out] + (size_t) t * hcE, tail->w_.at("output_norm.weight"),
+                             WT.head_x + (size_t) t * E, (uint8_t*) WT.head_xq + (size_t) t * WT.xq_s, FT->cs);
     const WSlot& ow = tail->ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, WT.head_xq, WT.head_x, WT.logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
     if (ow.type == 0) o.w = ow.f32;
@@ -1328,10 +1333,9 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     auto& W = F->win;
     const int64_t p = fast_->win.p0 + t;
     const int sl = W.bank * kPipeMax + t;   // this window's slot of token t
-#if defined(STRATA_USE_HIP)
     const size_t needed_p2p_bytes = (size_t) kPipeSlots * hcE * sizeof(float);
     auto get_p2p_buf = [&](int src_dev, int dst_dev) -> float* {
-        if (!enable_gfx906_peer_cached(dst_dev, src_dev)) return nullptr;
+        if (!enable_peer_cached(dst_dev, src_dev)) return nullptr;
         std::lock_guard<std::mutex> lk(p2p_mu);
         if (p2p_slot_buf[src_dev] != nullptr && p2p_slot_bytes[src_dev] < needed_p2p_bytes) {
             int cur = 0;
@@ -1357,7 +1361,6 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
         }
         return p2p_slot_buf[src_dev];
     };
-#endif
     cudaSetDevice(m->dev_);
     if (prev == nullptr) {
         cudaMemcpyAsync(W.emb + (size_t) sl * E, W.emb_h + (size_t) sl * E, (size_t) E * sizeof(float),
@@ -1365,12 +1368,9 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
         gf::embed_streams(W.emb + (size_t) sl * E, m->state_, E, F->cs);
     } else {
         cudaStreamWaitEvent(F->cs, prev->fast_->win.ev_tok[sl], 0);
-#if defined(STRATA_USE_HIP)
         if (float* pbuf = get_p2p_buf(prev->dev_, m->dev_)) {
             cudaMemcpyPeerAsync(m->state_, m->dev_, pbuf + (size_t) sl * hcE, prev->dev_, hcE * sizeof(float), F->cs);
-        } else
-#endif
-        {
+        } else {
             cudaMemcpyAsync(m->state_, prev->fast_->win.hop_h + (size_t) sl * hcE, hcE * sizeof(float),
                             cudaMemcpyHostToDevice, F->cs);
         }
@@ -1386,12 +1386,9 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     }
     if (m->split_next_) {
         gf::set_skip(nullptr);
-#if defined(STRATA_USE_HIP)
         if (float* pbuf = get_p2p_buf(m->dev_, m->split_next_->dev_)) {
             cudaMemcpyAsync(pbuf + (size_t) sl * hcE, m->state_, hcE * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
-        } else
-#endif
-        {
+        } else {
             cudaMemcpyAsync(W.hop_h + (size_t) sl * hcE, m->state_, hcE * sizeof(float), cudaMemcpyDeviceToHost, F->cs);
         }
         cudaEventRecord(W.ev_tok[sl], F->cs);
@@ -1489,9 +1486,9 @@ bool Glm5Model::win_head_split(int t, int sl, const float* hx, float* lg, std::s
         cudaStreamWaitEvent(F->cs, h->hh_ev_[sl], 0);
         cudaMemcpyAsync(own + 2, ht_pair_h_ + (size_t) sl * 2, 2 * sizeof(int), cudaMemcpyHostToDevice, F->cs);
         gf::argmax_join(own, own + 2, c0, W.tok + sl, F->cs);
-        // STRATA_GLM_HEAD_SPLIT_CHECK=1 (debug, slower): the whole row's GEMV and argmax too, the picks compared on the
+        // MAYA_GLM_HEAD_SPLIT_CHECK=1 (debug, slower): the whole row's GEMV and argmax too, the picks compared on the
         // host (the count printed at exit)
-        static const bool check = getenv("STRATA_GLM_HEAD_SPLIT_CHECK") != nullptr;
+        static const bool check = getenv("MAYA_GLM_HEAD_SPLIT_CHECK") != nullptr;
         if (check) {
             static float* clg = nullptr;
             static int* ctok = nullptr;
@@ -1530,10 +1527,10 @@ bool Glm5Model::win_head_split(int t, int sl, const float* hx, float* lg, std::s
     return true;
 }
 
-// STRATA_GLM_WIN_THREADS=0: the window's tokens enqueued by the calling thread alone (A/B)
+// MAYA_GLM_WIN_THREADS=0: the window's tokens enqueued by the calling thread alone (A/B)
 static bool win_threads_on() {
     static const bool on = [] {
-        const char* v = getenv("STRATA_GLM_WIN_THREADS");
+        const char* v = getenv("MAYA_GLM_WIN_THREADS");
         return v == nullptr || std::atoi(v) != 0;
     }();
     return on;
@@ -1578,7 +1575,7 @@ bool Glm5Model::win_pipe_begin(int32_t first, std::string& err, const strata::ke
     // a fresh window waits for the devices; one that follows a window's late tokens only queues behind them.  Each
     // part's begin (win_pipe_begin_part) runs on its crew thread ahead of its share of the first token, the parts at
     // once: here, one after the other, the idle parts' boundaries held the first part's anchor ~1.7 ms (and the
-    // drafter's start behind it; EXL3-4.05bpw over 9 GPUs).  STRATA_GLM_WIN_THREADS=0: here, as before
+    // drafter's start behind it; EXL3-4.05bpw over 9 GPUs).  MAYA_GLM_WIN_THREADS=0: here, as before
     const bool crew_on = split_next_ != nullptr && win_threads_on();
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         ++n_parts;
@@ -1594,9 +1591,9 @@ bool Glm5Model::win_pipe_begin(int32_t first, std::string& err, const strata::ke
         W.pick_sampled = sp != nullptr && (!sp->greedy || sp->penalty_last_n > 0);   // (penalties: the sampler's pick)
         if (W.pick_sampled) W.pick_sp = *sp;
     }
-    // the tokens past a wrong draft skip their heavy kernels (STRATA_GLM_WIN_SKIP=0: they run anyway)
+    // the tokens past a wrong draft skip their heavy kernels (MAYA_GLM_WIN_SKIP=0: they run anyway)
     static const bool skip_on = [] {
-        const char* v = getenv("STRATA_GLM_WIN_SKIP");
+        const char* v = getenv("MAYA_GLM_WIN_SKIP");
         return v == nullptr || std::atoi(v) != 0;
     }();
     {
@@ -1741,7 +1738,7 @@ bool Glm5Model::win_pipe_settle(std::string& err) {
     return true;
 }
 
-// (STRATA_GLM_DFLASH_TL) when part k's crew thread finished its begin for this window's first token
+// (MAYA_GLM_DFLASH_TL) when part k's crew thread finished its begin for this window's first token
 std::chrono::steady_clock::time_point Glm5Model::win_pipe_begun_at(int k) const {
     if (crew_ == nullptr || k < 0 || k >= (int) crew_->w.size()) return {};
     return crew_->w[(size_t) k]->t_begun;
@@ -1812,7 +1809,7 @@ bool Glm5Model::win_pipe_end(int32_t* out, std::string& err) {
     }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         m->pos_ = p0 + T;
-        // STRATA_GLM_PROF: the T tokens' phases on each part (its "start" holds the wait for the previous part)
+        // MAYA_GLM_PROF: the T tokens' phases on each part (its "start" holds the wait for the previous part)
         if (m->fast_->prof_on) {
             m->fast_->collect();
             if (m->fast_->ptokens > 0) m->fast_->ptokens += (uint64_t) T - 1;
@@ -1833,7 +1830,7 @@ bool Glm5Model::window_pipe(const int32_t* tokens, int T, int32_t* out, std::str
         err = "glm window: past the context";
         return false;
     }
-    static const bool hprof = getenv("STRATA_GLM_WIN_PROF") != nullptr;
+    static const bool hprof = getenv("MAYA_GLM_WIN_PROF") != nullptr;
     using hclk = std::chrono::steady_clock;
     auto h0 = hclk::now();
     const auto hlap = [&](double& acc) {
@@ -1898,9 +1895,9 @@ void Glm5Model::win_commit_part(int n_keep) {
     cudaSetDevice(dev_);
     // the kept tokens replayed onto the backup (the states before the window) through every recurrent layer at once,
     // then the backup copied to the live states: one copy (not a restore and the next window's backup) and two
-    // launches a token (not two a token and layer).  STRATA_GLM_WIN_REPLAY=0: restored, then layer by layer (A/B)
+    // launches a token (not two a token and layer).  MAYA_GLM_WIN_REPLAY=0: restored, then layer by layer (A/B)
     static const bool batched = [] {
-        const char* v = getenv("STRATA_GLM_WIN_REPLAY");
+        const char* v = getenv("MAYA_GLM_WIN_REPLAY");
         return v == nullptr || std::atoi(v) != 0;
     }();
     if (batched && F->rep != nullptr && kda_bak_ != nullptr && g.kda_head_dim == 128) {
