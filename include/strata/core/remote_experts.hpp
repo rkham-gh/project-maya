@@ -128,6 +128,10 @@ private:
     int device_ = -1, n_embd_ = 0, n_ff_ = 0;
     cudaStream_t stream_ = nullptr;
     uint8_t* arena_ = nullptr;
+    // MAYA_GLM_HELPER_KEEPALIVE=1 (fork branch glm-2gpu): a one-warp kernel asleep for ka_ns_ on this lowest-priority
+    // stream, launched again by a call once the last has ended, so a discrete helper's driver keeps its clocks up
+    cudaStream_t ka_stream_ = nullptr;
+    unsigned long long ka_ns_ = 0;
     float *x_ = nullptr, *out_ = nullptr;
     void *xq_ = nullptr, *hq_ = nullptr;
     strata::kernels::glmf::MoeDev plan_;

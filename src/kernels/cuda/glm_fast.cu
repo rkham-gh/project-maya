@@ -7497,4 +7497,17 @@ void argmax_join(const int* a, const int* b, int c0, int* out, cudaStream_t s) {
     launch_check("argmax_join");
 }
 
+namespace {
+__device__ __forceinline__ unsigned long long keepalive_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__global__ void keepalive_kernel(unsigned long long ns) {
+    const unsigned long long t0 = keepalive_ns();
+    while (keepalive_ns() - t0 < ns) __nanosleep(20000);
+}
+}  // namespace
+void keepalive(unsigned long long ns, cudaStream_t s) { keepalive_kernel<<<1, 32, 0, s>>>(ns); }
+
 }  // namespace strata::kernels::glmf

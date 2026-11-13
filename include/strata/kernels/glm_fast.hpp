@@ -78,6 +78,9 @@ void set_skip(const int* flag);
 void skip_gate(const volatile int* host_from, int t, int* flag, cudaStream_t s);
 /// Whether moe_gate_up() / moe_down() serve routed experts of this type.
 bool moe_supported(int type);
+/// One warp asleep for ns nanoseconds on s: a helper GPU's work kept "busy" for its driver's clocks
+/// (MAYA_GLM_HELPER_KEEPALIVE, fork branch glm-2gpu)
+void keepalive(unsigned long long ns, cudaStream_t s);
 /// Kernel launches of this family that failed since the process started (each is also printed); the forward
 /// that sees the count grow reports an error instead of computing on.
 int launch_errors();

@@ -115,6 +115,26 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
         err = "CUDA" + std::to_string(device) + " experts: the EXL3 kernels' scratch did not allocate";
         return false;
     }
+    // MAYA_GLM_HELPER_KEEPALIVE=1 (fork branch glm-2gpu; a discrete helper): its work comes in bursts of tens of
+    // microseconds a layer, so on its own its driver leaves it in P3 / P5 - an RTX 3090 helper measured 420-1,260 MHz
+    // and its memory at 5,001 or 810 MHz of 9,751 under the fork's maya-ink, whose expert GEMVs took 180-280 us there
+    // against 15-23 on the 5090.  A one-warp kernel asleep in __nanosleep on a non-blocking stream of the lowest
+    // priority makes the card count as busy; each ends by itself after MAYA_GLM_HELPER_KEEPALIVE_MS (50) and the next
+    // call launches another (one left running forever hung maya-ink's first token: some call waits for all of a
+    // card's work), so the card drops back to idle once no tokens are written.
+    if (const char* kv = std::getenv("MAYA_GLM_HELPER_KEEPALIVE"); kv && std::atoi(kv) != 0 && !integrated_) {
+        int lo = 0, hi = 0;
+        const char* km = std::getenv("MAYA_GLM_HELPER_KEEPALIVE_MS");
+        ka_ns_ = (unsigned long long) std::max(1, km ? std::atoi(km) : 50) * 1000000ull;
+        if (cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess &&
+            cudaStreamCreateWithPriority(&ka_stream_, cudaStreamNonBlocking, lo) == cudaSuccess) {
+            std::fprintf(stderr, "glm helper CUDA%d: a keep-alive kernel holds its clocks up while tokens are written "
+                                 "(%llu ms each)\n", device, ka_ns_ / 1000000ull);
+        } else {
+            (void) cudaGetLastError();
+            ka_stream_ = nullptr;
+        }
+    }
     uint8_t* at = arena_;
     const auto take = [&](size_t bytes) {
         void* p = at;
@@ -491,6 +511,11 @@ bool GlmExpertHelper::start(const strata::kernels::exl3::ExpertLayout* xl, int g
     for (int i = 0; i < ne; ++i) bytes += slots_[(size_t) keys[i]].bytes;
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
+    if (ka_stream_ && cudaStreamQuery(ka_stream_) == cudaSuccess) {   // (MAYA_GLM_HELPER_KEEPALIVE: the next one)
+        gf::keepalive(ka_ns_, ka_stream_);
+        (void) cudaStreamQuery(ka_stream_);   // (submitted now: WDDM holds launches until something does)
+        (void) cudaGetLastError();
+    }
     const auto t0 = std::chrono::steady_clock::now();
     // (EXL3: the family's launch failures only print and count - DS4_HELPER's check, around this call's kernels)
     const int x3_errors = xl != nullptr ? x3::launch_errors() : 0;
@@ -629,6 +654,10 @@ void GlmExpertHelper::close() {
         if (pool_) cudaFree(pool_);
         if (stream_) cudaStreamDestroy(stream_);
         if (copy_stream_) cudaStreamDestroy(copy_stream_);
+        if (ka_stream_) {
+            cudaStreamSynchronize(ka_stream_);
+            cudaStreamDestroy(ka_stream_);
+        }
         for (auto& e : ev_)
             if (e) cudaEventDestroy(e);
         for (auto& e : copy_ev_)
@@ -638,6 +667,7 @@ void GlmExpertHelper::close() {
         if (rows_host_) cudaFreeHost(rows_host_);
     }
     copy_stream_ = nullptr;
+    ka_stream_ = nullptr;
     copy_ev_.clear();
     copy_keys_.clear();
     rows_arena_ = rows_host_ = nullptr;
