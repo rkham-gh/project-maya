@@ -148,4 +148,7 @@ void swiglu_f32_rows(const float* gu, int n, int ff, float* h, cudaStream_t s);
 /// out[c] = sum over i < n of y[i][c] (rows of m; in order of i), c < m.
 void sum_rows(const float* y, int n, int m, float* out, cudaStream_t s);
 
+/// One warp that sleeps for ns nanoseconds: a card's work kept "busy" for its driver's clocks.
+void keepalive(unsigned long long ns, cudaStream_t s);
+
 }  // namespace nem::k
