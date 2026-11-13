@@ -132,6 +132,17 @@ tok/s on new prompts, 25.4 and 28.2 after the long prompt, and 43.5 and 44.0 on 
   on the 600-token answer) is within what single runs move; 2 is the default.
 - Both cards stayed cool through these runs: 67 and 50 degrees C at most, 158 and 79 W on average while working.
 
+#### The helper's clocks: an opt-in boost (2026-11-13)
+
+A helper's work comes in bursts of tens of microseconds a layer, so its driver keeps an RTX 3090 helper in P3 / P5
+while tokens are written: 330-720 MHz, its memory at 5,001 of 9,751 MHz. `INK_HELPER_KEEPALIVE=1` keeps a one-warp
+kernel asleep for `INK_HELPER_KEEPALIVE_MS` (50) on a lowest-priority stream of the helper, launched again each token
+once the last has ended, so the card stays in P2 (2,085 / 9,501 MHz) while writing and idles again within 50 ms of the
+last token. `ab.py` on both cards, the same build off / on, 2 interleaved runs each: new prompts 37.0 -> 39.6 tok/s, a
+repeated prompt's 3rd time 47.8 -> 55.6, after the 31.8K prompt 28.7 -> 34.2 (noisy); prefill unchanged; the greedy
+text identical; chat checks 6/6 and `derail.py` 0/20 with it on. It costs the 3090 100 -> 181 W while writing (both
+cards 287 -> 370 W, 20% more energy a token), so it's off by default.
+
 ## The engine
 
 - **The token path** (`Engine::step`): everything but the routed experts on the GPU, int8-activation GEMVs from
