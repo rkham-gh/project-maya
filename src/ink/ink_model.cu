@@ -551,6 +551,10 @@ struct Engine::Impl {
         std::vector<std::pair<int, int>> q, done;
         size_t qhead = 0;
         int inflight = 0;
+        // (INK_HELPER_KEEPALIVE) a one-warp kernel kept running on the helper while tokens are written (each lasts
+        // ka_ns; step() launches the next once it has ended), so its driver sees it busy and keeps its clocks up
+        cudaStream_t ks = nullptr;
+        unsigned long long ka_ns = 0;
         ~HC() {
             if (!th.joinable()) return;
             {
@@ -1614,6 +1618,30 @@ void Engine::Impl::hc_alloc() {
     hc.busy.assign((size_t) hc.slots, 0);
     hc.where.assign((size_t) g.n_layer * ec.ne, -1);
     if (hc.slots && hc.bg) hc.th = std::thread([this] { hc_worker(); });
+    // The helper works in bursts of tens of microseconds a layer, so on its own its driver leaves it in P3 / P5: the
+    // RTX 3090 measured 420-1,260 MHz and its memory at 5,001 or 810 MHz of 9,751 under maya-ink's Inkling 2, whose
+    // expert GEMVs took 180-280 us there against 15-23 on the 5090.  A kernel kept resident while tokens are written
+    // (one warp, asleep in __nanosleep, on a non-blocking stream of the lowest priority) makes the card count as busy.
+    // Each one ends by itself after INK_HELPER_KEEPALIVE_MS (50) and step() launches the next: a call that implicitly
+    // waits for all of the card's work (an allocation, a plain memset) waits that long at most - one left running
+    // forever hung the first token - and the card drops back to idle once the writing stops.
+    // INK_HELPER_KEEPALIVE=0: none.
+    const char* kv = std::getenv("INK_HELPER_KEEPALIVE");
+    if (hc.slots && (!kv || std::atoi(kv) != 0)) {
+        int lo = 0, hi = 0;
+        const char* km = std::getenv("INK_HELPER_KEEPALIVE_MS");
+        hc.ka_ns = (unsigned long long) std::max(1, km ? std::atoi(km) : 50) * 1000000ull;
+        OnDev od(hc.dev);
+        if (cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess &&
+            cudaStreamCreateWithPriority(&hc.ks, cudaStreamNonBlocking, lo) == cudaSuccess) {
+            std::fprintf(stderr, "maya-ink: helper card CUDA%d: a keep-alive kernel holds its clocks up while tokens are "
+                         "written (%llu ms each)\n", hc.dev, hc.ka_ns / 1000000ull);
+        } else {
+            cudaGetLastError();
+            hc.ks = nullptr;
+            std::fprintf(stderr, "maya-ink: helper card CUDA%d: no keep-alive kernel\n", hc.dev);
+        }
+    }
 }
 
 // An expert's bytes (gate | up | down, as the main cache's slots) into a helper slot, on st (the helper current)
@@ -2666,6 +2694,12 @@ const float* Engine::Impl::step(int token) {
     }
     if (graphs < 0) tok_graphs();
     ec_kv_reserve(pos + 1);
+    // (INK_HELPER_KEEPALIVE) the helper's keep-alive kernel again once the last one has ended
+    if (hc.ks && cudaStreamQuery(hc.ks) == cudaSuccess) {
+        OnDev od(hc.dev);
+        k::keepalive(hc.ka_ns, hc.ks);
+        (void) cudaStreamQuery(hc.ks);   // (submitted now: WDDM holds launches until something does)
+    }
 
     // the token's row, normed
     const uint8_t* erow = embd.w + (size_t) token * embd.rb;
