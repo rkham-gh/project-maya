@@ -206,6 +206,17 @@ context, the AVX2 Q2_0 rows on. `ab.py` through Maya's server, every run from th
   helper takes them in at 8 a token. Faster swaps cost their copies (0.19 ms each over this link).
 - The first token of a short turn comes 0.3 s later (the helper's refill after the prompt).
 
+#### The helper's clocks: an opt-in boost (2026-11-13)
+
+A helper's work comes in bursts of tens of microseconds a layer, so its driver keeps an RTX 3090 helper in P3 while
+tokens are written: 495-855 MHz, its memory at 5,001 of 9,751 MHz. `NEM_HELPER_KEEPALIVE=1` keeps a one-warp kernel
+asleep for `NEM_HELPER_KEEPALIVE_MS` (50) on a lowest-priority stream of the helper, launched again each token once
+the last has ended, so the card stays in P2 (2,085 / 9,501 MHz) while writing and idles again within 50 ms of the last
+token. `ab.py` on both cards (UD-Q3_K_XL, `NEM_SNAPSHOT=1 NEM_HELPER_BG=1`), the same build off / on, 2 interleaved
+runs each: new prompts 56.5 -> 62.5 tok/s, a repeated prompt's 3rd time 58.0 -> 67.0, after the 34K prompt 57.5 ->
+57.5; prefill unchanged; the greedy text identical; chat checks 6/6 and `derail.py` 0/20 with it on. It costs the 3090
+106 -> 196 W while writing (both cards 361 -> 467 W, 17% more energy a token), so it's off by default.
+
 ## The server
 
 - `serve/frontend.py` knows the template by its `medium_effort`: the server's `low` / `medium` (and `minimal`) turn it
