@@ -1382,6 +1382,17 @@ void gate_mul(float* o, const float* gate, size_t n, cudaStream_t s) {
     if (n) gate_mul_kernel<<<blocks_l(n, 256), 256, 0, s>>>(o, gate, n);
 }
 void softcap(float* x, int n, float cap, cudaStream_t s) { softcap_kernel<<<blocks(n, 256), 256, 0, s>>>(x, n, cap); }
+
+__device__ __forceinline__ unsigned long long global_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__global__ void keepalive_kernel(unsigned long long ns) {
+    const unsigned long long t0 = global_ns();
+    while (global_ns() - t0 < ns) __nanosleep(20000);
+}
+void keepalive(unsigned long long ns, cudaStream_t s) { keepalive_kernel<<<1, 32, 0, s>>>(ns); }
 void add2(float* y, const float* a, const float* b, size_t n, cudaStream_t s) {
     if (n) add2_kernel<<<blocks_l(n, 256), 256, 0, s>>>(y, a, b, n);
 }

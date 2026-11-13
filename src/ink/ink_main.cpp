@@ -339,6 +339,9 @@ int main(int argc, char** argv) {
                          st.tokens, st.tokens * 1000.0 / st.ms_total, 100.0 * st.ms_cpu / st.ms_total,
                          st.lookups ? 100.0 * st.hits / st.lookups : 0.0, st.cache_slots, st.cache_copies,
                          st.lookups ? 100.0 * st.hits_helper / st.lookups : 0.0, st.helper_slots, st.helper_copies);
+        if (st.tail_skips > 0)
+            std::fprintf(stderr, "maya-ink: INK_TAIL_KEEP left out %.1f%% of the routed experts (%.2f a token)\n",
+                         st.lookups ? 100.0 * st.tail_skips / st.lookups : 0.0, (double) st.tail_skips / st.tokens);
         if (st.tokens > 0)
             std::fprintf(stderr,
                          "maya-ink: a token's %.2f ms: the CPU lane %.2f (%.1f MoE layers a token), the wait for the helper "

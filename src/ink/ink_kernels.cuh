@@ -195,4 +195,6 @@ void moe_tail2(float* x, const float* res, const float* cpu, const float* gpu, c
 void gate_mul(float* o, const float* gate, size_t n, cudaStream_t s);
 void softcap(float* x, int n, float cap, cudaStream_t s);
 void add2(float* y, const float* a, const float* b, size_t n, cudaStream_t s);
+/// One warp that sleeps for ns nanoseconds: a card's work kept "busy" for its driver's clocks.
+void keepalive(unsigned long long ns, cudaStream_t s);
 }  // namespace ink::k

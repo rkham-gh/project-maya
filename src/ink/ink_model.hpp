@@ -82,6 +82,7 @@ public:
         double ms_lane = 0, ms_helper = 0, ms_update = 0;   // in ms_cpu: the CPU lane's part; the wait for the helper
                                                             // after it; and the helper's swaps between tokens
         long lane_layers = 0, helper_layers = 0;            // the MoE layers that used each
+        long tail_skips = 0;                                // the experts INK_TAIL_KEEP left out
     };
     Stats stats() const;
     void clear_stats();

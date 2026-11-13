@@ -216,10 +216,10 @@ struct Engine::Impl {
         cudaEvent_t e0 = nullptr, e1 = nullptr;
     } pt;
     // (INK_ROUTE_LOG=FILE) the routing as it goes, for replaying the expert cache's choices offline: 'T' + a token's
-    // n_used experts a MoE layer; 'P' + layer + a prompt chunk's counts an expert (uint16); 'E' a prompt's end (the
-    // cache refilled there)
+    // n_used experts a MoE layer, in rank order (uint16: Inkling 2 has 384; Inkling-Small's log had a byte each); 'P' +
+    // layer + a prompt chunk's counts an expert (uint16); 'E' a prompt's end (the cache refilled there)
     FILE* route_log = nullptr;
-    std::vector<uint8_t> route_tok;
+    std::vector<uint16_t> route_tok;
     bool pf_open = false;   // a prompt read through the prompt path, no token written since (its buffers not lent)
     // (Engine::snapshot, INK_SNAPSHOT=1) every layer's convolution states and the sliding layers' K / V rings at
     // snap_pos, one buffer in VRAM (-1: none taken)
@@ -592,6 +592,10 @@ struct Engine::Impl {
         std::vector<std::pair<int, int>> q, done;
         size_t qhead = 0;
         int inflight = 0;
+        // (INK_HELPER_KEEPALIVE) a one-warp kernel kept running on the helper while tokens are written (each lasts
+        // ka_ns; step() launches the next once it has ended), so its driver sees it busy and keeps its clocks up
+        cudaStream_t ks = nullptr;
+        unsigned long long ka_ns = 0;
         ~HC() {
             if (!th.joinable()) return;
             {
@@ -1682,6 +1686,28 @@ void Engine::Impl::hc_alloc() {
     hc.busy.assign((size_t) hc.slots, 0);
     hc.where.assign((size_t) g.n_layer * ec.ne, -1);
     if (hc.slots && hc.bg) hc.th = std::thread([this] { hc_worker(); });
+    // The helper works in bursts of tens of microseconds a layer, so on its own its driver leaves it in P3 / P5: the
+    // RTX 3090 measured 420-1,260 MHz and its memory at 5,001 or 810 MHz of 9,751 while maya-ink ran, and the experts'
+    // GEMVs took 180-280 us there against 15-23 on the 5090.  A kernel kept resident while tokens are written (one
+    // warp, asleep in __nanosleep, on a non-blocking stream of the lowest priority) makes the card count as busy.  Each
+    // one ends by itself after INK_HELPER_KEEPALIVE_MS (50) and step() launches the next: a call that implicitly waits
+    // for all of the card's work (an allocation, a plain memset) waits that long at most - one left running forever
+    // hung the first token - and the card drops back to idle once the writing stops.  INK_HELPER_KEEPALIVE=0: none.
+    const char* kv = std::getenv("INK_HELPER_KEEPALIVE");
+    if (hc.slots && (!kv || std::atoi(kv) != 0)) {
+        int lo = 0, hi = 0;
+        const char* km = std::getenv("INK_HELPER_KEEPALIVE_MS");
+        hc.ka_ns = (unsigned long long) std::max(1, km ? std::atoi(km) : 50) * 1000000ull;
+        if (cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess &&
+            cudaStreamCreateWithPriority(&hc.ks, cudaStreamNonBlocking, lo) == cudaSuccess) {
+            std::fprintf(stderr, "maya-ink: helper card CUDA%d: a keep-alive kernel holds its clocks up while tokens are "
+                         "written (%llu ms each)\n", hc.dev, hc.ka_ns / 1000000ull);
+        } else {
+            cudaGetLastError();
+            hc.ks = nullptr;
+            std::fprintf(stderr, "maya-ink: helper card CUDA%d: no keep-alive kernel\n", hc.dev);
+        }
+    }
 }
 
 // An expert's bytes (gate | up | down, as the main cache's slots) into a helper slot, on st (the helper current)
@@ -1954,6 +1980,11 @@ void Engine::Impl::hc_experts(const Layer& l, const int* slot, const float* w, i
     }
     k::sum_rows(hc.y, n, E, hc.routed, hc.s);
     CK(cudaMemcpyAsync(hc.h_out, hc.routed, (size_t) E * sizeof(float), cudaMemcpyDeviceToHost, hc.s));
+    // WDDM holds a stream's launches until something submits them: without this the helper's work may only start at
+    // its sync after the CPU lane (maya-ds4's win_submit for its helper).  INK_HELPER_FLUSH=1: done (2026-11-12: no
+    // gain here, 23.2 against 23.5 tok/s on ab.py - the lane is the longer wait - so off by default).
+    static const bool flush = std::getenv("INK_HELPER_FLUSH") && std::atoi(std::getenv("INK_HELPER_FLUSH")) != 0;
+    if (flush) (void) cudaStreamQuery(hc.s);
 }
 
 // (--bench-h2d) the ways to move the experts' bytes to the GPU on this machine, ~1.2 GB each
@@ -2767,12 +2798,22 @@ const float* Engine::Impl::step(int token) {
             ec_fill();
         }
         // The prompt changed the scores, and the main cache with them: the helper follows, with more copies after a
-        // longer prompt (an eighth of its tokens, 64 .. fill_cap).
-        hc_update(std::min(hc.fill_cap, std::max(64, (int) std::min<long>(pf_tokens_open / 8, INT_MAX))), false, false);
+        // longer prompt (an eighth of its tokens, 64 .. fill_cap).  INK_HELPER_PROMPT_BG=1 (strata-mimo's
+        // MIMO_HELPER_PROMPT_BG): the copies go to the swaps' thread, so the first token doesn't wait for them; the
+        // helper's slots being refilled sit out until their copy lands.
+        static const bool prompt_bg = std::getenv("INK_HELPER_PROMPT_BG") && std::atoi(std::getenv("INK_HELPER_PROMPT_BG")) != 0;
+        hc_update(std::min(hc.fill_cap, std::max(64, (int) std::min<long>(pf_tokens_open / 8, INT_MAX))), false,
+                  prompt_bg && hc.bg);
         pf_tokens_open = 0;
     }
     if (graphs < 0) tok_graphs();
     ec_kv_reserve(pos + 1);
+    // (INK_HELPER_KEEPALIVE) the helper's keep-alive kernel again once the last one has ended
+    if (hc.ks && cudaStreamQuery(hc.ks) == cudaSuccess) {
+        OnDev od(hc.dev);
+        k::keepalive(hc.ka_ns, hc.ks);
+        (void) cudaStreamQuery(hc.ks);   // (submitted now: WDDM holds launches until something does)
+    }
 
     // the token's row, normed
     const uint8_t* erow = embd.w + (size_t) token * embd.rb;
@@ -2873,12 +2914,24 @@ const float* Engine::Impl::step(int token) {
         }
         for (int i = 0; i < g.n_used; ++i) wv[i] = wv[i] / (sum + 1e-20f) * g.exp_scale;
         phase(pt.route);
-        // the chosen experts in VRAM go to the GPU, the others to the CPU lane, both at once
+        // the chosen experts in VRAM go to the GPU, the others to the CPU lane, both at once.  INK_TAIL_KEEP=k (off by
+        // default; strata-mimo's MIMO_TAIL_KEEP): a chosen expert that neither card holds and that ranks k-th or lower
+        // (sel[] is in rank order, sigmoid + bias) is left out, its weight with it (the others keep theirs; with
+        // INK_TAIL_RENORM=1 they share it).  INK_TAIL_W=w (Maya's MAYA_GLM_MISS_SKIP_W): also one whose weight is under
+        // w of the token's whole (8 experts: 1/8 = 0.125 is the even share).  Only in layers INK_TAIL_FROM <= il <
+        // INK_TAIL_UPTO.  Its score still counts, so the caches keep learning it.
+        static const float tail_w = std::getenv("INK_TAIL_W") ? (float) std::atof(std::getenv("INK_TAIL_W")) : 0.0f;
+        static const int tail_keep = std::getenv("INK_TAIL_KEEP") ? std::atoi(std::getenv("INK_TAIL_KEEP")) : 0;
+        static const int tail_from = std::getenv("INK_TAIL_FROM") ? std::atoi(std::getenv("INK_TAIL_FROM")) : 0;
+        static const int tail_upto = std::getenv("INK_TAIL_UPTO") ? std::atoi(std::getenv("INK_TAIL_UPTO")) : 1 << 30;
+        static const bool tail_renorm = std::getenv("INK_TAIL_RENORM") && std::atoi(std::getenv("INK_TAIL_RENORM")) != 0;
+        const bool tail_here = ((tail_keep > 0 && tail_keep < g.n_used) || tail_w > 0.0f) && il >= tail_from && il < tail_upto;
         int gslot[16], csel[16], hslot[16];
         float gw[16], cw[16], hw[16];
         int ng = 0, nc = 0, nh = 0;
+        float dropped = 0.0f;
         if (route_log)
-            for (int i = 0; i < g.n_used; ++i) route_tok.push_back((uint8_t) sel[i]);
+            for (int i = 0; i < g.n_used; ++i) route_tok.push_back((uint16_t) sel[i]);
         for (int i = 0; i < g.n_used; ++i) {
             const size_t key = (size_t) il * ne + sel[i];
             ec.score[key] += 1.0f;
@@ -2890,10 +2943,19 @@ const float* Engine::Impl::step(int token) {
             } else if (hs >= 0) {
                 hslot[nh] = hs;
                 hw[nh++] = wv[i];
+            } else if (tail_here && ((tail_keep > 0 && i >= tail_keep) || wv[i] < tail_w * g.exp_scale)) {
+                dropped += wv[i];
+                ++st.tail_skips;
             } else {
                 csel[nc] = sel[i];
                 cw[nc++] = wv[i];
             }
+        }
+        if (tail_renorm && dropped > 0.0f) {
+            const float kept = g.exp_scale - dropped, fr = kept > 0.0f ? g.exp_scale / kept : 1.0f;
+            for (int i = 0; i < ng; ++i) gw[i] *= fr;
+            for (int i = 0; i < nh; ++i) hw[i] *= fr;
+            for (int i = 0; i < nc; ++i) cw[i] *= fr;
         }
         ec.lookups += g.n_used;
         ec.hits += ng;
@@ -2950,7 +3012,7 @@ const float* Engine::Impl::step(int token) {
     ++pos;
     if (route_log) {
         std::fputc('T', route_log);
-        std::fwrite(route_tok.data(), 1, route_tok.size(), route_log);
+        std::fwrite(route_tok.data(), sizeof(uint16_t), route_tok.size(), route_log);
         route_tok.clear();
         if (pos % 64 == 0) std::fflush(route_log);
     }
