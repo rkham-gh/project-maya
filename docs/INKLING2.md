@@ -75,7 +75,10 @@ What the last column has (commit 7bf9452, and in the run config's `env` / `args`
 - Measured without gain: `INK_HELPER_FLUSH=1`; 16 helper swaps every 2 tokens at bias 0.5 (before the keep-alive:
   +3% new prompts, -6% after a long prompt). An offline replay of the routing (`ec-sim2.py`, outside this
   repository; `INK_ROUTE_LOG` now writes 16-bit ids) puts the main cache's settings near their best and predicts
-  8-19% less CPU time from 8-16 helper swaps every 2 tokens: to be measured with the keep-alive.
+  8-19% less CPU time from 8-16 helper swaps every 2 tokens. Measured with the keep-alive (2026-11-13, 3 runs each
+  from the same profile), 16 helper swaps averaged 33.9 tok/s on new prompts and 26.5 after the long prompt against
+  the defaults' 34.3 and 26.4; 8 swaps and `INK_HELPER_BIAS=4` stayed inside the defaults' spread too. The defaults
+  stay.
 - A token now (~33 ms): the 5090's attention and its sync ~12 ms (a layer's graph ~205 us), launching both cards'
   expert kernels ~7 ms (beside the CPU lane), the CPU lane ~12 ms.
 
@@ -85,6 +88,16 @@ copies nearly every expert the VRAM doesn't hold.
 
 `INK_SNAPSHOT=1` is on in the run config for this model: `--restore-check` (with `INK_CACHE_SWAPS=0`, one card) gives a
 difference of 0 over 64 tokens, and agent turns read only their new part (first tokens 7.4-24.6 s against 8.6-38.5).
+
+## Hard test
+
+The user's 25-task hard test (traces, long multiplication, logic grids, routes and a knapsack, instruction following,
+long reads, 7 coding tasks, a repair job with tools), at effort `max`, temperature 1, top-p 1, 128K context, with the
+settings above: **22 of 25 in 184 minutes**, 4 of 7 coding tasks (the ordered multiset, the diff, the JSON parser, the
+SAT solver), everything else right, 481K tokens written at 44 tok/s on average. The regex engine refused lazy
+quantifiers (`a+?`), the Scheme interpreter's `cond` had a `continue` inside its clause loop, and the Sudoku solver hit
+the classic worst-case puzzle for constraint propagation with fewest-candidates search. Inkling-Small on this engine
+scored 21 in 279 minutes.
 
 ## Checks
 
