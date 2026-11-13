@@ -1692,9 +1692,11 @@ void Engine::Impl::hc_alloc() {
     // warp, asleep in __nanosleep, on a non-blocking stream of the lowest priority) makes the card count as busy.  Each
     // one ends by itself after INK_HELPER_KEEPALIVE_MS (50) and step() launches the next: a call that implicitly waits
     // for all of the card's work (an allocation, a plain memset) waits that long at most - one left running forever
-    // hung the first token - and the card drops back to idle once the writing stops.  INK_HELPER_KEEPALIVE=0: none.
+    // hung the first token - and the card drops back to idle once the writing stops.
+    // Off by default (2026-11-13: it costs the helper ~80-90 W while tokens are written, for 5-11% more speed);
+    // INK_HELPER_KEEPALIVE=1 turns it on.
     const char* kv = std::getenv("INK_HELPER_KEEPALIVE");
-    if (hc.slots && (!kv || std::atoi(kv) != 0)) {
+    if (hc.slots && kv && std::atoi(kv) != 0) {
         int lo = 0, hi = 0;
         const char* km = std::getenv("INK_HELPER_KEEPALIVE_MS");
         hc.ka_ns = (unsigned long long) std::max(1, km ? std::atoi(km) : 50) * 1000000ull;
