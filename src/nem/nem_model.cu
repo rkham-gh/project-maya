@@ -1590,9 +1590,10 @@ void Engine::Impl::hc_alloc() {
     // Each one ends by itself after NEM_HELPER_KEEPALIVE_MS (50) and step() launches the next: a call that implicitly
     // waits for all of the card's work (an allocation, a plain memset) waits that long at most - one left running
     // forever hung the first token - and the card drops back to idle once the writing stops.
-    // NEM_HELPER_KEEPALIVE=0: none.
+    // Off by default (2026-11-13: it costs the helper ~80-90 W while tokens are written, for 5-11% more speed);
+    // NEM_HELPER_KEEPALIVE=1 turns it on.
     const char* kv = std::getenv("NEM_HELPER_KEEPALIVE");
-    if (hc.slots && (!kv || std::atoi(kv) != 0)) {
+    if (hc.slots && kv && std::atoi(kv) != 0) {
         int lo = 0, hi = 0;
         const char* km = std::getenv("NEM_HELPER_KEEPALIVE_MS");
         hc.ka_ns = (unsigned long long) std::max(1, km ? std::atoi(km) : 50) * 1000000ull;
