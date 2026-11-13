@@ -52,12 +52,32 @@ model is more than 50% sure); perplexity 2.449 -> 2.467.
 An RTX 5090 at PCIe 5.0 x8 plus an RTX 3090 as the helper card, a Ryzen 9 9950X, 192 GB of DDR5-3600, Windows 11,
 CUDA 13.4, 128K context. `ab.py`, each run from the same expert profile:
 
-| | llama.cpp port, experts in RAM | maya-ink, the 5090 alone | maya-ink, both cards |
-|---|---|---|---|
-| Writing, new prompts | 8.3 tok/s | 19.8 | 23.6 |
-| Writing after a 41K-token prompt | 8.5 | 13.4 | 15.0 |
-| Reading that prompt | 23 tok/s (59 with 512-token batches) | 601 | 521 |
-| A repeated prompt, 3rd time | 8.8 | 22.3 | 28.6 |
+| | llama.cpp port, experts in RAM | maya-ink, the 5090 alone (first build) | maya-ink, both cards (first build) | maya-ink, both cards, 7bf9452 + settings below |
+|---|---|---|---|---|
+| Writing, new prompts | 8.3 tok/s | 19.8 | 23.6 | 32.5 |
+| Writing after a 41K-token prompt | 8.5 | 13.4 | 15.0 | 27.0 |
+| Reading that prompt | 23 tok/s (59 with 512-token batches) | 601 | 521 | 836 |
+| A repeated prompt, 3rd time | 8.8 | 22.3 | 28.6 | 38.6 |
+
+What the last column has (commit 7bf9452, and in the run config's `env` / `args`):
+
+- `INK_HELPER_KEEPALIVE` (on by default): the RTX 3090 helper idled in P3 / P5 (420-1,260 MHz, its memory at 5,001 or
+  810 MHz of 9,751) because its work comes in bursts; its IQ2 GEMVs took 180-280 us against 15-23 on the 5090 and each
+  token waited ~5 ms for it. A one-warp kernel asleep for 50 ms on a lowest-priority non-blocking stream, launched
+  again each token once it has ended, keeps it in P2: the wait falls to ~0.6 ms. (One left running forever hung the
+  first token: some call implicitly waits for all of the card's work.) The other helper-card engines likely lose the
+  same.
+- `INK_TAIL_KEEP=5` (strata-mimo's `MIMO_TAIL_KEEP`): a chosen expert that neither card holds and that ranks 6th-8th
+  is left out with its weight (~10% of a token's experts). Top-1 agreement with the released model on 6,144
+  teacher-forced positions: 94.2% -> 93.9%; 23-26 -> 33-34 tok/s.
+- `INK_CACHE_PROMPT=2`, `--chunk 16384` and `INK_HELPER_PROMPT_BG=1` (the helper's refill after a prompt on its
+  thread): writing after the 41K prompt 18.8 -> 27.0 tok/s, its first token 79 -> 50 s, prompts +55%.
+- Measured without gain: `INK_HELPER_FLUSH=1`; 16 helper swaps every 2 tokens at bias 0.5 (before the keep-alive:
+  +3% new prompts, -6% after a long prompt). An offline replay of the routing (`ec-sim2.py`, outside this
+  repository; `INK_ROUTE_LOG` now writes 16-bit ids) puts the main cache's settings near their best and predicts
+  8-19% less CPU time from 8-16 helper swaps every 2 tokens: to be measured with the keep-alive.
+- A token now (~33 ms): the 5090's attention and its sync ~12 ms (a layer's graph ~205 us), launching both cards'
+  expert kernels ~7 ms (beside the CPU lane), the CPU lane ~12 ms.
 
 About 5,350 of the 18,432 experts fit in the two cards' VRAM (29%), against about 3,130 of 10,240 (31%) for Inkling-Small, and a token takes 8
 instead of 6: hence the lower speed. A prompt of a few hundred new tokens still takes ~7 s, because the prompt path
