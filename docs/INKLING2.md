@@ -61,7 +61,8 @@ CUDA 13.4, 128K context. `ab.py`, each run from the same expert profile:
 
 What the last column has (commit 7bf9452, and in the run config's `env` / `args`):
 
-- `INK_HELPER_KEEPALIVE` (on by default): the RTX 3090 helper idled in P3 / P5 (420-1,260 MHz, its memory at 5,001 or
+- `INK_HELPER_KEEPALIVE=1` (off by default since 2528786, 2026-11-13: the user's choice, for the ~80 W it costs the
+  3090 while writing): the RTX 3090 helper idled in P3 / P5 (420-1,260 MHz, its memory at 5,001 or
   810 MHz of 9,751) because its work comes in bursts; its IQ2 GEMVs took 180-280 us against 15-23 on the 5090 and each
   token waited ~5 ms for it. A one-warp kernel asleep for 50 ms on a lowest-priority non-blocking stream, launched
   again each token once it has ended, keeps it in P2: the wait falls to ~0.6 ms. (One left running forever hung the
@@ -79,6 +80,9 @@ What the last column has (commit 7bf9452, and in the run config's `env` / `args`
   from the same profile), 16 helper swaps averaged 33.9 tok/s on new prompts and 26.5 after the long prompt against
   the defaults' 34.3 and 26.4; 8 swaps and `INK_HELPER_BIAS=4` stayed inside the defaults' spread too. The defaults
   stay.
+- The last column had the keep-alive on. With it off (the default now), 2 interleaved runs each from the same profile
+  on 2026-11-13: new prompts 30.9 tok/s (34.6 on), after the 41K prompt 26.5 (28.1), prompts 844 tok/s (852), a
+  repeated prompt's 3rd time 34.9 (41.2); the same text every run.
 - A token now (~33 ms): the 5090's attention and its sync ~12 ms (a layer's graph ~205 us), launching both cards'
   expert kernels ~7 ms (beside the CPU lane), the CPU lane ~12 ms.
 
