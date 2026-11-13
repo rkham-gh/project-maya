@@ -202,7 +202,7 @@ struct Engine::Impl {
     // attention residuals' outputs [3][E], the normed inputs [3][E], the gate [H hd], the sinks [H], the dynamic taps of
     // k and v [Hkv K], k and v after a global layer's convs, the output's residual query
     float *blk = nullptr, *res = nullptr, *mix = nullptr, *a3 = nullptr, *gt = nullptr, *snk = nullptr, *dyk = nullptr,
-          *dyv = nullptr, *k2 = nullptr, *v2 = nullptr, *out_q = nullptr;
+          *dyv = nullptr, *k2 = nullptr, *v2 = nullptr, *out_q = nullptr, *ars = nullptr;
     int n_blocks() const { return (g.n_layer + g.res_block - 1) / g.res_block; }
     // host (pinned)
     float *h_f = nullptr, *h_rlog = nullptr, *h_tail = nullptr, *h_logits = nullptr, *h_tokd = nullptr,
@@ -934,6 +934,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     dyv = dalloc<float>((size_t) g.n_head_kv * kc);
     k2 = dalloc<float>(kvw);
     v2 = dalloc<float>(kvw);
+    ars = dalloc<float>(k::attn_res_scratch);
     xq = dalloc<int8_t>((size_t) kmax);
     xd = dalloc<float>((size_t) kmax / 32);
     e16 = dalloc<uint16_t>(E);
@@ -2620,7 +2621,7 @@ void Engine::Impl::tok_attention(Layer& l, const Layer* prev) {
     if (il == 0) {
         k::rmsnorm(x, l.swa ? l.attn_norm : l.in_norm[0], a3, 1, E, g.eps, s);
     } else {
-        k::attn_res(blk, nullptr, (size_t) E, nb, x, l.res_q, l.nq, mix, (size_t) E, 1, E, s);
+        k::attn_res_tok(blk, nb, x, l.res_q, l.nq, mix, (size_t) E, E, ars, s);
         if (l.swa) k::rmsnorm(mix, l.attn_norm, a3, 1, E, g.eps, s);
         else
             for (int i = 0; i < 3; ++i) k::rmsnorm(mix + (size_t) i * E, l.in_norm[i], a3 + (size_t) i * E, 1, E, g.eps, s);
@@ -2665,7 +2666,7 @@ void Engine::Impl::tok_attention(Layer& l, const Layer* prev) {
     } else {
         k::add2(res, x, ao, (size_t) E, s);
     }
-    k::attn_res(blk, nullptr, (size_t) E, nb + (boundary ? 1 : 0), res, l.ffn_q, 1, mix, (size_t) E, 1, E, s);
+    k::attn_res_tok(blk, nb + (boundary ? 1 : 0), res, l.ffn_q, 1, mix, (size_t) E, E, ars, s);
     k::rmsnorm(mix, l.ffn_norm, f, 1, E, g.eps, s);
     quant(f, 1, E);
 }
@@ -2693,7 +2694,7 @@ void Engine::Impl::tok_tail(const Layer& l) {
 void Engine::Impl::tok_head(const Layer& last) {
     const int E = g.n_embd;
     tok_tail(last);
-    k::attn_res(blk, nullptr, (size_t) E, n_blocks(), x, out_q, 1, a, (size_t) E, 1, E, s);
+    k::attn_res_tok(blk, n_blocks(), x, out_q, 1, a, (size_t) E, E, ars, s);
     k::rmsnorm(a, out_norm, a, 1, E, g.eps, s);
     if (is_float(output.type)) {
         k::gemv_f(output.w, output.type, output.rb, a, logits, output.n, output.k, s);

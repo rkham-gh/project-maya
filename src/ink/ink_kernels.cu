@@ -948,11 +948,24 @@ __global__ void attn_res_kernel(const float* __restrict__ b32, const __half* __r
         for (int i = 0; i < nq; ++i) acc[nb * kResQ + i] += v * qv[i];
     }
     const float sc = rsqrtf((float) E);
+    // the (nb + 1) x nq sums at once: each warp's by shuffles, then the warps' partials added by one thread a sum
+    __shared__ float part[kResMax * kResQ][8];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
     for (int j = 0; j <= nb; ++j)
         for (int i = 0; i < nq; ++i) {
-            const float d = block_sum(acc[j * kResQ + i]);
-            if (threadIdx.x == 0) wts[i][j] = d * sc;
+            const float d = warp_sum(acc[j * kResQ + i]);
+            if (lane == 0) part[j * kResQ + i][wid] = d;
         }
+    __syncthreads();
+    if (threadIdx.x < (nb + 1) * kResQ) {
+        const int j = threadIdx.x / kResQ, i = threadIdx.x % kResQ;
+        if (i < nq) {
+            float d = 0.0f;
+            for (int w = 0; w < nw; ++w) d += part[threadIdx.x][w];
+            wts[i][j] = d * sc;
+        }
+    }
+    __syncthreads();
     if (threadIdx.x == 0)
         for (int i = 0; i < nq; ++i) {
             float m = -INFINITY;
@@ -974,6 +987,58 @@ __global__ void attn_res_kernel(const float* __restrict__ b32, const __half* __r
         }
         const float v = p[c] * inv;
         for (int i = 0; i < nq; ++i) out[(size_t) i * oqs + (size_t) t * E + c] = o[i] + wts[i][nb] * v;
+    }
+}
+
+// One token's attention residual in two wide launches (attn_res_kernel's one block a token is latency-bound at T = 1):
+// the dots, a block a state (the partial's also its rsqrt of the mean square) into w [kResMax][kResQ] + inv; then the
+// softmax and the mix, a thread a channel.  b32: the token's finished blocks, [nb][E] (normed).
+__global__ void attn_res_dots_kernel(const float* __restrict__ b32, int nb, const float* __restrict__ partial,
+                                     const float* __restrict__ q, int nq, int E, float* __restrict__ w) {
+    const int j = blockIdx.x;
+    const float* s = j < nb ? b32 + (size_t) j * E : partial;
+    float a[kResQ] = {0.0f, 0.0f, 0.0f}, ss = 0.0f;
+    for (int c = threadIdx.x; c < E; c += blockDim.x) {
+        const float v = s[c];
+        ss += v * v;
+        for (int i = 0; i < nq; ++i) a[i] += v * q[(size_t) i * E + c];
+    }
+    __shared__ float part[kResQ + 1][32];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    for (int i = 0; i < nq; ++i) {
+        const float d = warp_sum(a[i]);
+        if (lane == 0) part[i][wid] = d;
+    }
+    const float dss = warp_sum(ss);
+    if (lane == 0) part[kResQ][wid] = dss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tss = 0.0f;
+        for (int k = 0; k < nw; ++k) tss += part[kResQ][k];
+        const float inv = j < nb ? 1.0f : rsqrtf(tss / (float) E + 1e-6f);
+        for (int i = 0; i < nq; ++i) {
+            float d = 0.0f;
+            for (int k = 0; k < nw; ++k) d += part[i][k];
+            w[j * kResQ + i] = d * inv * rsqrtf((float) E);
+        }
+        if (j == nb) w[kResMax * kResQ] = inv;
+    }
+}
+__global__ void attn_res_mix_kernel(const float* __restrict__ b32, int nb, const float* __restrict__ partial, int nq,
+                                    int E, const float* __restrict__ w, float* __restrict__ out, size_t oqs) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= E) return;
+    const float inv = w[kResMax * kResQ];
+    for (int i = 0; i < nq; ++i) {
+        float m = -INFINITY;
+        for (int j = 0; j <= nb; ++j) m = fmaxf(m, w[j * kResQ + i]);
+        float s = 0.0f, o = 0.0f;
+        for (int j = 0; j <= nb; ++j) {
+            const float p = __expf(w[j * kResQ + i] - m);
+            s += p;
+            o += p * (j < nb ? b32[(size_t) j * E + c] : partial[c] * inv);
+        }
+        out[(size_t) i * oqs + c] = o / s;
     }
 }
 
@@ -1252,6 +1317,11 @@ __global__ void add2_kernel(float* __restrict__ y, const float* __restrict__ a, 
 void attn_res(const float* b32, const __half* b16, size_t bstride, int nb, const float* partial, const float* q, int nq,
               float* out, size_t oqs, int T, int E, cudaStream_t s) {
     if (T > 0) attn_res_kernel<<<T, 256, 0, s>>>(b32, b16, bstride, nb, partial, q, nq, out, oqs, E);
+}
+void attn_res_tok(const float* b32, int nb, const float* partial, const float* q, int nq, float* out, size_t oqs, int E,
+                  float* scratch, cudaStream_t s) {
+    attn_res_dots_kernel<<<nb + 1, 256, 0, s>>>(b32, nb, partial, q, nq, E, scratch);
+    attn_res_mix_kernel<<<blocks(E, 256), 256, 0, s>>>(b32, nb, partial, nq, E, scratch, out, oqs);
 }
 void unorm(const float* x, float* y32, __half* y16, int T, int E, float eps, cudaStream_t s) {
     if (T > 0) unorm_kernel<<<T, 256, 0, s>>>(x, y32, y16, E, eps);

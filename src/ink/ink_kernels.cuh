@@ -157,6 +157,10 @@ namespace ink::k {
 /// q . state / sqrt(E) for each of nq <= 3 queries [nq][E]; out (query i, token t at i oqs + t E) = the weighted sum.
 void attn_res(const float* b32, const __half* b16, size_t bstride, int nb, const float* partial, const float* q, int nq,
               float* out, size_t oqs, int T, int E, cudaStream_t s);
+/// attn_res for one token (the token path): F32 blocks [nb][E], two wide launches; scratch: attn_res_scratch floats.
+void attn_res_tok(const float* b32, int nb, const float* partial, const float* q, int nq, float* out, size_t oqs, int E,
+                  float* scratch, cudaStream_t s);
+constexpr int attn_res_scratch = 9 * 3 + 1;
 /// y = x * rsqrt(mean(x^2) + eps) for T rows of E (into y32 or, when set, y16).
 void unorm(const float* x, float* y32, __half* y16, int T, int E, float eps, cudaStream_t s);
 /// Each head of hd: x *= scale (per [heads][hd], may be null); x *= min(1, thr / (|x| + 1e-6)); x *= tau[row] (null: 1).
