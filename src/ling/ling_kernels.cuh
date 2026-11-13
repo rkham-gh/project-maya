@@ -134,4 +134,7 @@ void scatter_add(const float* ye, const int* list, const float* wl, int rows, in
 /// (--selftest) the KDA recurrence and the MLA decode against host references on random data; prints, true = pass.
 bool selftest();
 
+/// One warp that sleeps for ns nanoseconds: a card's work kept "busy" for its driver's clocks.
+void keepalive(unsigned long long ns, cudaStream_t s);
+
 }  // namespace ling::k

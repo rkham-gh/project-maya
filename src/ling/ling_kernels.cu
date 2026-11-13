@@ -1227,4 +1227,15 @@ bool selftest() {
     return ok;
 }
 
+__device__ __forceinline__ unsigned long long global_ns() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__global__ void keepalive_kernel(unsigned long long ns) {
+    const unsigned long long t0 = global_ns();
+    while (global_ns() - t0 < ns) __nanosleep(20000);
+}
+void keepalive(unsigned long long ns, cudaStream_t s) { keepalive_kernel<<<1, 32, 0, s>>>(ns); }
+
 }  // namespace ling::k
