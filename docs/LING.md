@@ -127,6 +127,14 @@ without the helper.
   buys no more than it costs; maya-ink's prompt path, which has no copier thread, reads as fast with two cards.
   The helper's refill after the prompt (up to 4,096 experts) adds ~2 s more.
 
+#### The helper's clocks: an opt-in boost (2026-11-13, not measured on Ling)
+
+An RTX 3090 helper stays in P3 / P5 under a helper's bursty work (maya-ink and maya-nem measured 330-855 MHz, the
+memory at 5,001 of 9,751 MHz). `LING_HELPER_KEEPALIVE=1` keeps a one-warp kernel asleep for `LING_HELPER_KEEPALIVE_MS`
+(50) on a lowest-priority stream of the helper, launched again each token once the last has ended, so the card stays
+in P2 while writing. Off by default: on maya-ink and maya-nem it bought 7-11% on new prompts for ~80-90 W more on the
+3090. It compiles here, but Ling's GGUF wasn't on this PC on 2026-11-13, so it hasn't run with Ling.
+
 ## The engine
 
 - **The token path** (`Engine::step`): everything but the routed experts on the GPU, int8-activation GEMVs from
