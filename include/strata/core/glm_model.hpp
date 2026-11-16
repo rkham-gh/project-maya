@@ -699,6 +699,9 @@ public:
     // a batched verify window's layer on both window lanes, each distinct expert read once (glm_fast_path.cu)
     void win_cpu_merged(int il, int nb, const strata::kernels::glmf::MoeRequest* const* rq,
                         strata::kernels::glmf::CpuAnswer* const* ans, const unsigned int* seq);
+    // ... the same window on a linked helper (MAYA_GLM_LINK_WIN): one call for its helper experts (glm_fast_path.cu)
+    void win_helper_merged(int il, int nb, const strata::kernels::glmf::MoeRequest* const* rq,
+                           strata::kernels::glmf::CpuAnswer* const* ans, const unsigned int* seq);
     // MAYA_GLM_HELPER_ROWS: a batched verify window's layer with the expert helper - one helper call for every row,
     // the CPU lane's experts row by row beside it, then each row's answer (glm_fast_path.cu)
     void fast_helper_rows(int nb, const strata::kernels::glmf::MoeRequest* const* rq,
