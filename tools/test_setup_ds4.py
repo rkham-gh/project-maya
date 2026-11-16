@@ -516,9 +516,31 @@ class Calibrate(unittest.TestCase):
         self.assertIn("effective TP per GPU: 1/1/1", output.call_args.args[0])
 
     def test_busy_gpus(self):
-        with patch.object(maya, "busy_gpus", return_value=[(0, 15000)]), patch.object(maya.CAL4, "run") as run:
+        with patch.object(maya, "busy_gpus", return_value=[(0, 15000)]), \
+                patch.object(maya, "maya_engines_on", return_value=[]), patch.object(maya.CAL4, "run") as run:
             self.assertFalse(maya.calibrate_config(self.cfg))
         run.assert_not_called()
+
+    def test_another_maya_model_loaded_refuses(self):
+        with patch.object(maya, "busy_gpus", return_value=[(0, 1200)]), \
+                patch.object(maya, "maya_engines_on", return_value=[(0, "maya-ds4", "4242")]), \
+                patch.object(maya.CAL4, "run") as run, patch.object(maya, "warn") as warn:
+            self.assertFalse(maya.calibrate_config(self.cfg))
+        run.assert_not_called()
+        self.assertIn("another Maya model is loaded there (maya-ds4 on GPU 0, PID 4242)", warn.call_args.args[0])
+
+    def test_a_display_does_not_hold_it_back(self):
+        # (#794: --calibrate is always asked for - a GPU that drives a display holds some memory; the tuning runs
+        #  anyway, and says how much is in use)
+        res = {"args": {"--tp": 8, "--cpu-threads": None},
+               "report": {"tok_s": 151.0, "own_tok_s": 103.0, "prompt_tok_s": 607}}
+        with patch.object(maya, "busy_gpus", return_value=[(0, 1500)]), \
+                patch.object(maya, "maya_engines_on", return_value=[]), \
+                patch.object(maya.CAL4, "run", return_value=res) as run, patch.object(maya, "warn") as warn:
+            self.assertTrue(maya.calibrate_config(self.cfg))
+        run.assert_called_once()
+        self.assertIn("GPU 0 has 1500 MiB in use", warn.call_args_list[0].args[0])
+        self.assertIn("measures anyway, as asked", warn.call_args_list[0].args[0])
 
     def test_failed_keeps_the_config(self):
         before = self.cfg.read_text()
@@ -1392,8 +1414,11 @@ class MayaQuants(unittest.TestCase):
                 maya.ds4_gguf_model("maya-s")
 
     def test_published(self):
+        # (a PC that holds Maya-S: its RAM and its GPU both set here - the test host's own GPUs picked Maya-XS on a
+        # 32 GB card, where Maya-S has under FIT_MIN_VRAM_SHARE of it in VRAM)
         with self.published(), patch.object(maya.S, "UI", None), \
-                patch.object(maya, "mem_gb", return_value=(512.0, 500.0)):   # (a PC that holds Maya-S)
+                patch.object(maya, "mem_gb", return_value=(512.0, 500.0)), \
+                patch.object(maya.S, "gpus", return_value=[{"index": 0, "arch": 90, "name": "test GPU", "vram_gb": 80.0}]):
             self.assertTrue(maya.ds4_maya_published("maya-s"))
             self.assertFalse(maya.ds4_maya_published("maya-m"))
             self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-s")   # (recommended)
@@ -1756,6 +1781,25 @@ class Drafting(unittest.TestCase):
         self.assertEqual(c["args"][-2:], ["--dflash", "/m/d.bin"])
         self.assertEqual(c["installer"]["draft"], "dflash2")
         self.assertFalse(maya.needs_speed_calibration(c))
+
+
+class FastPrefill(unittest.TestCase):
+    def test_on_off_and_unchanged(self):
+        c = {"args": []}
+        with patch.object(maya, "ok", lambda *a: None):
+            maya.set_fast_prefill(c, None)
+            self.assertNotIn("fast_prefill", c)                 # (not given: unchanged, off by default)
+            maya.set_fast_prefill(c, "on")
+            self.assertIs(c["fast_prefill"], True)
+            maya.set_fast_prefill(c, None)
+            self.assertIs(c["fast_prefill"], True)              # (kept)
+            maya.set_fast_prefill(c, "off")
+            self.assertNotIn("fast_prefill", c)
+
+    def test_the_flag_and_the_setup_keep_it(self):
+        src = Path(maya.__file__).read_text(encoding="utf-8")
+        self.assertIn('ap.add_argument("--fast-prefill", choices=["on", "off"]', src)
+        self.assertEqual(src.count('"mcp_servers", "fast_prefill"'), 1)   # (DeepSeek's setup keeps it; no other)
 
 
 if __name__ == "__main__":
