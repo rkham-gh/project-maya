@@ -985,6 +985,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_compile_definitions(maya-ling PRIVATE MAYA_DS4_IQ_ONLY)
   endif()
 
+  # Hy4 Flash (Tencent; llama.cpp's "hy_v4_flash" GGUF, ggml-org/llama.cpp#32517): its own engine (src/hy4), maya-ling's
+  # machinery with Hy4's layers - gated MLA over sliding-window and sparse layers, identity hyper-connections over 4
+  # residual streams, the Engram n-gram table, latent routed experts (16 of 512 a token) in a VRAM cache or on the CPU lane.
+  if(STRATA_ENABLE_CUDA)
+    add_executable(maya-hy4 src/hy4/hy4_main.cpp src/hy4/hy4_model.cu src/hy4/hy4_kernels.cu src/hy4/hy4_cpu.cpp
+                            src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
+    target_include_directories(maya-hy4 PRIVATE ${_strata_gpu_include_directories} include src/hy4 third_party/ggml)
+    target_link_libraries(maya-hy4 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    target_compile_definitions(maya-hy4 PRIVATE MAYA_DS4_IQ_ONLY)
+  endif()
+
   if(STRATA_ENABLE_HIP)
     enable_testing()
     set(_strata_hip_tests)
