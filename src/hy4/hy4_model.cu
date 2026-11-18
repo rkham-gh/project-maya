@@ -304,7 +304,14 @@ struct Engine::Impl {
     size_t snap_bytes = 0;
     int snap_pos = -1;
 
+    bool loaded = false;   // (load() done: no dalloc after it - see dalloc)
     template <class T> T* dalloc(size_t n) {
+        // (its device sync would wait on a token's spins - moe_wait, hd_plan - that wait for this thread: a buffer is
+        //  allocated at the load, never after)
+        if (loaded) {
+            std::fprintf(stderr, "maya-hy4: a device allocation after the load (dalloc): allocate it at the load\n");
+            std::abort();
+        }
         void* p = nullptr;
         CK(cudaMalloc(&p, std::max<size_t>(1, n) * sizeof(T)));
         CK(cudaMemset(p, 0, std::max<size_t>(1, n) * sizeof(T)));
@@ -327,7 +334,8 @@ struct Engine::Impl {
     }
 
     // a matrix [k, n] (or a 3D bank [k, n, count] as n x count rows when count > 0) into VRAM
-    bool mat(const std::string& name, int k, int n, DMat& m, std::string& err, int count = 0, bool to_bf16 = false) {
+    bool mat(const std::string& name, int k, int n, DMat& m, std::string& err, int count = 0, bool to_bf16 = false,
+             bool to_q8 = false) {
         const Tensor* t = find(name);
         if (!t) {
             err = "the GGUF has no " + name;
@@ -356,6 +364,42 @@ struct Engine::Impl {
             return false;
         }
         const size_t bytes = m.rb * (size_t) m.n;
+        if (to_q8 && (type == 0 || type == 30) && k % 32 == 0) {   // (Q8_0 as llama.cpp's quantize_row_q8_0_ref)
+            const size_t nb = (size_t) k / 32, rbq = nb * 34;
+            std::vector<uint8_t> h(rbq * m.n);
+            const uint8_t* src = t->data;
+            auto value = [&](size_t i) -> float {
+                if (type == 0) return ((const float*) src)[i];
+                const uint32_t u = (uint32_t) ((const uint16_t*) src)[i] << 16;
+                float f;
+                std::memcpy(&f, &u, 4);
+                return f;
+            };
+            const int nth = std::max(1u, std::thread::hardware_concurrency());
+            std::vector<std::thread> th;
+            for (int w = 0; w < nth; ++w)
+                th.emplace_back([&, w] {
+                    for (size_t r = (size_t) w; r < (size_t) m.n; r += (size_t) nth)
+                        for (size_t b = 0; b < nb; ++b) {
+                            const size_t i0 = r * k + b * 32;
+                            float amax = 0.0f;
+                            for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(value(i0 + j)));
+                            const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+                            uint8_t* o = h.data() + r * rbq + b * 34;
+                            const __half hd = __float2half(d);
+                            std::memcpy(o, &hd, 2);
+                            for (int j = 0; j < 32; ++j) ((int8_t*) (o + 2))[j] = (int8_t) std::lround(value(i0 + j) * id);
+                        }
+                });
+            for (auto& x : th) x.join();
+            m.type = 8;
+            m.rb = rbq;
+            uint8_t* d = dalloc<uint8_t>(h.size());
+            CK(cudaMemcpy(d, h.data(), h.size(), cudaMemcpyHostToDevice));
+            m.w = d;
+            trim(t->data, bytes);
+            return true;
+        }
         if (to_bf16 && type == 0) {   // (F32 whose values BF16 holds exactly - every low half zero: BF16, lossless)
             const uint32_t* src = (const uint32_t*) t->data;
             const size_t nv = (size_t) k * m.n;
@@ -1067,7 +1111,14 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
             return false;
         }
     }
-    if (!mat(find("output.weight") ? "output.weight" : "token_embd.weight", E, g.vocab, output, err)) return false;
+    // The output head quantized to Q8_0 at the load (HY4_HEAD_Q8=0: as the GGUF has it, BF16): half its bytes, a token's
+    // longest GEMV.  KL against BF16, teacher-forced: 1.3e-5 nats mean, 2.5e-4 at most, top-1 223 of 224.
+    {
+        const bool q8 = !(std::getenv("HY4_HEAD_Q8") && std::atoi(std::getenv("HY4_HEAD_Q8")) == 0);
+        if (!mat(find("output.weight") ? "output.weight" : "token_embd.weight", E, g.vocab, output, err, 0, false, q8))
+            return false;
+        if (q8 && o.verbose) std::fprintf(stderr, "maya-hy4: the output head in Q8_0 (HY4_HEAD_Q8)\n");
+    }
     if (!(out_norm = f32("output_norm.weight", (size_t) E, err))) return false;
     if (!(head_fn = f32("output_hc_fn.weight", (size_t) g.hc * g.hc * E, err)) ||
         !(head_scale = f32("output_hc_scale.weight", 1, err)) || !(head_base = f32("output_hc_base.weight", (size_t) g.hc, err)))
@@ -1396,6 +1447,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
                      dev_bytes / 1e9, ec.own, (dev_bytes - before_ec) / 1e9, ec.slots - ec.arena_end, cls.c_str(),
                      pool->threads(), (now_ms() - t0) / 1000.0, g.eos);
     }
+    loaded = true;   // (no dalloc from here on)
     return true;
 }
 

@@ -312,7 +312,10 @@ int main(int argc, char** argv) {
         }
         eng.clear_stats();
         const int steps = follow.empty() ? n_gen : (int) follow.size();
+        // (HY4_LOGITS_DUMP=<file>: every position's logits appended, F32 [vocab] each - a KL check's input)
+        static FILE* ldump = std::getenv("HY4_LOGITS_DUMP") ? std::fopen(std::getenv("HY4_LOGITS_DUMP"), "wb") : nullptr;
         for (int n = 0; n < steps && lg; ++n) {
+            if (ldump) std::fwrite(lg, sizeof(float), (size_t) V, ldump);
             std::vector<int> idx((size_t) V);
             for (int i = 0; i < V; ++i) idx[(size_t) i] = i;
             std::partial_sort(idx.begin(), idx.begin() + top, idx.end(), [&](int a, int b) { return lg[a] > lg[b]; });
@@ -330,6 +333,7 @@ int main(int argc, char** argv) {
             if (follow.empty() && pick == eos) break;
             lg = eng.step(pick);
         }
+        if (ldump) std::fflush(ldump);
         const bool failed = eng.failed();   // (the run's output is cut short: not ok, so its END says so)
         if (failed) {
             std::fprintf(stderr, "maya-hy4: FAILED - a card gave up waiting for the other; reset\n");
