@@ -1499,6 +1499,87 @@ __global__ void moe_wait_kernel(const int* ans, const int* __restrict__ need, co
     volatile const float* vs = (volatile const float*) (ans + kAnsHead);
     for (int i = t; i < nl; i += blockDim.x) tail[4 + i] = vs[i];
 }
+
+__device__ __forceinline__ bool spin_for(const int* p, int want, unsigned* diag) {
+    volatile const int* v = p;
+    const long long t0 = clock64();
+    while (v[0] != want)
+        if (clock64() - t0 > (1ll << 36)) {   // (~30 s: a dead peer must not hang the card)
+            if (diag) atomicAdd(diag, 1u);
+            return false;
+        }
+    __threadfence_system();
+    return true;
+}
+
+__global__ void moe_wait2_kernel(const int* ans, const int* hans, const int* __restrict__ need,
+                                 const int* __restrict__ dpos, int nl, float* __restrict__ tail, unsigned* diag) {
+    __shared__ int s_go, s_cpu, s_nh;
+    const int t = threadIdx.x;
+    if (t == 0) {
+        const int nd = *need, want = dpos[2];
+        int nh = 0, cpu = 0;
+        if (nd > 0) {
+            spin_for(hans, want, diag);
+            nh = ((volatile const int*) hans)[1];
+            cpu = nd - nh > 0;
+            if (cpu) spin_for(ans, want, diag);
+        }
+        s_go = nd > 0;
+        s_cpu = cpu;
+        s_nh = nh;
+        ((int*) tail)[0] = nd > 0;
+        ((int*) tail)[1] = 1;
+    }
+    __syncthreads();
+    if (!s_go) return;
+    volatile const float* vc = (volatile const float*) (ans + kAnsHead);
+    volatile const float* vh = (volatile const float*) (hans + kAnsHead);
+    for (int i = t; i < nl; i += blockDim.x) {
+        float v = s_cpu ? vc[i] : 0.0f;
+        if (s_nh) v = s_cpu ? v + vh[i] : vh[i];
+        tail[4 + i] = v;
+    }
+}
+
+__global__ void hd_plan_kernel(const int* plan, int nu, int nl, const int* __restrict__ where,
+                               const uint8_t* const* __restrict__ slotptr, const uint8_t** gptr, float* __restrict__ w,
+                               float* __restrict__ lat, int* nh, const int* __restrict__ dpos, unsigned* diag) {
+    __shared__ int s_here[16];
+    const int t = threadIdx.x;
+    if (t == 0) spin_for(plan, dpos[2], diag);
+    __syncthreads();
+    volatile const int* vp = plan;
+    if (t < nu) {
+        const int e = vp[2 + t], main_sl = vp[34 + t];
+        const int hs = main_sl >= 0 ? -1 : where[e];
+        gptr[t] = hs >= 0 ? slotptr[hs] : nullptr;
+        w[t] = __int_as_float(vp[18 + t]);
+        s_here[t] = hs >= 0;
+    }
+    volatile const float* vl = (volatile const float*) (plan + kPlanHead);
+    for (int i = t; i < nl; i += blockDim.x) lat[i] = vl[i];
+    __syncthreads();
+    if (t == 0) {
+        int n = 0;
+        for (int i = 0; i < nu; ++i) n += s_here[i];
+        *nh = n;
+    }
+}
+
+__global__ void hd_answer_kernel(const float* __restrict__ routed, const int* __restrict__ nh, int nl, int* hans,
+                                 const int* __restrict__ dpos) {
+    const int t = threadIdx.x;
+    volatile float* vs = (volatile float*) (hans + kAnsHead);
+    for (int i = t; i < nl; i += blockDim.x) vs[i] = routed[i];
+    if (t == 0) ((volatile int*) hans)[1] = *nh;
+    __threadfence_system();
+    __syncthreads();
+    if (t == 0) {
+        ((volatile int*) hans)[0] = dpos[2];
+        __threadfence_system();
+    }
+}
 }  // namespace
 
 void moe_plan(const int* sel, const float* w, int nu, const float* lat, int nl, const int* where,
@@ -1507,6 +1588,17 @@ void moe_plan(const int* sel, const float* w, int nu, const float* lat, int nl, 
 }
 void moe_wait(const int* ans, const int* need, const int* dpos, int nl, float* tail, unsigned* diag, cudaStream_t s) {
     moe_wait_kernel<<<1, 256, 0, s>>>(ans, need, dpos, nl, tail, diag);
+}
+void moe_wait2(const int* ans, const int* hans, const int* need, const int* dpos, int nl, float* tail, unsigned* diag,
+               cudaStream_t s) {
+    moe_wait2_kernel<<<1, 256, 0, s>>>(ans, hans, need, dpos, nl, tail, diag);
+}
+void hd_plan(const int* plan, int nu, int nl, const int* where, const uint8_t* const* slotptr, const uint8_t** gptr,
+             float* w, float* lat, int* nh, const int* dpos, unsigned* diag, cudaStream_t s) {
+    hd_plan_kernel<<<1, 256, 0, s>>>(plan, nu, nl, where, slotptr, gptr, w, lat, nh, dpos, diag);
+}
+void hd_answer(const float* routed, const int* nh, int nl, int* hans, const int* dpos, cudaStream_t s) {
+    hd_answer_kernel<<<1, 256, 0, s>>>(routed, nh, nl, hans, dpos);
 }
 
 }  // namespace hy4::k

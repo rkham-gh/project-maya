@@ -223,6 +223,18 @@ void moe_plan(const int* sel, const float* w, int nu, const float* lat, int nl, 
 /// With *need > 0: waits for the answer's sequence number dpos[2] (bounded: ~30 s, then diag[0] + 1), its sum into
 /// tail + 4; tail's flags [0] (the host's sum to add) and [1] (the main card's, always) for lat_sum_q8.
 void moe_wait(const int* ans, const int* need, const int* dpos, int nl, float* tail, unsigned* diag, cudaStream_t s);
+/// moe_wait with the helper card's own answer (hans, as an answer: [1] its count of experts): with *need > 0, the
+/// helper's answer for dpos[2], then the host's when the helper took fewer than *need; tail + 4 = the host's sum, plus
+/// the helper's (the host's routing's order).
+void moe_wait2(const int* ans, const int* hans, const int* need, const int* dpos, int nl, float* tail, unsigned* diag,
+               cudaStream_t s);
+/// (the helper card) A MoE layer's plan once its sequence number dpos[2] is there (bounded: diag[0] + 1): each choice
+/// not on the main card that this card holds (where: the layer's [n_expert] slots here) its pointer from slotptr into
+/// gptr (else null), the weights into w, the latent into lat [nl], their count into *nh.
+void hd_plan(const int* plan, int nu, int nl, const int* where, const uint8_t* const* slotptr, const uint8_t** gptr,
+             float* w, float* lat, int* nh, const int* dpos, unsigned* diag, cudaStream_t s);
+/// (the helper card) Its sum (routed [nl]) and count *nh into its answer hans, the sequence number dpos[2] last.
+void hd_answer(const float* routed, const int* nh, int nl, int* hans, const int* dpos, cudaStream_t s);
 
 /// (--selftest) nothing yet; true.
 bool selftest();

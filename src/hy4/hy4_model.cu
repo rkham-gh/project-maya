@@ -243,6 +243,26 @@ struct Engine::Impl {
     void dr_where();
     void tok_moe(const Layer& l, int il);
     void step_dr(double& cpu_ms, double& tp);
+    // ... and the helper card's experts from its own queued work (hd_alloc): its slots for every key (hwhere, as
+    // where), their pointers, a layer's choices there, weights, latent and count, the position; its answers in
+    // host-mapped memory (m_hans; mdh_*: the helper's device pointers); its per-layer graphs
+    bool hd = false;
+    int *hd_where = nullptr, *hh_where = nullptr, *hh_pos = nullptr;
+    std::vector<int> hwhere_up;
+    const uint8_t** hd_slotptr = nullptr;
+    const uint8_t** hd_gptr = nullptr;
+    float *hd_w = nullptr, *hd_lat = nullptr;
+    int *hd_nh = nullptr, *hd_dpos = nullptr;
+    int *m_hans = nullptr, *md_hans = nullptr, *mdh_hans = nullptr, *mdh_plan = nullptr;
+    unsigned* mdh_diag = nullptr;
+    std::vector<cudaGraphExec_t> hgx;
+    int hgraphs = -1;
+    unsigned hdiag_seen = 0;
+    void hd_alloc();
+    void hd_layer(const Layer& l, int il);
+    void hd_graphs();
+    void hd_start();
+    void hd_launch(int il);
     // Engram's tables and the token history its n-grams read (hist[p]: the token at position p)
     const uint8_t* eg_table = nullptr;
     size_t eg_rb = 0;
@@ -1248,6 +1268,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     if (o.helper_gpu >= 0) {
         const double th = now_ms();
         hc_alloc();
+        hd_alloc();
         if (hc.slots) {
             hc_update(INT_MAX, false, false);
             if (o.verbose)
@@ -3206,6 +3227,135 @@ void Engine::Impl::route_host(const Layer& l, const float* rl, int* sel, float* 
     for (int i = 0; i < g.n_used; ++i) w[i] = p[sel[i]] / den * g.exp_scale;
 }
 
+// The helper card's own queued work (with the device's routing): each MoE layer's experts there read from the plan in
+// host-mapped memory by the card itself (hd_plan waits for it), its sum answered there (hd_answer) for the main card's
+// moe_wait2; the host runs only the CPU lane's.  HY4_DEV_HELPER=0: the host launches the helper's experts, as before.
+void Engine::Impl::hd_alloc() {
+    const char* v = std::getenv("HY4_DEV_HELPER");
+    hd = dr && hc.slots > 0 && !(v && std::atoi(v) == 0);
+    if (!hd) return;
+    const int NL = g.n_lat;
+    const size_t nk = (size_t) g.n_layer * g.n_expert;
+    void* ha = nullptr;
+    if (cudaHostAlloc(&ha, (size_t) g.n_layer * ans_ints * sizeof(int), cudaHostAllocMapped | cudaHostAllocPortable) !=
+        cudaSuccess) {
+        cudaGetLastError();
+        hd = false;
+        std::fprintf(stderr, "maya-hy4: no host-mapped memory for the helper card's answers: the host launches its experts\n");
+        return;
+    }
+    m_hans = (int*) ha;
+    std::memset(m_hans, 0, (size_t) g.n_layer * ans_ints * sizeof(int));
+    CK(cudaHostGetDevicePointer((void**) &md_hans, m_hans, 0));
+    auto portable = [&](size_t bytes) {   // (pinned for the helper's context too)
+        void* p = nullptr;
+        CK(cudaHostAlloc(&p, bytes, cudaHostAllocPortable));
+        std::memset(p, 0, bytes);
+        return p;
+    };
+    hh_where = (int*) portable(nk * sizeof(int));
+    hh_pos = (int*) portable(4 * sizeof(int));
+    hwhere_up.assign(nk, INT_MIN);
+    OnDev od(hc.dev);
+    CK(cudaHostGetDevicePointer((void**) &mdh_hans, m_hans, 0));
+    CK(cudaHostGetDevicePointer((void**) &mdh_plan, m_plan, 0));
+    CK(cudaHostGetDevicePointer((void**) &mdh_diag, m_diag, 0));
+    auto dev_alloc = [&](size_t bytes) {
+        void* p = nullptr;
+        CK(cudaMalloc(&p, bytes));
+        CK(cudaMemset(p, 0, bytes));
+        hc.bytes += bytes;
+        return p;
+    };
+    hd_where = (int*) dev_alloc(nk * sizeof(int));
+    hd_slotptr = (const uint8_t**) dev_alloc((size_t) hc.slots * sizeof(uint8_t*));
+    CK(cudaMemcpy((void*) hd_slotptr, hc.ptr.data(), (size_t) hc.slots * sizeof(uint8_t*), cudaMemcpyHostToDevice));
+    hd_gptr = (const uint8_t**) dev_alloc(16 * sizeof(uint8_t*));
+    hd_w = (float*) dev_alloc(16 * sizeof(float));
+    hd_lat = (float*) dev_alloc((size_t) NL * sizeof(float));
+    hd_nh = (int*) dev_alloc(sizeof(int));
+    hd_dpos = (int*) dev_alloc(4 * sizeof(int));
+    hgx.assign((size_t) g.n_layer, nullptr);
+}
+
+// A MoE layer's work on the helper card, on hc.s (the helper current): hc_experts' launches with the device's choices
+void Engine::Impl::hd_layer(const Layer& l, int il) {
+    const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used, ne = g.n_expert;
+    const CpuLayer& c = l.cl;
+    const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru;
+    k::hd_plan(mdh_plan + (size_t) il * plan_ints, nu, NL, hd_where + (size_t) il * ne, hd_slotptr, hd_gptr, hd_w, hd_lat,
+               hd_nh, hd_dpos, mdh_diag + 1, hc.s);
+    k::q8(hd_lat, 1, NL, hc.qq, hc.qd, hc.s);
+    auto tab = [&](int type, size_t off, size_t ld, int kk, int n, const int8_t* xq, const float* xd, size_t xs,
+                   float* y, size_t ys, const float* alpha) {
+        if (!iq::mv_table(type, hd_gptr, off, ld, kk, n, nu, xq, xd, xs, y, ys, alpha, hc.s)) {
+            std::fprintf(stderr, "maya-hy4: no table GEMV for the experts' type %d (k %d) on the helper\n", type, kk);
+            std::abort();
+        }
+    };
+    tab(c.tg, 0, c.rg, NL, ff, hc.qq, hc.qd, 0, hc.gu, (size_t) 2 * ff, nullptr);
+    tab(c.tu, gb, c.ru, NL, ff, hc.qq, hc.qd, 0, hc.gu + ff, (size_t) 2 * ff, nullptr);
+    k::swiglu_f32_rows(hc.gu, nu, ff, l.clamp_exp, hc.h, hc.s);
+    k::q8(hc.h, nu, ff, hc.hq, hc.hd, hc.s);
+    tab(c.td, gb + ub, c.rd, ff, NL, hc.hq, hc.hd, (size_t) ff, hc.y, (size_t) NL, hd_w);
+    k::sum_rows(hc.y, nu, NL, hc.routed, hc.s);
+    k::hd_answer(hc.routed, hd_nh, NL, mdh_hans + (size_t) il * ans_ints, hd_dpos, hc.s);
+}
+
+void Engine::Impl::hd_graphs() {
+    hgraphs = 0;
+    const char* v = std::getenv("HY4_GRAPHS");
+    if (v && std::atoi(v) == 0) return;
+    OnDev od(hc.dev);
+    bool ok = true;
+    for (int il = g.n_dense; il < g.n_layer && ok; ++il) {
+        cudaGraph_t gr_ = nullptr;
+        ok = cudaStreamBeginCapture(hc.s, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+        if (!ok) break;
+        hd_layer(L[(size_t) il], il);
+        ok = cudaStreamEndCapture(hc.s, &gr_) == cudaSuccess && gr_ &&
+             cudaGraphInstantiate(&hgx[(size_t) il], gr_, 0) == cudaSuccess;
+        if (gr_) cudaGraphDestroy(gr_);
+    }
+    if (!ok) {
+        cudaGetLastError();
+        std::fprintf(stderr, "maya-hy4: the helper card's CUDA graphs could not be made; it launches its kernels one by one\n");
+        for (auto& e : hgx)
+            if (e) cudaGraphExecDestroy(e);
+        hgx.assign((size_t) g.n_layer, nullptr);
+        return;
+    }
+    hgraphs = 1;
+}
+
+// The helper's slots up to its card when they changed, the token's position and sequence number with them; then its
+// first MoE layer's work
+void Engine::Impl::hd_start() {
+    if (hgraphs < 0) hd_graphs();
+    OnDev od(hc.dev);
+    const size_t nk = hwhere_up.size();
+    bool diff = false;
+    for (size_t i = 0; i < nk; ++i) {
+        const int v = hc.where[i] >= 0 ? hc.where[i] : -1;
+        hh_where[i] = v;
+        diff |= v != hwhere_up[i];
+    }
+    if (diff) {
+        std::memcpy(hwhere_up.data(), hh_where, nk * sizeof(int));
+        CK(cudaMemcpyAsync(hd_where, hh_where, nk * sizeof(int), cudaMemcpyHostToDevice, hc.s));
+    }
+    std::memcpy(hh_pos, h_pos, 3 * sizeof(int));
+    CK(cudaMemcpyAsync(hd_dpos, hh_pos, 3 * sizeof(int), cudaMemcpyHostToDevice, hc.s));
+    hd_launch(g.n_dense);
+}
+
+void Engine::Impl::hd_launch(int il) {
+    OnDev od(hc.dev);
+    if (hgraphs > 0) CK(cudaGraphLaunch(hgx[(size_t) il], hc.s));
+    else hd_layer(L[(size_t) il], il);
+    (void) cudaStreamQuery(hc.s);   // (submitted now)
+}
+
 // ------------------------------------------------------------------------------------------------ the device's routing
 void Engine::Impl::dr_alloc() {
     const char* v = std::getenv("HY4_DEV_ROUTE");
@@ -3293,7 +3443,8 @@ void Engine::Impl::tok_moe(const Layer& l, int il) {
     k::swiglu(sg, su, sh, g.n_ff_sh, 0.0f, s);
     k::q8(sh, 1, g.n_ff_sh, xq_h, xd_h, s);
     mv(l.sh_down, sh, xq_h, xd_h, so);
-    k::moe_wait(md_ans + (size_t) il * ans_ints, d_need, dpos, NL, d_tail, md_diag, s);
+    if (hd) k::moe_wait2(md_ans + (size_t) il * ans_ints, md_hans + (size_t) il * ans_ints, d_need, dpos, NL, d_tail, md_diag, s);
+    else k::moe_wait(md_ans + (size_t) il * ans_ints, d_need, dpos, NL, d_tail, md_diag, s);
 }
 
 // step()'s layers with the device's routing: every segment launched at once (graphs; else each layer's as the host
@@ -3321,6 +3472,7 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
         const char* v = std::getenv("HY4_DR_LAZY");
         return !(v && std::atoi(v) == 0);
     }();
+    if (hd) hd_start();
     if (graphs > 0) {
         CK(cudaGraphLaunch(gx[0], s));
         if (!lazy) {
@@ -3354,6 +3506,7 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
             CK(cudaGraphLaunch(gx[(size_t) (il + 1)], s));
             (void) cudaStreamQuery(s);
         }
+        if (hd && il + 1 < g.n_layer) hd_launch(il + 1);   // (the helper's next layer, waiting for its plan)
         if (staging) {
             ec_stage_end();
             staging = false;
@@ -3385,18 +3538,19 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
         ec.hits += nmain;
         hc.hits += nh;
         phase(pt.route);
-        if (nc || nh) {
+        const int nh_host = hd ? 0 : nh;   // (hd: the helper card takes its own)
+        if (nc || nh_host) {
             const double c0 = now_ms();
             const float* xin = (const float*) (pl + k::kPlanHead);
             int* ans = m_ans + (size_t) il * ans_ints;
             float* part = (float*) (ans + k::kAnsHead);
             if (nc) lane.begin(*pool, l.cl, NL, ff, csel, cw, nc, xin, part);
-            if (nh) hc_experts(l, hslot, hw, nh, xin);
+            if (nh_host) hc_experts(l, hslot, hw, nh, xin);
             phase(pt.glaunch);
             if (nc) lane.end();
             const double c1 = now_ms();
             st.ms_lane += c1 - c0;
-            if (nh) {
+            if (nh_host) {
                 {
                     OnDev od(hc.dev);
                     CK(cudaStreamSynchronize(hc.s));
@@ -3426,6 +3580,10 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
     if (st4) ec_stage_end();
     trace("done", g.n_layer, 0, 0, 0);
     phase(pt.tail);
+    if (hd && m_diag[1] != hdiag_seen) {
+        hdiag_seen = m_diag[1];
+        std::fprintf(stderr, "maya-hy4: the helper card gave up waiting for a plan (%u times so far)\n", hdiag_seen);
+    }
     if (m_diag[0] != diag_seen) {
         diag_seen = m_diag[0];
         std::fprintf(stderr, "maya-hy4: the device gave up waiting for the host's answer (%u times so far)\n", diag_seen);
