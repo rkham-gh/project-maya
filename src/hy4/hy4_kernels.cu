@@ -8,6 +8,7 @@
 #include <cmath>
 #include <functional>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <vector>
 
@@ -724,6 +725,46 @@ __global__ void route_kernel(const float* __restrict__ RL, int ld, const float* 
         }
     }
 }
+// route_kernel for one token (the token path) in one block of ne threads: each thread an expert's sigmoid and score,
+// its rank the scores above it (ties: the lower id first - route_kernel's order), the nu best by rank; their weights
+// summed in that order as route_kernel sums them - the same choices and the same bits, in ~1 us where route_kernel's
+// 16 serial warp rounds took ~18 (ng 1 only)
+constexpr int kRoute1Max = 1024;
+__global__ void route1_kernel(const float* __restrict__ rl, const float* __restrict__ bias, int ne, int nu, float scale,
+                              int* __restrict__ sel, float* __restrict__ w) {
+    __shared__ float s_sc[kRoute1Max];
+    __shared__ float s_p[16];
+    __shared__ int s_e[16];
+    const int e = threadIdx.x;
+    float p = 0.0f, sc = -INFINITY;
+    if (e < ne) {
+        p = 1.0f / (1.0f + expf(-rl[e]));
+        sc = p + bias[e];
+        s_sc[e] = sc;
+    }
+    __syncthreads();
+    if (e < ne) {
+        int rank = 0;
+        for (int j = 0; j < ne; ++j) {
+            const float v = s_sc[j];
+            rank += v > sc || (v == sc && j < e);
+        }
+        if (rank < nu) {
+            s_e[rank] = e;
+            s_p[rank] = p;
+        }
+    }
+    __syncthreads();
+    if (e == 0) {
+        float psum = 0.0f;
+        for (int k = 0; k < nu; ++k) psum += s_p[k];
+        const float den = fmaxf(psum, 6.103515625e-5f);
+        for (int k = 0; k < nu; ++k) {
+            sel[k] = s_e[k];
+            w[k] = s_p[k] / den * scale;
+        }
+    }
+}
 __global__ void expert_count_kernel(const int* __restrict__ sel, int n, int* __restrict__ counts) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) atomicAdd(counts + sel[i], 1);
@@ -870,6 +911,12 @@ void mla_softmax(float* S, int lds, __half* P, int ldp, int M, int nk, int H, in
 void route(const float* RL, int ld, const float* bias, int T, int ne, int ng, int ngu, int nu, float scale, int* sel,
            float* w, cudaStream_t s) {
     const int wpb = 4;
+    // (one token: route1_kernel; HY4_ROUTE1=0 the warp kernel, as before)
+    static const bool one = !(std::getenv("HY4_ROUTE1") && std::atoi(std::getenv("HY4_ROUTE1")) == 0);
+    if (T == 1 && ng == 1 && one && ne <= kRoute1Max && nu <= 16) {
+        route1_kernel<<<1, (unsigned) ((ne + 31) / 32 * 32), 0, s>>>(RL, bias, ne, nu, scale, sel, w);
+        return;
+    }
     if (T > 0) route_kernel<<<blocks(T, wpb), 32 * wpb, 0, s>>>(RL, ld, bias, T, ne, ng, ngu, nu, scale, sel, w);
 }
 void expert_count(const int* sel, int n, int* counts, cudaStream_t s) {
