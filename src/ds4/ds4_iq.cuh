@@ -159,6 +159,12 @@ struct MvJob {
     float alpha = 1.0f;
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// nj GEMVs of one type whose matrices the device chose (maya-hy4's routed experts from its device routing): job j's
+/// matrix at wp[j] + off (wp on the device; n rows of k values, ld bytes apart), its int8 input xq + j xs (scales
+/// xd + j xs / 32; xs 0: one input for all), y[j ys + r] = alpha[j] (row r . x) (alpha null: 1).  A null wp[j]: its n
+/// outputs 0.  The same sums as mv's one-column jobs.
+bool mv_table(int type, const uint8_t* const* wp, size_t off, size_t ld, int k, int n, int nj, const int8_t* xq,
+              const float* xd, size_t xs, float* y, size_t ys, const float* alpha, cudaStream_t s);
 
 /// (tests) every value of n rows of k (rows row_bytes(type, k) apart, on the device) as the kernels decode them: sub =
 /// the token / window / light kernels' codes times their scales (d s q - m; IQ1_M through the persistent kernels'

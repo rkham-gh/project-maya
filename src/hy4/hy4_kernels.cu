@@ -1441,4 +1441,72 @@ __global__ void keepalive_kernel(unsigned long long ns) {
 }
 void keepalive(unsigned long long ns, cudaStream_t s) { keepalive_kernel<<<1, 32, 0, s>>>(ns); }
 
+// ------------------------------------------------------------------------------------------------ the device's routing
+namespace {
+__global__ void moe_plan_kernel(const int* __restrict__ sel, const float* __restrict__ w, int nu,
+                                const float* __restrict__ lat, int nl, const int* __restrict__ where,
+                                const uint8_t* const* __restrict__ slotptr, const uint8_t** gptr, int* need, int* plan,
+                                const int* __restrict__ dpos) {
+    const int t = threadIdx.x;
+    __shared__ int s_main[16];
+    volatile int* vp = plan;
+    if (t < nu) {
+        const int e = sel[t], sl = where[e];
+        gptr[t] = sl >= 0 ? slotptr[sl] : nullptr;
+        s_main[t] = sl >= 0;
+        vp[2 + t] = e;
+        vp[18 + t] = __float_as_int(w[t]);
+        vp[34 + t] = sl;
+    }
+    volatile float* vl = (volatile float*) (plan + kPlanHead);
+    for (int i = t; i < nl; i += blockDim.x) vl[i] = lat[i];
+    __threadfence_system();
+    __syncthreads();
+    if (t == 0) {
+        int nm = 0;
+        for (int i = 0; i < nu; ++i) nm += s_main[i];
+        vp[1] = nm;
+        *need = nu - nm;
+        __threadfence_system();
+        vp[0] = dpos[2];
+        __threadfence_system();
+    }
+}
+
+__global__ void moe_wait_kernel(const int* ans, const int* __restrict__ need, const int* __restrict__ dpos, int nl,
+                                float* __restrict__ tail, unsigned* diag) {
+    __shared__ int s_go;
+    const int t = threadIdx.x;
+    if (t == 0) {
+        const int go = *need > 0;
+        if (go) {
+            const int want = dpos[2];
+            volatile const int* va = ans;
+            const long long t0 = clock64();
+            while (va[0] != want)
+                if (clock64() - t0 > (1ll << 36)) {   // (a dead host must not hang the GPU: ~30 s)
+                    if (diag) atomicAdd(diag, 1u);
+                    break;
+                }
+            __threadfence_system();
+        }
+        s_go = go;
+        ((int*) tail)[0] = go;
+        ((int*) tail)[1] = 1;
+    }
+    __syncthreads();
+    if (!s_go) return;
+    volatile const float* vs = (volatile const float*) (ans + kAnsHead);
+    for (int i = t; i < nl; i += blockDim.x) tail[4 + i] = vs[i];
+}
+}  // namespace
+
+void moe_plan(const int* sel, const float* w, int nu, const float* lat, int nl, const int* where,
+              const uint8_t* const* slotptr, const uint8_t** gptr, int* need, int* plan, const int* dpos, cudaStream_t s) {
+    moe_plan_kernel<<<1, 256, 0, s>>>(sel, w, nu, lat, nl, where, slotptr, gptr, need, plan, dpos);
+}
+void moe_wait(const int* ans, const int* need, const int* dpos, int nl, float* tail, unsigned* diag, cudaStream_t s) {
+    moe_wait_kernel<<<1, 256, 0, s>>>(ans, need, dpos, nl, tail, diag);
+}
+
 }  // namespace hy4::k

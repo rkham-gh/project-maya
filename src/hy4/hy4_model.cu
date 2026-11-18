@@ -38,6 +38,8 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <immintrin.h>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -219,7 +221,28 @@ struct Engine::Impl {
     int max_pools = 0;
     // host (pinned)
     float *h_f = nullptr, *h_rlog = nullptr, *h_tail = nullptr, *h_logits = nullptr, *h_eg = nullptr;
-    int* h_pos = nullptr;
+    int* h_pos = nullptr;   // [0] the position, [1] the token (or 0), [2] the token's sequence number (tseq)
+    // The device's routing (the token path; HY4_DEV_ROUTE=0: the host's, as before).  Each MoE layer routes on the
+    // device, runs its experts in the main card's cache from a table there (where: every key's slot, uploaded when it
+    // changed; slotptr: the slots' pointers) and its shared expert in the segment's graph, and publishes its plan to
+    // host-mapped memory; the host reads the plans in order (no syncs), runs the CPU lane's and the helper's experts
+    // and answers there; the device waits for an answer only where the plan sent experts to the host.
+    bool dr = false;
+    int *d_where = nullptr, *h_where = nullptr;
+    std::vector<int> where_up;   // (the table as last uploaded)
+    const uint8_t** d_slotptr = nullptr;
+    const uint8_t** d_gptr = nullptr;
+    int *d_sel = nullptr, *d_need = nullptr;
+    float* d_wsel = nullptr;
+    int *m_plan = nullptr, *m_ans = nullptr, *md_plan = nullptr, *md_ans = nullptr;   // (host / device pointers)
+    unsigned *m_diag = nullptr, *md_diag = nullptr;
+    unsigned diag_seen = 0;
+    size_t plan_ints = 0, ans_ints = 0;
+    int tseq = 0;
+    void dr_alloc();
+    void dr_where();
+    void tok_moe(const Layer& l, int il);
+    void step_dr(double& cpu_ms, double& tp);
     // Engram's tables and the token history its n-grams read (hist[p]: the token at position p)
     const uint8_t* eg_table = nullptr;
     size_t eg_rb = 0;
@@ -579,7 +602,7 @@ struct Engine::Impl {
     void ec_adapt();
     void ec_reclaim();
     void ec_flush();
-    bool ec_stage_begin(size_t budget);
+    bool ec_stage_begin(size_t budget, bool wait = true);
     void ec_stage_end();
     void ec_arrive();
     bool ec_usable(int sl) const {
@@ -658,7 +681,7 @@ struct Engine::Impl {
     void hc_copy_many(const std::vector<std::pair<int, int>>& todo);
     void hc_collect(bool wait);
     void hc_worker();
-    void hc_experts(const Layer& l, const int* slot, const float* w, int n);
+    void hc_experts(const Layer& l, const int* slot, const float* w, int n, const float* xin = nullptr);
 
     bool save_profile(const std::string& path) const;
     bool load_profile(const std::string& path);
@@ -1114,7 +1137,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     d_tail = dalloc<float>((size_t) 4 + NL);
     logits = dalloc<float>((size_t) g.vocab);
     rlog = dalloc<float>((size_t) g.n_expert);
-    dpos = dalloc<int>(2);
+    dpos = dalloc<int>(4);
     attn_nsp = k::mla_nsp(max_ctx);
     attn_scr = dalloc<float>(k::mla_scratch_floats(Hmax, attn_nsp));
     const size_t ka = (size_t) std::max(E, Hmax * g.v_head), kf = (size_t) E, kh = (size_t) ffm,
@@ -1133,7 +1156,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     h_rlog = halloc<float>((size_t) g.n_expert);
     h_tail = halloc<float>((size_t) 4 + NL);
     h_logits = halloc<float>((size_t) g.vocab);
-    h_pos = halloc<int>(2);
+    h_pos = halloc<int>(4);
     if (!g.eg_layers.empty()) {
         const size_t cd = (size_t) g.eg_cols * g.eg_dim;
         eg_rows_d = dalloc<float>(g.eg_layers.size() * cd);
@@ -1213,6 +1236,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     if (!pf_alloc(err)) return false;
     const size_t before_ec = dev_bytes;
     ec_alloc();
+    dr_alloc();
     if (!o.profile.empty() && load_profile(o.profile)) {
         const double tf = now_ms();
         ec_fill();
@@ -1631,8 +1655,13 @@ void Engine::Impl::ec_src_parts(int key, size_t off, size_t n,
 
 // The pending copies' next piece (up to `budget` bytes of the first one) into a pinned buffer, by the CPU lane's
 // workers, while this thread waits for the GPU; ec_stage_end joins them and puts the piece's DMA on the copy stream.
-bool Engine::Impl::ec_stage_begin(size_t budget) {
+bool Engine::Impl::ec_stage_begin(size_t budget, bool wait) {
     if (!ec.defer || ec.pend_head >= ec.pend.size()) return false;
+    // (wait false: none when that buffer's last DMA is still on its way - the device's routing must not block here)
+    if (!wait && cudaEventQuery(ec.aev[ec.ak]) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
     EC::Pending& p0 = ec.pend[ec.pend_head];
     const size_t n = std::min(budget, p0.bytes - p0.done);
     CK(cudaEventSynchronize(ec.aev[ec.ak]));   // (that buffer's last DMA: long done)
@@ -1661,6 +1690,9 @@ void Engine::Impl::ec_stage_end() {
     EC::Pending& p0 = ec.pend[ec.pend_head];
     CK(cudaMemcpyAsync(ec.ptr[(size_t) p0.slot] + p0.done, ec.apin[ec.ak], ec.stage_n, cudaMemcpyHostToDevice, pf.cs));
     CK(cudaEventRecord(ec.aev[ec.ak], pf.cs));
+    // (submitted now: WDDM holds a stream's work until something flushes it, and the device's routing has no sync
+    //  before the next piece waits for this one)
+    (void) cudaStreamQuery(pf.cs);
     ec.ak ^= 1;
     p0.done += ec.stage_n;
     if (p0.done == p0.bytes) {
@@ -2126,7 +2158,7 @@ void Engine::Impl::hc_update(int max_copies, bool hysteresis, bool bg) {
 
 // A token's experts on the helper card: f up from the host, its int8 rows, then gpu_experts' launches on the helper's
 // stream and buffers; their sum -> hc.h_out (there once hc.s is synchronized).
-void Engine::Impl::hc_experts(const Layer& l, const int* slot, const float* w, int n) {
+void Engine::Impl::hc_experts(const Layer& l, const int* slot, const float* w, int n, const float* xin) {
     const int E = g.n_lat, ff = g.n_ff_exp;
     const CpuLayer& c = l.cl;
     const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru;
@@ -2137,7 +2169,7 @@ void Engine::Impl::hc_experts(const Layer& l, const int* slot, const float* w, i
         }
     };
     OnDev od(hc.dev);
-    CK(cudaMemcpyAsync(hc.f, h_f, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, hc.s));
+    CK(cudaMemcpyAsync(hc.f, xin ? xin : h_f, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, hc.s));
     k::q8(hc.f, 1, E, hc.qq, hc.qd, hc.s);
     iq::MvJob jobs[32];
     for (int i = 0; i < n; ++i) {
@@ -3065,6 +3097,7 @@ void Engine::Impl::tok_router(const Layer& l) {
     mv(l.gate_inp, f, xq_f, xd_f, rlog);
     mv(l.lat_down, f, xq_f, xd_f, lat);
     k::q8(lat, 1, g.n_lat, xq_l, xd_l, s);
+    if (dr) return;   // (the device's routing: tok_moe next)
     CK(cudaMemcpyAsync(h_f, lat, (size_t) g.n_lat * sizeof(float), cudaMemcpyDeviceToHost, s));
     CK(cudaMemcpyAsync(h_rlog, rlog, (size_t) g.n_expert * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
@@ -3072,7 +3105,7 @@ void Engine::Impl::tok_router(const Layer& l) {
 // A MoE layer's end: the CPU lane's latent sum and which lanes ran (h_tail, written by the host) up to the device; the
 // latent sum (+ the VRAM experts') through routed_up, plus the shared expert's, post-normed, written back to the streams
 void Engine::Impl::tok_tail(const Layer& l) {
-    CK(cudaMemcpyAsync(d_tail, h_tail, tail_bytes(), cudaMemcpyHostToDevice, s));
+    if (!dr) CK(cudaMemcpyAsync(d_tail, h_tail, tail_bytes(), cudaMemcpyHostToDevice, s));   // (else moe_wait's)
     k::lat_sum_q8(d_tail + 4, ec.routed, (const int*) d_tail, g.n_lat, lsum, xq_l, xd_l, s);
     mv(l.lat_up, lsum, xq_l, xd_l, fo);
     k::norm_write(fo, so, l.post_ffn, g.eps, hpost, g.hc, g.n_embd, R, s);
@@ -3109,7 +3142,10 @@ void Engine::Impl::tok_seg(int seg) {
             Layer& l = L[(size_t) il];
             tok_attn(l);
             if (l.dense) tok_dense_ffn(l);
-            else tok_router(l);
+            else {
+                tok_router(l);
+                if (dr) tok_moe(l, il);
+            }
         }
         return;
     }
@@ -3117,6 +3153,7 @@ void Engine::Impl::tok_seg(int seg) {
     tok_tail(L[(size_t) seg - 1]);
     tok_attn(l);
     tok_router(l);
+    if (dr) tok_moe(l, seg);
 }
 
 void Engine::Impl::tok_graphs() {
@@ -3169,6 +3206,232 @@ void Engine::Impl::route_host(const Layer& l, const float* rl, int* sel, float* 
     for (int i = 0; i < g.n_used; ++i) w[i] = p[sel[i]] / den * g.exp_scale;
 }
 
+// ------------------------------------------------------------------------------------------------ the device's routing
+void Engine::Impl::dr_alloc() {
+    const char* v = std::getenv("HY4_DEV_ROUTE");
+    dr = !(v && std::atoi(v) == 0) && g.n_used <= 16;
+    if (!dr) return;
+    const int NL = g.n_lat;
+    const size_t nk = (size_t) g.n_layer * g.n_expert;
+    plan_ints = ((size_t) k::kPlanHead + NL + 63) & ~(size_t) 63;
+    ans_ints = ((size_t) k::kAnsHead + NL + 63) & ~(size_t) 63;
+    const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
+    void *hp = nullptr, *ha = nullptr, *hd = nullptr;
+    if (cudaHostAlloc(&hp, (size_t) g.n_layer * plan_ints * sizeof(int), fl) != cudaSuccess ||
+        cudaHostAlloc(&ha, (size_t) g.n_layer * ans_ints * sizeof(int), fl) != cudaSuccess ||
+        cudaHostAlloc(&hd, 64, fl) != cudaSuccess) {
+        cudaGetLastError();
+        dr = false;
+        std::fprintf(stderr, "maya-hy4: no host-mapped memory for the device's routing: the host routes\n");
+        return;
+    }
+    m_plan = (int*) hp;
+    m_ans = (int*) ha;
+    m_diag = (unsigned*) hd;
+    std::memset(m_plan, 0, (size_t) g.n_layer * plan_ints * sizeof(int));
+    std::memset(m_ans, 0, (size_t) g.n_layer * ans_ints * sizeof(int));
+    std::memset(m_diag, 0, 64);
+    CK(cudaHostGetDevicePointer((void**) &md_plan, m_plan, 0));
+    CK(cudaHostGetDevicePointer((void**) &md_ans, m_ans, 0));
+    CK(cudaHostGetDevicePointer((void**) &md_diag, m_diag, 0));
+    d_where = dalloc<int>(nk);
+    h_where = halloc<int>(nk);
+    where_up.assign(nk, INT_MIN);
+    d_slotptr = (const uint8_t**) dalloc<const uint8_t*>((size_t) std::max(1, ec.slots));
+    if (ec.slots)
+        CK(cudaMemcpy((void*) d_slotptr, ec.ptr.data(), (size_t) ec.slots * sizeof(uint8_t*), cudaMemcpyHostToDevice));
+    d_gptr = (const uint8_t**) dalloc<const uint8_t*>(16);
+    d_sel = dalloc<int>(16);
+    d_wsel = dalloc<float>(16);
+    d_need = dalloc<int>(1);
+}
+
+// The experts' slots up to the device when they changed since the last upload (they change only between tokens:
+// swaps and arrivals at a token's end, the lent slots before one)
+void Engine::Impl::dr_where() {
+    const size_t nk = where_up.size();
+    bool diff = false;
+    for (size_t i = 0; i < nk; ++i) {
+        const int v = ec.where[i];
+        h_where[i] = v;
+        diff |= v != where_up[i];
+    }
+    if (!diff) return;
+    std::memcpy(where_up.data(), h_where, nk * sizeof(int));
+    CK(cudaMemcpyAsync(d_where, h_where, nk * sizeof(int), cudaMemcpyHostToDevice, s));
+}
+
+// A MoE layer on the device after its router: the top n_used, the plan out to the host, the experts in the main card's
+// cache (gpu_experts' sums in the choices' order, the others' rows 0), the shared expert; then the host's answer when
+// the plan sent it experts (into d_tail for tok_tail)
+void Engine::Impl::tok_moe(const Layer& l, int il) {
+    const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used, ne = g.n_expert;
+    const CpuLayer& c = l.cl;
+    k::route(rlog, ne, l.exp_bias_d, 1, ne, 1, 1, nu, g.exp_scale, d_sel, d_wsel, s);
+    k::moe_plan(d_sel, d_wsel, nu, lat, NL, d_where + (size_t) il * ne, d_slotptr, d_gptr, d_need,
+                md_plan + (size_t) il * plan_ints, dpos, s);
+    const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru;
+    auto tab = [&](int type, size_t off, size_t ld, int kk, int n, const int8_t* xq, const float* xd, size_t xs,
+                   float* y, size_t ys, const float* alpha) {
+        if (!iq::mv_table(type, d_gptr, off, ld, kk, n, nu, xq, xd, xs, y, ys, alpha, s)) {
+            std::fprintf(stderr, "maya-hy4: no table GEMV for the experts' type %d (k %d)\n", type, kk);
+            std::abort();
+        }
+    };
+    tab(c.tg, 0, c.rg, NL, ff, xq_l, xd_l, 0, ec.gu, (size_t) 2 * ff, nullptr);
+    tab(c.tu, gb, c.ru, NL, ff, xq_l, xd_l, 0, ec.gu + ff, (size_t) 2 * ff, nullptr);
+    k::swiglu_f32_rows(ec.gu, nu, ff, l.clamp_exp, ec.h, s);
+    k::q8(ec.h, nu, ff, ec.hq, ec.hd, s);
+    tab(c.td, gb + ub, c.rd, ff, NL, ec.hq, ec.hd, (size_t) ff, ec.y, (size_t) NL, d_wsel);
+    k::sum_rows(ec.y, nu, NL, ec.routed, s);
+    // the shared expert (f's int8 rows), unclamped
+    {
+        const DMat* ms[2] = {&l.sh_gate, &l.sh_up};
+        float* ys[2] = {sg, su};
+        mv_many(ms, ys, 2, f, xq_f, xd_f);
+    }
+    k::swiglu(sg, su, sh, g.n_ff_sh, 0.0f, s);
+    k::q8(sh, 1, g.n_ff_sh, xq_h, xd_h, s);
+    mv(l.sh_down, sh, xq_h, xd_h, so);
+    k::moe_wait(md_ans + (size_t) il * ans_ints, d_need, dpos, NL, d_tail, md_diag, s);
+}
+
+// step()'s layers with the device's routing: every segment launched at once (graphs; else each layer's as the host
+// gets to it), then each MoE layer's plan read in order: the scores, the helper's and the CPU lane's experts, their sum
+// answered; the head waited for.
+void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
+    static const bool ptimes = std::getenv("HY4_STEP_TIMES") != nullptr;
+    auto phase = [&](double& acc) {
+        if (!ptimes) return;
+        const double t = now_ms();
+        acc += t - tp;
+        tp = t;
+    };
+    const int NL = g.n_lat, ne = g.n_expert, ff = g.n_ff_exp, nu = g.n_used, seq = tseq;
+    static const bool tr = std::getenv("HY4_DR_TRACE") != nullptr;   // (each layer's host side, as it goes)
+    auto trace = [&](const char* what, int il, int a0, int a1, int a2) {
+        if (!tr) return;
+        std::fprintf(stderr, "[dr] token %d layer %d: %s %d %d %d\n", seq, il, what, a0, a1, a2);
+        std::fflush(stderr);
+    };
+    dr_where();
+    // HY4_DR_LAZY=0: every segment's graph launched at once; else each the moment the layer before has its plan (the
+    // stream then holds a segment or two: work on the other streams - the swaps' copies - is not queued behind a token)
+    static const bool lazy = [] {
+        const char* v = std::getenv("HY4_DR_LAZY");
+        return !(v && std::atoi(v) == 0);
+    }();
+    if (graphs > 0) {
+        CK(cudaGraphLaunch(gx[0], s));
+        if (!lazy) {
+            for (int il = g.n_dense + 1; il < g.n_layer; ++il) CK(cudaGraphLaunch(gx[(size_t) il], s));
+            CK(cudaGraphLaunch(gx[(size_t) g.n_layer], s));
+        }
+        (void) cudaStreamQuery(s);   // (submitted now: WDDM holds launches until something does)
+    }
+    bool staging = false;
+    for (int il = g.n_dense; il < g.n_layer; ++il) {
+        Layer& l = L[(size_t) il];
+        if (graphs <= 0) {
+            tok_seg(il == g.n_dense ? 0 : il);
+            (void) cudaStreamQuery(s);
+        }
+        volatile const int* pl = m_plan + (size_t) il * plan_ints;
+        if (pl[0] != seq) {
+            const double tw = now_ms();
+            for (unsigned spin = 1; pl[0] != seq; ++spin) {
+                _mm_pause();
+                if ((spin & 0xfffu) == 0 && now_ms() - tw > 60000.0) {
+                    std::fprintf(stderr, "maya-hy4: layer %d's plan did not come in 60 s (token %d, saw %d)\n", il, seq,
+                                 pl[0]);
+                    std::abort();
+                }
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        trace("plan", il, pl[1], 0, 0);
+        if (graphs > 0 && lazy) {   // (the next segment behind this layer's wait)
+            CK(cudaGraphLaunch(gx[(size_t) (il + 1)], s));
+            (void) cudaStreamQuery(s);
+        }
+        if (staging) {
+            ec_stage_end();
+            staging = false;
+            trace("staged", il, 0, 0, 0);
+        }
+        phase(pt.att);
+        const int nmain = pl[1];
+        int csel[16], hslot[16];
+        float cw[16], hw[16];
+        int nc = 0, nh = 0;
+        for (int i = 0; i < nu; ++i) {
+            const int e = pl[2 + i], sl = pl[34 + i], wb = pl[18 + i];
+            float wi;
+            std::memcpy(&wi, &wb, sizeof(float));
+            const size_t key = (size_t) il * ne + e;
+            if (route_log) route_tok.push_back((uint16_t) e);
+            ec.score[key] += 1.0f;
+            if (sl >= 0) continue;
+            const int hs = hc.slots ? hc.where[key] : -1;
+            if (hs >= 0) {
+                hslot[nh] = hs;
+                hw[nh++] = wi;
+            } else {
+                csel[nc] = e;
+                cw[nc++] = wi;
+            }
+        }
+        ec.lookups += nu;
+        ec.hits += nmain;
+        hc.hits += nh;
+        phase(pt.route);
+        if (nc || nh) {
+            const double c0 = now_ms();
+            const float* xin = (const float*) (pl + k::kPlanHead);
+            int* ans = m_ans + (size_t) il * ans_ints;
+            float* part = (float*) (ans + k::kAnsHead);
+            if (nc) lane.begin(*pool, l.cl, NL, ff, csel, cw, nc, xin, part);
+            if (nh) hc_experts(l, hslot, hw, nh, xin);
+            phase(pt.glaunch);
+            if (nc) lane.end();
+            const double c1 = now_ms();
+            st.ms_lane += c1 - c0;
+            if (nh) {
+                {
+                    OnDev od(hc.dev);
+                    CK(cudaStreamSynchronize(hc.s));
+                }
+                if (nc)
+                    for (int i = 0; i < NL; ++i) part[i] += hc.h_out[i];
+                else std::memcpy(part, hc.h_out, (size_t) NL * sizeof(float));
+                st.ms_helper += now_ms() - c1;
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+            ((volatile int*) ans)[0] = seq;
+            trace("answered", il, nc, nh, 0);
+            cpu_ms += now_ms() - c0;
+            phase(pt.cpu);
+        }
+        pt.cpu_experts += nc;
+        st.lane_layers += nc > 0;
+        st.helper_layers += nh > 0;
+        staging = ec_stage_begin(ec.piece, false);   // (a piece of the swaps' copies while the GPU goes on)
+        trace("stage begun", il, staging, 0, 0);
+    }
+    if (graphs <= 0) tok_seg(g.n_layer);
+    if (staging) ec_stage_end();
+    const bool st4 = ec_stage_begin(4 * ec.piece, false);   // (the head's GEMV is the token's longest wait)
+    trace("head sync", g.n_layer, st4, 0, 0);
+    CK(cudaStreamSynchronize(s));
+    if (st4) ec_stage_end();
+    trace("done", g.n_layer, 0, 0, 0);
+    phase(pt.tail);
+    if (m_diag[0] != diag_seen) {
+        diag_seen = m_diag[0];
+        std::fprintf(stderr, "maya-hy4: the device gave up waiting for the host's answer (%u times so far)\n", diag_seen);
+    }
+}
+
 const float* Engine::Impl::step(int token) {
     if (pos >= max_ctx || token < 0 || token >= g.vocab) return nullptr;
     const double t0 = now_ms();
@@ -3213,8 +3476,11 @@ const float* Engine::Impl::step(int token) {
     hist[(size_t) pos] = token;
     h_pos[0] = pos;
     h_pos[1] = embd_host ? 0 : token;
-    CK(cudaMemcpyAsync(dpos, h_pos, 2 * sizeof(int), cudaMemcpyHostToDevice, s));
+    h_pos[2] = ++tseq;
+    CK(cudaMemcpyAsync(dpos, h_pos, 3 * sizeof(int), cudaMemcpyHostToDevice, s));
     phase(pt.embed);
+    if (dr) step_dr(cpu_ms, tp);
+    else {   // the host's routing: a sync each MoE layer
 
     static const bool trace = std::getenv("HY4_TRACE") != nullptr;
     const int ne = g.n_expert, ff = g.n_ff_exp;
@@ -3309,11 +3575,14 @@ const float* Engine::Impl::step(int token) {
     }
 
     // the last layer's end and the output head
-    if (graphs > 0) CK(cudaGraphLaunch(gx[(size_t) g.n_layer], s));
-    else tok_seg(g.n_layer);
-    const bool staging = ec_stage_begin(4 * ec.piece);   // (the head's GEMV is the token's longest wait)
-    CK(cudaStreamSynchronize(s));
-    if (staging) ec_stage_end();
+    {
+        if (graphs > 0) CK(cudaGraphLaunch(gx[(size_t) g.n_layer], s));
+        else tok_seg(g.n_layer);
+        const bool staging = ec_stage_begin(4 * ec.piece);   // (the head's GEMV is the token's longest wait)
+        CK(cudaStreamSynchronize(s));
+        if (staging) ec_stage_end();
+    }
+    }   // (the host's routing)
     dump("final", g.n_layer, R, pos);
     ++pos;
     if (route_log) {

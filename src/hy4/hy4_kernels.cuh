@@ -209,6 +209,21 @@ void idx_score_rows(const float* A, const float* w, int nh, int npool, int tq, i
 void idx_select_rows(const float* S, int npool, int tq, int qpos0, int kpool, int top_pools, int* cells, unsigned* bits,
                      int nwords, int* sel_on, cudaStream_t s);
 
+// ------------------------------------------------------------------------------------------------ the device's routing
+/// A MoE layer's plan and the host's answer, in host-mapped memory (ints).  Plan: [0] the token's sequence number once
+/// the rest is there, [1] the experts on the main card, [2 + i] the i-th choice, [18 + i] its weight (float bits),
+/// [34 + i] its main-card slot (-1: not there), the latent (F32) from kPlanHead.  Answer: [0] the sequence number once
+/// the sum is there, the CPU lane's and the helper's latent sum (F32) from kAnsHead.
+constexpr int kPlanHead = 64, kAnsHead = 16;
+/// After the router's top nu (sel, w on the device): each choice's slot from where (the layer's [n_expert]) and its
+/// matrices' pointer from slotptr (null: not on the main card) into gptr [nu], the experts the host must add into *need,
+/// the plan into plan (the latent lat [nl] in it); its sequence number dpos[2] last.
+void moe_plan(const int* sel, const float* w, int nu, const float* lat, int nl, const int* where,
+              const uint8_t* const* slotptr, const uint8_t** gptr, int* need, int* plan, const int* dpos, cudaStream_t s);
+/// With *need > 0: waits for the answer's sequence number dpos[2] (bounded: ~30 s, then diag[0] + 1), its sum into
+/// tail + 4; tail's flags [0] (the host's sum to add) and [1] (the main card's, always) for lat_sum_q8.
+void moe_wait(const int* ans, const int* need, const int* dpos, int nl, float* tail, unsigned* diag, cudaStream_t s);
+
 /// (--selftest) nothing yet; true.
 bool selftest();
 
