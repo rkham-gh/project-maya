@@ -248,6 +248,9 @@ bool hc_step(const float* a, const float* b, const float* wpost, const float* po
              float* R, const float* fn, int nmix, const float* scale, const float* base, float hc_eps, float mag,
              float* mix, float* x, float* post_out, const float* wn, float* y, int8_t* q, float* d, cudaStream_t s);
 
+/// The decode attention's kernel chosen, at the load (HY4_MLA_TC=0: the FP32 one): true, the tensor cores'.
+bool mla_init();
+
 /// (--selftest) nothing yet; true.
 bool selftest();
 

@@ -1220,6 +1220,11 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     rlog = dalloc<float>((size_t) g.n_expert);
     dpos = dalloc<int>(4);
     attn_nsp = k::mla_nsp(max_ctx);
+    {
+        const bool tc = k::mla_init();
+        if (o.verbose)
+            std::fprintf(stderr, "maya-hy4: the decode attention on %s\n", tc ? "tensor cores" : "FP32 (HY4_MLA_TC=0)");
+    }
     attn_scr = dalloc<float>(k::mla_scratch_floats(Hmax, attn_nsp));
     const size_t ka = (size_t) std::max(E, Hmax * g.v_head), kf = (size_t) E, kh = (size_t) ffm,
                  km = (size_t) std::max({g.q_lora, Hmax * g.qk_head, Hmax * g.kv_lora});

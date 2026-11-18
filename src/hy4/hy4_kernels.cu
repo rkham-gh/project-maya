@@ -2,6 +2,8 @@
 #include "hy4_kernels.cuh"
 #include "hy4_topk.cuh"
 
+#include <mma.h>
+
 #include <cuda_bf16.h>
 
 #include <algorithm>
@@ -422,9 +424,11 @@ __global__ void mla_kv_store_kernel(const float* __restrict__ kva, const float* 
 // head's (max, sum, acc) of the split for the combine.  The split's size from the keys there are (the grid the same at
 // every position: a CUDA graph's).
 constexpr int kMlaHG = 16, kMlaTile = 64, kMlaThreads = 256, kMlaD = 576, kMlaV = 512;
-__host__ __device__ inline int mla_split_keys(int n_kv, int nsp) {
+// a split's keys: n_kv over nsp splits, at least smin (and a multiple of it: 64 = the tile; fewer keys a split give more
+// blocks, the decode being bound by its latency at a few thousand keys)
+__host__ __device__ inline int mla_split_keys(int n_kv, int nsp, int smin = kMlaTile) {
     const int per = (n_kv + nsp - 1) / nsp;
-    return max(kMlaTile, (per + kMlaTile - 1) / kMlaTile * kMlaTile);
+    return max(smin, (per + smin - 1) / smin * smin);
 }
 __global__ void __launch_bounds__(kMlaThreads) mla_decode_kernel(const float* __restrict__ qa,
                                                                  const float* __restrict__ qf, int qk, int nope,
@@ -432,11 +436,11 @@ __global__ void __launch_bounds__(kMlaThreads) mla_decode_kernel(const float* __
                                                                  const int* __restrict__ dpos, int win,
                                                                  const int* __restrict__ cells,
                                                                  const int* __restrict__ ncell, int ring, int nsp,
-                                                                 float scale, float* __restrict__ part) {
+                                                                 float scale, float* __restrict__ part, int smin) {
     extern __shared__ float sm[];
     const int split = blockIdx.x, hg = blockIdx.y, t = threadIdx.x;
     const int n_kv = *dpos + 1, j_lo = win > 0 ? max(0, n_kv - win) : 0;
-    const int n = cells ? *ncell : n_kv - j_lo, S = mla_split_keys(n, nsp);
+    const int n = cells ? *ncell : n_kv - j_lo, S = mla_split_keys(n, nsp, smin);
     const int j0 = split * S, j1 = min(n, j0 + S);
     if (j0 >= n) return;   // (a split past the keys: the combine reads only those before)
     auto row = [&](int j) { return cells ? cells[j] : ring > 0 ? (j_lo + j) % ring : j_lo + j; };
@@ -549,13 +553,150 @@ __global__ void __launch_bounds__(kMlaThreads) mla_decode_kernel(const float* __
         pp[2 + t + kMlaThreads] = acc1[hl];
     }
 }
+
+// The decode attention on tensor cores (HY4_MLA_TC, on; sm_80 and up): mla_decode_kernel's blocks and partial sums, the
+// products as FlashMLA does them - a block (a split of the keys, kMlaHG = 16 heads) of 4 warps; the heads' queries F16
+// [16][576] once; a tile of 64 keys' rows F16 [64][576] (zeros past the keys); the scores Q K^T on 16x16x16 tiles (a
+// warp 16 keys, 36 steps of the 576), the tile's online softmax (P F16), then P V (V = the rows' first 512) added to
+// the heads' F32 sums [16][512] (a warp 8 of the 32 column tiles, 4 steps of the 64 keys), the sums first rescaled.
+// (a tile of 32 keys: the block's shared memory ~91 KB, under the 99 KB a block of sm_86 / sm_89 / sm_120 may have)
+// Rows in shared memory padded (576 -> 584 halves, 512 -> 516 floats): 1,152- and 2,048-byte rows put a 16x16 tile's
+// 16 rows on the same banks (16-way conflicts: the products took 23 of the kernel's 26 us).
+constexpr int kTcWarps = 4, kTcThreads = kTcWarps * 32, kTcTile = 32, kQS = kMlaD + 8, kAS = kMlaV + 4;
+constexpr size_t kTcSmem = (size_t) kMlaHG * kQS * 2 + (size_t) kTcTile * kQS * 2 + (size_t) kMlaHG * kTcTile * 4 +
+                           (size_t) kMlaHG * kTcTile * 2 + (size_t) kMlaHG * kAS * 4 + 3 * kMlaHG * 4;
+__global__ void __launch_bounds__(kTcThreads) mla_decode_tc_kernel(const float* __restrict__ qa,
+                                                                   const float* __restrict__ qf, int qk, int nope,
+                                                                   const __half* __restrict__ cache,
+                                                                   const int* __restrict__ dpos, int win,
+                                                                   const int* __restrict__ cells,
+                                                                   const int* __restrict__ ncell, int ring, int nsp,
+                                                                   float scale, float* __restrict__ part, int smin) {
+#if __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    extern __shared__ __align__(128) unsigned char smb[];
+    __half* qs = (__half*) smb;                                      // [16][kQS]
+    __half* ks = qs + kMlaHG * kQS;                                  // [32][kQS]
+    float* sc = (float*) (ks + kTcTile * kQS);                       // [16][32]
+    __half* ps = (__half*) (sc + kMlaHG * kTcTile);                  // [16][32]
+    float* acc = (float*) (ps + kMlaHG * kTcTile);                   // [16][kAS]
+    float* mrow = acc + kMlaHG * kAS;
+    float* lrow = mrow + kMlaHG;
+    float* frow = lrow + kMlaHG;
+    const int split = blockIdx.x, hg = blockIdx.y, t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    const int n_kv = *dpos + 1, j_lo = win > 0 ? max(0, n_kv - win) : 0;
+    const int n = cells ? *ncell : n_kv - j_lo, S = mla_split_keys(n, nsp, smin);
+    const int j0 = split * S, j1 = min(n, j0 + S);
+    if (j0 >= n) return;
+    auto row = [&](int j) { return cells ? cells[j] : ring > 0 ? (j_lo + j) % ring : j_lo + j; };
+    {
+        constexpr int kQ4 = kMlaHG * kMlaD / 4, kPer = kQ4 / kTcThreads;   // (18 float4 a thread)
+        float4 v[kPer];
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int x = (t + i * kTcThreads) * 4, hl = x / kMlaD, d = x % kMlaD, h = hg * kMlaHG + hl;
+            v[i] = d < kMlaV ? *reinterpret_cast<const float4*>(qa + (size_t) h * kMlaV + d)
+                             : *reinterpret_cast<const float4*>(qf + (size_t) h * qk + nope + (d - kMlaV));
+        }
+#pragma unroll
+        for (int i = 0; i < kPer; ++i) {
+            const int x = (t + i * kTcThreads) * 4, hl = x / kMlaD, d = x % kMlaD;
+            __half2* q2 = reinterpret_cast<__half2*>(qs + (size_t) hl * kQS + d);
+            q2[0] = __floats2half2_rn(v[i].x, v[i].y);
+            q2[1] = __floats2half2_rn(v[i].z, v[i].w);
+        }
+    }
+    for (int x = t * 4; x < kMlaHG * kMlaV; x += kTcThreads * 4)
+        *reinterpret_cast<float4*>(acc + (size_t) (x / kMlaV) * kAS + x % kMlaV) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (t < kMlaHG) {
+        mrow[t] = -INFINITY;
+        lrow[t] = 0.0f;
+    }
+    for (int jt = j0; jt < j1; jt += kTcTile) {
+        const int nk = min(kTcTile, j1 - jt);
+        {   // the tile's rows (zeros past the keys): a thread's 18 16-byte pieces in flight at once
+            constexpr int kR16 = kTcTile * (kMlaD / 8), kPer = kR16 / kTcThreads;
+            uint4 u[kPer];
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) {
+                const int x = t + i * kTcThreads, kk = x / (kMlaD / 8), c = x % (kMlaD / 8);
+                u[i] = kk < nk ? reinterpret_cast<const uint4*>(cache + (size_t) row(jt + kk) * kMlaD)[c]
+                               : make_uint4(0, 0, 0, 0);
+            }
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) {
+                const int x = t + i * kTcThreads, kk = x / (kMlaD / 8), c = x % (kMlaD / 8);
+                reinterpret_cast<uint4*>(ks + (size_t) kk * kQS)[c] = u[i];
+            }
+        }
+        __syncthreads();
+        if (warp < kTcTile / 16) {   // the scores: warp w the keys 16 w .. 16 w + 15 of the tile
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc;
+            wmma::fill_fragment(fc, 0.0f);
+            for (int k0 = 0; k0 < kMlaD; k0 += 16) {
+                wmma::load_matrix_sync(fa, qs + k0, kQS);
+                wmma::load_matrix_sync(fb, ks + (size_t) (16 * warp) * kQS + k0, kQS);
+                wmma::mma_sync(fc, fa, fb, fc);
+            }
+            wmma::store_matrix_sync(sc + 16 * warp, fc, kTcTile, wmma::mem_row_major);
+        }
+        __syncthreads();
+        // the online softmax: warp w the heads 4 w .. 4 w + 3 (a key a lane)
+        for (int hl = 4 * warp; hl < 4 * warp + 4; ++hl) {
+            const float* sh = sc + (size_t) hl * kTcTile;
+            const float v0 = lane < nk ? sh[lane] * scale : -INFINITY;
+            const float mx = warp_max(v0);
+            const float m_old = mrow[hl], m_new = fmaxf(m_old, mx);
+            const float p0 = lane < nk ? __expf(v0 - m_new) : 0.0f;
+            ps[(size_t) hl * kTcTile + lane] = __float2half(p0);
+            const float l = warp_sum(p0);
+            if (lane == 0) {
+                const float f = m_old == -INFINITY ? 0.0f : __expf(m_old - m_new);
+                frow[hl] = f;
+                lrow[hl] = lrow[hl] * f + l;
+                mrow[hl] = m_new;
+            }
+        }
+        __syncthreads();
+        for (int x = t; x < kMlaHG * kMlaV; x += kTcThreads) acc[(size_t) (x / kMlaV) * kAS + x % kMlaV] *= frow[x / kMlaV];
+        __syncthreads();
+        {   // P V: warp w the column tiles 8 w .. 8 w + 7 of the 512
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fb;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> fc;
+            for (int ct = 8 * warp; ct < 8 * warp + 8; ++ct) {
+                wmma::load_matrix_sync(fc, acc + 16 * ct, kAS, wmma::mem_row_major);
+                for (int k0 = 0; k0 < kTcTile; k0 += 16) {
+                    wmma::load_matrix_sync(fa, ps + k0, kTcTile);
+                    wmma::load_matrix_sync(fb, ks + (size_t) k0 * kQS + 16 * ct, kQS);
+                    wmma::mma_sync(fc, fa, fb, fc);
+                }
+                wmma::store_matrix_sync(acc + 16 * ct, fc, kAS, wmma::mem_row_major);
+            }
+        }
+        __syncthreads();   // (the next tile's rows overwrite ks)
+    }
+    for (int x = t; x < kMlaHG * kMlaV; x += kTcThreads) {
+        const int hl = x / kMlaV, d = x % kMlaV, h = hg * kMlaHG + hl;
+        part[((size_t) h * nsp + split) * (kMlaV + 2) + 2 + d] = acc[(size_t) hl * kAS + d];
+    }
+    if (t < kMlaHG) {
+        float* pp = part + ((size_t) (hg * kMlaHG + t) * nsp + split) * (kMlaV + 2);
+        pp[0] = mrow[t];
+        pp[1] = lrow[t];
+    }
+#endif
+}
 // grid H, block 512: the splits' partial sums merged (the splits that hold keys), and the row's int8 rounding
 // A head's sink (sinks set): one more logit in the softmax's sum, with no value row (ggml_soft_max_add_sinks).
 __global__ void mla_combine_kernel(const float* __restrict__ part, int nsp, const int* __restrict__ dpos, int win,
                                    const int* __restrict__ ncell, const float* __restrict__ sinks,
-                                   float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od) {
+                                   float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od, int smin) {
     const int h = blockIdx.x, d = threadIdx.x;
-    const int n_kv = *dpos + 1, n = ncell ? *ncell : win > 0 ? min(n_kv, win) : n_kv, S = mla_split_keys(n, nsp);
+    const int n_kv = *dpos + 1, n = ncell ? *ncell : win > 0 ? min(n_kv, win) : n_kv,
+              S = mla_split_keys(n, nsp, smin);
     const int used = min(nsp, (n + S - 1) / S);
     const float* pp = part + (size_t) h * nsp * (kMlaV + 2);
     float M = sinks ? sinks[h] : -INFINITY;
@@ -885,14 +1026,45 @@ void mla_kv_store(const float* kva, const float* w, float eps, __half* cache, in
     if (T > 0) mla_kv_store_kernel<<<T, 256, 0, s>>>(kva, w, eps, cache, pos0, dpos, theta_scale, ring, base);
 }
 int mla_nsp(int rows) { return std::max(128, (rows + 1023) / 1024); }
+// (mla_init, at the load: the tensor cores' kernel and its shared memory, outside any graph capture)
+static bool g_mla_tc = false;
+bool mla_init() {
+    const char* v = std::getenv("HY4_MLA_TC");
+    g_mla_tc = false;
+    if (v && std::atoi(v) == 0) return false;
+    int dev = 0, major = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess || major < 8) {
+        cudaGetLastError();
+        return false;
+    }
+    if (cudaFuncSetAttribute(mla_decode_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) kTcSmem) !=
+        cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    g_mla_tc = true;
+    return true;
+}
 size_t mla_scratch_floats(int H, int nsp) { return (size_t) H * nsp * (kMlaV + 2); }
 void mla_decode(const float* qa, const float* qf, int qk, int nope, const __half* cache, const int* dpos, int win,
                 const int* cells, const int* ncell, const float* sinks, int H, float scale, int nsp, float* scratch,
                 float* out, int8_t* oq, float* od, cudaStream_t s, int ring) {
     const size_t smem = ((size_t) kMlaHG * kMlaD + (size_t) kMlaHG * kMlaTile + 3 * kMlaHG) * sizeof(float);   // 41 KB
-    mla_decode_kernel<<<dim3(nsp, H / kMlaHG), kMlaThreads, smem, s>>>(qa, qf, qk, nope, cache, dpos, win, cells, ncell,
-                                                                       ring, nsp, scale, scratch);
-    mla_combine_kernel<<<H, kMlaV, 0, s>>>(scratch, nsp, dpos, win, cells ? ncell : nullptr, sinks, out, oq, od);
+    // (HY4_MLA_SPLIT_MIN: a split's fewest keys - 64, 32 or 16; 16 on the tensor cores, a tile a block - 10 us a call,
+    //  23 with 64 - and 64 on FP32)
+    static const int smin = [] {
+        const char* v = std::getenv("HY4_MLA_SPLIT_MIN");
+        const int m = v ? std::atoi(v) : (g_mla_tc ? 16 : kMlaTile);
+        return m == 16 || m == 32 ? m : kMlaTile;
+    }();
+    if (g_mla_tc)
+        mla_decode_tc_kernel<<<dim3(nsp, H / kMlaHG), kTcThreads, kTcSmem, s>>>(qa, qf, qk, nope, cache, dpos, win, cells,
+                                                                                ncell, ring, nsp, scale, scratch, smin);
+    else
+        mla_decode_kernel<<<dim3(nsp, H / kMlaHG), kMlaThreads, smem, s>>>(qa, qf, qk, nope, cache, dpos, win, cells,
+                                                                           ncell, ring, nsp, scale, scratch, smin);
+    mla_combine_kernel<<<H, kMlaV, 0, s>>>(scratch, nsp, dpos, win, cells ? ncell : nullptr, sinks, out, oq, od, smin);
 }
 void head_gate(const float* x, const float* g, int H, int hd, float* y, int8_t* q, float* dq, cudaStream_t s) {
     const int n = H * hd;
