@@ -65,8 +65,11 @@ public:
     bool load(const Options& o, std::string& err);
     const Geo& geo() const;
     int max_ctx() const;
-    /// Back to position 0, every state cleared.
+    /// Back to position 0, every state cleared (failed() too).
     void reset();
+    /// step() / prefill() returned nullptr because a card gave up waiting for the other (~30 s, the device's routing):
+    /// that token and the conversation's state are not to be trusted - fail the request and reset().
+    bool failed() const;
     int pos() const;
     /// One token at pos(): the next token's logits (host memory, geo().vocab values), pos + 1.  nullptr when pos() is
     /// at max_ctx().

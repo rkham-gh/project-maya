@@ -237,6 +237,7 @@ struct Engine::Impl {
     int *m_plan = nullptr, *m_ans = nullptr, *md_plan = nullptr, *md_ans = nullptr;   // (host / device pointers)
     unsigned *m_diag = nullptr, *md_diag = nullptr;
     unsigned diag_seen = 0;
+    bool fault = false;   // (a card gave up waiting: see step_dr's end; reset() clears it)
     size_t plan_ints = 0, ans_ints = 0;
     int tseq = 0;
     void dr_alloc();
@@ -569,11 +570,10 @@ struct Engine::Impl {
     // A swap's copy is staged in pieces (HY4_CACHE_STAGE_KB, 2 MB) while the CPU waits for a layer's attention on the
     // GPU, and the expert is used from the token after the one its last piece went up in.  HY4_CACHE_DEFER=0: copied
     // at the swap.
-    // A prompt chunk adds each expert's count of its tokens as it is - thousands after a long prompt, where a written
-    // token adds 1 and an expert every token chose settles at 99: the cache then holds what the prompt used most and no
-    // swap clears the bar until those scores have decayed, some hundred tokens on.  HY4_CACHE_PROMPT=1 (off by
-    // default, not run yet) puts a chunk on the written tokens' scale (pf_score); 2 also decays what was there, as its
-    // tokens written one by one would.
+    // A prompt chunk's counts go on the written tokens' scale (HY4_CACHE_PROMPT=2, the default since cc69fc0; pf_score):
+    // each expert gets its share of what T written tokens would leave, and the layer's scores first decay as those
+    // tokens would.  0 is the old raw counts - thousands after a long prompt, where a written token adds 1 and an expert
+    // every token chose settles at 99, so no swap cleared the bar for some hundred tokens; 1 scales without the decay.
     static constexpr int kKvSlack = 4096;   // (cache rows reserved past the position)
     struct EC {
         int slots = 0, ne = 0, own = 0, lend_cls = 0, arena_end = 0;   // [own, arena_end): the prompt path's
@@ -781,7 +781,10 @@ bool Engine::restore() {
     return true;
 }
 
+bool Engine::failed() const { return p->fault; }
+
 void Engine::reset() {
+    p->fault = false;
     p->pos = 0;
     p->snap_pos = -1;
     p->ec.kv_hi = 0;   // (the caches' slots usable again: empty, the next fill or swaps take them)
@@ -2959,7 +2962,7 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     int min_chunk = 256;
     if (const char* v = std::getenv("HY4_MIN_CHUNK")) min_chunk = std::max(1, std::atoi(v));
     if (n < min_chunk) {
-        for (int i = 0; i < n; ++i) lg = step(ids[i]);
+        for (int i = 0; i < n && (i == 0 || lg); ++i) lg = step(ids[i]);   // (nullptr: failed())
         if (progress) progress(ctx, n);
         return lg;
     }
@@ -3563,6 +3566,14 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
                 else std::memcpy(part, hc.h_out, (size_t) NL * sizeof(float));
                 st.ms_helper += now_ms() - c1;
             }
+            // (HY4_DR_STALL_AT=<n>, a test of the fault path: token n's first answer 40 s late - the main card gives up)
+            static const int stall_at = std::getenv("HY4_DR_STALL_AT") ? std::atoi(std::getenv("HY4_DR_STALL_AT")) : -1;
+            static bool stalled = false;
+            if (seq == stall_at && !stalled) {
+                stalled = true;
+                std::fprintf(stderr, "maya-hy4: HY4_DR_STALL_AT: token %d, layer %d's answer 40 s late\n", seq, il);
+                std::this_thread::sleep_for(std::chrono::seconds(40));
+            }
             std::atomic_thread_fence(std::memory_order_release);
             ((volatile int*) ans)[0] = seq;
             trace("answered", il, nc, nh, 0);
@@ -3583,12 +3594,17 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
     if (st4) ec_stage_end();
     trace("done", g.n_layer, 0, 0, 0);
     phase(pt.tail);
+    // A card that gave up waiting (~30 s) went on with what it had: the helper with a stale plan (its answer then
+    // stamped as this token's), the main card without an answer - the token, and this conversation's state, are not
+    // to be trusted.  fault: step() returns nullptr, the caller fails the request and resets.
     if (hd && m_diag[1] != hdiag_seen) {
         hdiag_seen = m_diag[1];
+        fault = true;
         std::fprintf(stderr, "maya-hy4: the helper card gave up waiting for a plan (%u times so far)\n", hdiag_seen);
     }
     if (m_diag[0] != diag_seen) {
         diag_seen = m_diag[0];
+        fault = true;
         std::fprintf(stderr, "maya-hy4: the device gave up waiting for the host's answer (%u times so far)\n", diag_seen);
     }
 }
@@ -3640,7 +3656,13 @@ const float* Engine::Impl::step(int token) {
     h_pos[2] = ++tseq;
     CK(cudaMemcpyAsync(dpos, h_pos, 3 * sizeof(int), cudaMemcpyHostToDevice, s));
     phase(pt.embed);
-    if (dr) step_dr(cpu_ms, tp);
+    if (dr) {
+        step_dr(cpu_ms, tp);
+        if (fault) {   // (a card gave up waiting: the token is not to be trusted)
+            ++pos;
+            return nullptr;
+        }
+    }
     else {   // the host's routing: a sync each MoE layer
 
     static const bool trace = std::getenv("HY4_TRACE") != nullptr;

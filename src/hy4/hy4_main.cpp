@@ -325,6 +325,10 @@ int main(int argc, char** argv) {
             if (follow.empty() && pick == eos) break;
             lg = eng.step(pick);
         }
+        if (eng.failed()) {
+            std::fprintf(stderr, "maya-hy4: FAILED - a card gave up waiting for the other; reset\n");
+            eng.reset();
+        }
         const auto st = eng.stats();
         if (st.tokens > 0)
             std::fprintf(stderr,
@@ -496,6 +500,18 @@ int main(int argc, char** argv) {
             if (eng.pos() + 1 >= eng.max_ctx()) break;
             lg = eng.step(t);
             hist.push_back(t);
+        }
+        if (eng.failed()) {   // (a card gave up waiting for the other: this conversation's state is gone)
+            std::printf("ERR maya-hy4: a card gave up waiting for the other (the device's routing); the conversation "
+                        "was dropped\n");
+            std::printf("DONE %d %zu %.1f %.1f length 0 0 %zu\n", generated, ids.size(), p1 - p0, now_ms() - p1, reuse);
+            std::fflush(stdout);
+            eng.reset();
+            hist.clear();
+            last.clear();
+            have_snap = false;
+            eng.clear_stats();
+            continue;
         }
         if (lg && finish != "stop") last.assign(lg, lg + V);
         else last.clear();
