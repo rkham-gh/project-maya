@@ -330,7 +330,8 @@ int main(int argc, char** argv) {
             if (follow.empty() && pick == eos) break;
             lg = eng.step(pick);
         }
-        if (eng.failed()) {
+        const bool failed = eng.failed();   // (the run's output is cut short: not ok, so its END says so)
+        if (failed) {
             std::fprintf(stderr, "maya-hy4: FAILED - a card gave up waiting for the other; reset\n");
             eng.reset();
         }
@@ -350,7 +351,7 @@ int main(int argc, char** argv) {
                          st.ms_total / st.tokens, st.ms_lane / st.tokens, (double) st.lane_layers / st.tokens,
                          st.ms_helper / st.tokens, (double) st.helper_layers / st.tokens, st.ms_update / st.tokens,
                          (st.ms_total - st.ms_lane - st.ms_helper - st.ms_update) / st.tokens);
-        return true;
+        return !failed;
     };
 
     if (!runs_arg.empty()) {
@@ -507,6 +508,7 @@ int main(int argc, char** argv) {
             hist.push_back(t);
         }
         if (eng.failed()) {   // (a card gave up waiting for the other: this conversation's state is gone)
+            // (serve/server.py keys on "the conversation was dropped" - DROPPED, dropped_state(): keep the phrase)
             std::printf("ERR maya-hy4: a card gave up waiting for the other (the device's routing); the conversation "
                         "was dropped\n");
             std::printf("DONE %d %zu %.1f %.1f length 0 0 %zu\n", generated, ids.size(), p1 - p0, now_ms() - p1, reuse);

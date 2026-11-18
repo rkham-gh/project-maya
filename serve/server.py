@@ -4576,6 +4576,10 @@ class Service:
                                 yield t
                             return
                         except ValueError as e:
+                            if again and not got and dropped_state(e):
+                                # (the run again failed the same way: the engine's error, not a bad request - a
+                                # request not streamed gets 422 engine_error, not 400 invalid_request_error)
+                                raise EngineFault(f"the engine failed before the answer started, twice ({e})") from e
                             if again or got or not dropped_state(e):
                                 raise
                             print(f"[maya] the engine dropped the conversation before the answer started ({e}): "

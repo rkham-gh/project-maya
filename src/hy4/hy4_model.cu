@@ -613,6 +613,30 @@ struct Engine::Impl {
         size_t stage_n = 0;
         std::vector<std::pair<const uint8_t*, size_t>> stage_parts;
         std::function<void(int)> stage_fn;
+        // The fill's worker (HY4_BG_REFILL: the fill after a prompt in the background): (key, slot) jobs from fq, the
+        // copied ones to fdone (both under fmu), through its own two pinned buffers on its own stream; finflight is the
+        // token's thread's count of those it has not collected.  A job's slot is its expert's already (where -2): nothing
+        // reads it until it is collected, at a token's end.
+        std::thread fth;
+        bool fquit = false;
+        std::mutex fmu;
+        std::condition_variable fcv, fcv_done;
+        std::vector<std::pair<int, int>> fq, fdone;
+        size_t fqhead = 0;
+        int finflight = 0;
+        uint8_t* fpin[2] = {nullptr, nullptr};
+        cudaEvent_t fev[2] = {nullptr, nullptr};
+        cudaStream_t fcs = nullptr;
+        size_t fcap = 0;
+        ~EC() {
+            if (!fth.joinable()) return;
+            {
+                std::lock_guard<std::mutex> lk(fmu);
+                fquit = true;
+            }
+            fcv.notify_all();
+            fth.join();
+        }
     } ec;
     size_t expert_bytes(int il) const {
         const CpuLayer& c = L[(size_t) il].cl;
@@ -621,7 +645,11 @@ struct Engine::Impl {
     void ec_alloc();
     void ec_copy(int key, int slot);
     void ec_copy_many(const std::vector<std::pair<int, int>>& todo);
-    void ec_fill();
+    void ec_fill(bool defer = false);
+    void ec_falloc();
+    void ec_fworker();
+    void ec_fcollect(bool wait, bool drop);
+    void ec_drop_pending();
     void ec_adapt();
     void ec_reclaim();
     void ec_flush();
@@ -671,6 +699,13 @@ struct Engine::Impl {
         bool stage = false;
         long hits = 0, copies = 0, tok = 0;
         int every = 1, per = 32, fill_cap = 4096;  // (see docs/LING.md, "Two cards")
+        // A background fill after a prompt (HY4_BG_REFILL): fill_left copies still to release, at most fill_batch on
+        // their way at a time (HY4_HELPER_FILL_BATCH, 64) - each batch's victims evicted only when it is released, at a
+        // token's end, so the rest keep serving; issued: the last hc_update's copies
+        int fill_left = 0, fill_batch = 64, issued = 0;
+        // the worker's own staging (as hc_copy_many's, apart from the token's thread's): two pinned buffers in turn
+        uint8_t* wpin[2] = {nullptr, nullptr};
+        cudaEvent_t wev[2] = {nullptr, nullptr};
         float margin = -1.0f, bias = 0.5f;        // a swap's bar: score > margin * the slot's + bias (-1: the main cache's)
         size_t bytes = 0;
         // the worker: (key, slot) jobs from q, the copied ones to done (both under mu); inflight is the main thread's
@@ -697,8 +732,12 @@ struct Engine::Impl {
         }
     } hc;
     bool hc_steal = false;
-    long pf_tokens_open = 0;   // the tokens read through the prompt path since the last written token
+    long pf_tokens_open = 0;
+    int refill_tok = -1, refill_helper = 0;   // (verbose) a background refill's tokens so far (-1: none), its copies
+    long refill_main = 0;
+    double refill_ms = 0;   // the tokens read through the prompt path since the last written token
     void hc_alloc();
+    void hc_drop_queued();
     void hc_update(int max_copies, bool hysteresis, bool bg);
     void hc_copy(int key, int slot, cudaStream_t st);
     void hc_copy_many(const std::vector<std::pair<int, int>>& todo);
@@ -1262,6 +1301,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     if (!pf_alloc(err)) return false;
     const size_t before_ec = dev_bytes;
     ec_alloc();
+    ec_falloc();
     dr_alloc();
     if (!o.profile.empty() && load_profile(o.profile)) {
         const double tf = now_ms();
@@ -1505,7 +1545,119 @@ void Engine::Impl::ec_copy_many(const std::vector<std::pair<int, int>>& todo) {
     CK(cudaStreamWaitEvent(s, ec.copied, 0));
 }
 
-void Engine::Impl::ec_fill() {
+void Engine::Impl::ec_falloc() {
+    const char* v = std::getenv("HY4_BG_REFILL");
+    if ((v && std::atoi(v) == 0) || ec.slots == 0) return;
+    ec.fcap = (size_t) 64 << 20;
+    bool ok = true;
+    for (int i = 0; i < 2 && ok; ++i) {
+        ok = cudaHostAlloc((void**) &ec.fpin[i], ec.fcap, cudaHostAllocPortable) == cudaSuccess;
+        if (ok) CK(cudaEventCreateWithFlags(&ec.fev[i], cudaEventDisableTiming));
+    }
+    if (!ok) {
+        cudaGetLastError();
+        std::fprintf(stderr, "maya-hy4: no pinned staging for the fill's worker: the fill after a prompt stages in pieces\n");
+        return;
+    }
+    CK(cudaStreamCreateWithFlags(&ec.fcs, cudaStreamNonBlocking));
+    ec.fth = std::thread([this] { ec_fworker(); });
+}
+
+// The fill's thread: as many queued experts as fill a pinned buffer, copied there (this thread's memcpy), one DMA
+// each from there on its stream; a batch's experts reported once its DMAs are done (the buffer's event)
+void Engine::Impl::ec_fworker() {
+    CK(cudaSetDevice(o.gpu));
+    std::vector<std::pair<int, int>> out[2];
+    int k = 0;
+    auto finish = [&](int b) {
+        if (out[b].empty()) return;
+        CK(cudaEventSynchronize(ec.fev[b]));
+        {
+            std::lock_guard<std::mutex> lk(ec.fmu);
+            ec.fdone.insert(ec.fdone.end(), out[b].begin(), out[b].end());
+        }
+        out[b].clear();
+        ec.fcv_done.notify_all();
+    };
+    for (;;) {
+        std::vector<std::pair<int, int>> jobs;
+        {
+            std::unique_lock<std::mutex> lk(ec.fmu);
+            if (ec.fqhead >= ec.fq.size() && (!out[0].empty() || !out[1].empty())) {
+                lk.unlock();   // (nothing new: the batches on their way finished first)
+                finish(k ^ 1);
+                finish(k);
+                continue;
+            }
+            ec.fcv.wait(lk, [&] { return ec.fquit || ec.fqhead < ec.fq.size(); });
+            if (ec.fquit) return;
+            size_t fill = 0;
+            while (ec.fqhead < ec.fq.size()) {
+                const size_t eb = expert_bytes(ec.fq[ec.fqhead].first / ec.ne);
+                if (!jobs.empty() && fill + eb > ec.fcap) break;
+                jobs.push_back(ec.fq[ec.fqhead++]);
+                fill += eb;
+            }
+            if (ec.fqhead == ec.fq.size()) {
+                ec.fq.clear();
+                ec.fqhead = 0;
+            }
+        }
+        finish(k);   // (this buffer's last batch: its DMAs done before it is written again)
+        uint8_t* pin = ec.fpin[k];
+        size_t at = 0;
+        std::vector<std::pair<const uint8_t*, size_t>> parts;
+        for (const auto& kv : jobs) {
+            const size_t eb = expert_bytes(kv.first / ec.ne);
+            parts.clear();
+            ec_src_parts(kv.first, 0, eb, parts);
+            size_t o0 = at;
+            for (const auto& pr : parts) {
+                std::memcpy(pin + o0, pr.first, pr.second);
+                o0 += pr.second;
+            }
+            CK(cudaMemcpyAsync(ec.ptr[(size_t) kv.second], pin + at, eb, cudaMemcpyHostToDevice, ec.fcs));
+            at += eb;
+        }
+        CK(cudaEventRecord(ec.fev[k], ec.fcs));
+        (void) cudaStreamQuery(ec.fcs);   // (submitted now)
+        out[k] = std::move(jobs);
+        k ^= 1;
+    }
+}
+
+// The fill's copied experts usable (from the next token: called between tokens).  drop: its jobs not started given up
+// (their slots empty again); wait: those on their way finished first (before their slots are reclaimed or reused).
+void Engine::Impl::ec_fcollect(bool wait, bool drop) {
+    if (ec.finflight == 0) return;
+    std::unique_lock<std::mutex> lk(ec.fmu);
+    if (drop) {
+        long n = 0;
+        for (size_t i = ec.fqhead; i < ec.fq.size(); ++i) {
+            const int key = ec.fq[i].first, sl = ec.fq[i].second;
+            if (ec.owner[(size_t) sl] == key) ec.owner[(size_t) sl] = -1;
+            if (ec.where[(size_t) key] == -2) ec.where[(size_t) key] = -1;
+            ++n;
+        }
+        ec.fq.clear();
+        ec.fqhead = 0;
+        ec.finflight -= (int) n;
+        if (o.verbose && n > 0) std::fprintf(stderr, "maya-hy4: %ld of the fill's copies still to come dropped\n", n);
+    }
+    if (wait) ec.fcv_done.wait(lk, [&] { return (int) ec.fdone.size() == ec.finflight; });
+    for (const auto& kv : ec.fdone) {
+        if (ec.owner[(size_t) kv.second] == kv.first && ec.where[(size_t) kv.first] == -2)
+            ec.where[(size_t) kv.first] = kv.second;
+        ++ec.copies;
+    }
+    ec.finflight -= (int) ec.fdone.size();
+    ec.fdone.clear();
+}
+
+// (defer, with HY4_CACHE_DEFER's staging on: the copies queued as the swaps' are - each slot given to its expert now,
+//  its bytes staged in pieces while the next tokens are written, the expert used once they are all up - instead of
+//  made here before the token goes on)
+void Engine::Impl::ec_fill(bool defer) {
     if (ec.slots == 0) return;
     ec_flush();
     std::vector<std::pair<int, int>> todo;
@@ -1534,6 +1686,35 @@ void Engine::Impl::ec_fill() {
                 todo.push_back({keys[i], spare.back()});
                 spare.pop_back();
             }
+    }
+    if (defer && ec.fth.joinable()) {   // (the fill's worker: whole experts, apart from the swaps' staging)
+        for (const auto& kv : todo) {
+            const int key = kv.first, sl = kv.second;
+            if (ec.owner[(size_t) sl] >= 0) ec.where[(size_t) ec.owner[(size_t) sl]] = -1;
+            ec.owner[(size_t) sl] = key;
+            ec.where[(size_t) key] = -2;
+        }
+        ec.finflight += (int) todo.size();
+        {
+            std::lock_guard<std::mutex> lk(ec.fmu);
+            ec.fq.insert(ec.fq.end(), todo.begin(), todo.end());
+        }
+        ec.fcv.notify_one();
+        return;
+    }
+    if (defer && ec.defer) {
+        for (const auto& kv : todo) {
+            const int key = kv.first, sl = kv.second;
+            if (ec.owner[(size_t) sl] >= 0) ec.where[(size_t) ec.owner[(size_t) sl]] = -1;
+            ec.owner[(size_t) sl] = key;
+            ec.where[(size_t) key] = -2;
+            EC::Pending p0;
+            p0.key = key;
+            p0.slot = sl;
+            p0.bytes = expert_bytes(key / ec.ne);
+            ec.pend.push_back(p0);
+        }
+        return;
     }
     ec_copy_many(todo);
 }
@@ -1607,8 +1788,30 @@ void Engine::Impl::ec_adapt() {
 }
 
 // The lent slots back to the prompt path: emptied, once the GPU is through with them (its experts, the copies into them)
+// The swaps and fills not yet up (ec.pend) given up: their slots empty, their experts not in VRAM - a new prompt is
+// about to be read and fills the cache by its own scores, so copying them first (ec_flush) would only hold it up (a
+// background refill after a long prompt can have thousands queued).  The pieces already on their way are waited for;
+// the experts whose last piece went up stay (arrived).
+void Engine::Impl::ec_drop_pending() {
+    ec_fcollect(true, true);   // (the fill's: the rest dropped, those on their way in)
+    if (ec.pend_head >= ec.pend.size()) return;
+    CK(cudaStreamSynchronize(pf.cs));
+    long dropped = 0;
+    for (size_t i = ec.pend_head; i < ec.pend.size(); ++i) {
+        const EC::Pending& p0 = ec.pend[i];
+        if (ec.owner[(size_t) p0.slot] == p0.key) ec.owner[(size_t) p0.slot] = -1;
+        if (ec.where[(size_t) p0.key] == -2) ec.where[(size_t) p0.key] = -1;
+        ++dropped;
+    }
+    ec.pend.clear();
+    ec.pend_head = 0;
+    if (o.verbose && dropped > 0)
+        std::fprintf(stderr, "maya-hy4: a new prompt: %ld of the cache's copies still to come dropped\n", dropped);
+}
+
 void Engine::Impl::ec_reclaim() {
     if (!ec.lent) return;
+    ec_drop_pending();
     ec_flush();
     CK(cudaStreamSynchronize(pf.cs));
     CK(cudaStreamSynchronize(s));
@@ -1750,6 +1953,7 @@ void Engine::Impl::ec_arrive() {
 
 // Every pending copy finished now (whole experts again, through ec_copy_many), before the slots are refilled or lent back
 void Engine::Impl::ec_flush() {
+    ec_fcollect(true, true);   // (the fill's: the rest dropped, those on their way in)
     if (!ec.arrived.empty() || !ec.arrived_prev.empty()) {
         CK(cudaStreamSynchronize(pf.cs));
         for (auto* v : {&ec.arrived_prev, &ec.arrived}) {
@@ -1942,6 +2146,21 @@ void Engine::Impl::hc_alloc() {
     hc.owner.assign((size_t) hc.slots, -1);
     hc.busy.assign((size_t) hc.slots, 0);
     hc.where.assign((size_t) g.n_layer * ec.ne, -1);
+    if (hc.slots && hc.bg && hc.pcap > 0) {   // (the worker's own staging: HY4_HELPER_STAGE's size, two buffers)
+        bool ok = true;
+        for (int i = 0; i < 2 && ok; ++i) {
+            ok = cudaHostAlloc((void**) &hc.wpin[i], hc.pcap, cudaHostAllocPortable) == cudaSuccess;
+            if (ok) CK(cudaEventCreateWithFlags(&hc.wev[i], cudaEventDisableTiming));
+        }
+        if (!ok) {
+            cudaGetLastError();
+            for (uint8_t*& b0 : hc.wpin) {
+                if (b0) cudaFreeHost(b0);
+                b0 = nullptr;
+            }
+        }
+    }
+    if (const char* v = std::getenv("HY4_HELPER_FILL_BATCH")) hc.fill_batch = std::max(1, std::atoi(v));
     if (hc.slots && hc.bg) hc.th = std::thread([this] { hc_worker(); });
     // The helper works in bursts of tens of microseconds a layer, so on its own its driver leaves it in P3 / P5: the
     // RTX 3090 measured 420-1,260 MHz and its memory at 5,001 or 810 MHz of 9,751 under maya-ink's Inkling 2, whose
@@ -2038,26 +2257,98 @@ void Engine::Impl::hc_copy_many(const std::vector<std::pair<int, int>>& todo) {
 // thread has collected it)
 void Engine::Impl::hc_worker() {
     CK(cudaSetDevice(hc.dev));
+    const bool staged = hc.wpin[0] && hc.wpin[1];
+    std::vector<std::pair<int, int>> out[2];   // (each buffer's batch, done once its event has)
+    int k = 0;
+    auto finish = [&](int b) {   // a batch's DMAs done: its experts to the main thread
+        if (out[b].empty()) return;
+        CK(cudaEventSynchronize(hc.wev[b]));
+        {
+            std::lock_guard<std::mutex> lk(hc.mu);
+            hc.done.insert(hc.done.end(), out[b].begin(), out[b].end());
+        }
+        out[b].clear();
+        hc.cv_done.notify_one();
+    };
     for (;;) {
-        std::pair<int, int> job;
+        std::vector<std::pair<int, int>> jobs;
         {
             std::unique_lock<std::mutex> lk(hc.mu);
+            if (hc.qhead >= hc.q.size() && (!out[0].empty() || !out[1].empty())) {
+                lk.unlock();   // (nothing new: the batches on their way finished first)
+                finish(k ^ 1);
+                finish(k);
+                continue;
+            }
             hc.cv.wait(lk, [&] { return hc.quit || hc.qhead < hc.q.size(); });
             if (hc.quit) return;
-            job = hc.q[hc.qhead++];
+            // a batch: the jobs that fit a staging buffer (one without the staging)
+            size_t fill = 0;
+            while (hc.qhead < hc.q.size()) {
+                const size_t eb = expert_bytes(hc.q[hc.qhead].first / ec.ne);
+                if (!staged || (!jobs.empty() && fill + eb > hc.pcap)) break;
+                jobs.push_back(hc.q[hc.qhead++]);
+                fill += eb;
+                if (!staged) break;
+            }
+            if (!staged && jobs.empty()) jobs.push_back(hc.q[hc.qhead++]);
             if (hc.qhead == hc.q.size()) {
                 hc.q.clear();
                 hc.qhead = 0;
             }
         }
-        hc_copy(job.first, job.second, hc.cs);
-        CK(cudaStreamSynchronize(hc.cs));
-        {
-            std::lock_guard<std::mutex> lk(hc.mu);
-            hc.done.push_back(job);
+        if (!staged) {   // (one at a time, the driver's staging)
+            hc_copy(jobs[0].first, jobs[0].second, hc.cs);
+            CK(cudaStreamSynchronize(hc.cs));
+            {
+                std::lock_guard<std::mutex> lk(hc.mu);
+                hc.done.push_back(jobs[0]);
+            }
+            hc.cv_done.notify_one();
+            continue;
         }
-        hc.cv_done.notify_one();
+        finish(k);   // (this buffer's last batch: its DMAs done before it is written again)
+        uint8_t* pin = hc.wpin[k];
+        size_t at = 0;
+        for (const auto& kv : jobs) {
+            std::vector<std::pair<const uint8_t*, size_t>> parts;
+            const size_t eb = expert_bytes(kv.first / ec.ne);
+            ec_src_parts(kv.first, 0, eb, parts);
+            size_t o = at;
+            for (const auto& pr : parts) {
+                std::memcpy(pin + o, pr.first, pr.second);
+                o += pr.second;
+            }
+            CK(cudaMemcpyAsync(hc.ptr[(size_t) kv.second], pin + at, eb, cudaMemcpyHostToDevice, hc.cs));
+            at += eb;
+        }
+        CK(cudaEventRecord(hc.wev[k], hc.cs));
+        (void) cudaStreamQuery(hc.cs);   // (submitted now)
+        out[k] = std::move(jobs);
+        k ^= 1;
     }
+}
+
+// The worker's jobs it has not started given up (a new prompt: the helper is filled by its scores after it): their slots
+// free again, their experts not on the helper; the one being copied is left to finish (collected as usual)
+void Engine::Impl::hc_drop_queued() {
+    if (hc.slots == 0 || !hc.th.joinable()) return;
+    std::vector<std::pair<int, int>> jobs;
+    {
+        std::lock_guard<std::mutex> lk(hc.mu);
+        jobs.assign(hc.q.begin() + (long) hc.qhead, hc.q.end());
+        hc.q.clear();
+        hc.qhead = 0;
+    }
+    for (const auto& kv : jobs) {
+        hc.busy[(size_t) kv.second] = 0;
+        if (hc.owner[(size_t) kv.second] == kv.first) hc.owner[(size_t) kv.second] = -1;
+        if (hc.where[(size_t) kv.first] == -2) hc.where[(size_t) kv.first] = -1;
+    }
+    hc.inflight -= (int) jobs.size();
+    hc.fill_left = 0;
+    if (o.verbose && !jobs.empty())
+        std::fprintf(stderr, "maya-hy4: a new prompt: %zu of the helper's copies still to come dropped\n", jobs.size());
 }
 
 // The copied experts become usable (wait: all of those on their way first)
@@ -2080,6 +2371,7 @@ void Engine::Impl::hc_collect(bool wait) {
 // between tokens, the helper idle.  bg: the copies go to the worker and count against max_copies until they are done;
 // otherwise they are made here, after the worker's.
 void Engine::Impl::hc_update(int max_copies, bool hysteresis, bool bg) {
+    hc.issued = 0;
     if (hc.slots == 0) return;
     bg = bg && hc.th.joinable();
     hc_collect(!bg);
@@ -2094,7 +2386,9 @@ void Engine::Impl::hc_update(int max_copies, bool hysteresis, bool bg) {
         for (int sl = 0; sl < hc.slots; ++sl) {
             if (hc.cls[(size_t) sl] != c || hc.busy[(size_t) sl]) continue;
             const int ow = hc.owner[(size_t) sl];
-            if (ow >= 0 && ec.where[(size_t) ow] != -1) {
+            // (an expert the main card holds: freed here.  Only one it can use already - one still on its way there,
+            //  -2, stays: a deferred fill takes ~100 tokens to bring them all, and they went to the CPU lane meanwhile)
+            if (ow >= 0 && ec.where[(size_t) ow] >= 0) {
                 hc.where[(size_t) ow] = -1;
                 hc.owner[(size_t) sl] = -1;
             }
@@ -2138,6 +2432,7 @@ void Engine::Impl::hc_update(int max_copies, bool hysteresis, bool bg) {
         }
     }
     if (todo.empty()) return;
+    hc.issued = (int) todo.size();
     if (bg) {
         for (const auto& kv : todo) hc.busy[(size_t) kv.second] = 1;
         hc.inflight += (int) todo.size();
@@ -2966,8 +3261,11 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
         if (progress) progress(ctx, n);
         return lg;
     }
-    // the lent slots back to their buffers until the next token is written (a long prompt comes in pieces)
+    // the lent slots back to their buffers until the next token is written (a long prompt comes in pieces); the
+    // background refill's copies still to come dropped (the prompt fills by its own scores)
     ec_reclaim();
+    ec_drop_pending();
+    hc_drop_queued();
     pf_open = true;
     pf_tokens_open += n;
     for (int c0 = 0; c0 < n; c0 += pf.C) {
@@ -3632,19 +3930,39 @@ const float* Engine::Impl::step(int token) {
         acc += t - tp;
         tp = t;
     };
+    ec_kv_reserve(pos + 1);   // (before the first token's fill: it takes no slot about to be reserved)
     if (pf_open) {   // the first token after a prompt: the prompt path's buffers lent to the cache again, and filled
         pf_open = false;
+        // HY4_BG_REFILL (on): both fills in the background - the main cache's copies staged with the swaps' while the
+        // next tokens are written, the helper's through its worker - not made before this token (the first token after
+        // a long prompt waited ~1-2 s for them); 0: here, as before
+        static const bool bg_refill = [] {
+            const char* v = std::getenv("HY4_BG_REFILL");
+            return !(v && std::atoi(v) == 0);
+        }();
         if (ec.arena_end > ec.own) {
             ec.lent = true;
-            ec_fill();
+            ec_fill(bg_refill);
         }
         // The prompt changed the scores, and the main cache with them: the helper follows, with more copies after a
         // longer prompt (an eighth of its tokens, 64 .. fill_cap).
-        hc_update(std::min(hc.fill_cap, std::max(64, (int) std::min<long>(pf_tokens_open / 8, INT_MAX))), false, false);
+        const int cap = std::min(hc.fill_cap, std::max(64, (int) std::min<long>(pf_tokens_open / 8, INT_MAX)));
+        if (bg_refill && hc.bg && hc.th.joinable()) {
+            hc.fill_left = cap;   // (released fill_batch at a time, from the token's end on)
+            hc_update(std::min(hc.fill_left, hc.fill_batch), false, true);
+            hc.fill_left -= hc.issued;
+        } else {
+            hc_update(cap, false, false);
+        }
         pf_tokens_open = 0;
+        if (bg_refill && o.verbose) {   // (the refill's end is told once both are up: see the token's end)
+            refill_tok = 0;
+            refill_ms = now_ms();
+            refill_main = (long) (ec.pend.size() - ec.pend_head) + ec.finflight;
+            refill_helper = hc.inflight + hc.fill_left;
+        }
     }
     if (graphs < 0) tok_graphs();
-    ec_kv_reserve(pos + 1);
     // (HY4_HELPER_KEEPALIVE) the helper's keep-alive kernel again once the last one has ended
     if (hc.ks && cudaStreamQuery(hc.ks) == cudaSuccess) {
         OnDev od(hc.dev);
@@ -3789,27 +4107,50 @@ const float* Engine::Impl::step(int token) {
     // in use from the next)
     if (ec.slots) {
         ec_arrive();
+        ec_fcollect(false, false);   // (the fill's experts that came in: usable from the next token)
         for (float& v : ec.score) v *= ec.decay;
         if (++ec.tok % ec.every == 0) ec_adapt();
     }
-    if (hc.slots && ++hc.tok % hc.every == 0) {
+    if (hc.slots && hc.fill_left > 0) {   // (a background fill: its next batch as the last one comes in)
+        const double u0 = now_ms();
+        hc_update(std::min(hc.fill_left, hc.fill_batch), false, true);
+        if (hc.issued == 0 && hc.inflight == 0) hc.fill_left = 0;   // (nothing better left to bring)
+        else hc.fill_left -= hc.issued;
+        st.ms_update += now_ms() - u0;
+    } else if (hc.slots && ++hc.tok % hc.every == 0) {
         const double u0 = now_ms();
         hc_update(hc.per, true, hc.bg);
         st.ms_update += now_ms() - u0;
+    }
+    if (refill_tok >= 0) {   // (a background refill under way: told when both caches' copies are up)
+        ++refill_tok;
+        if (ec.finflight == 0 && hc.fill_left == 0) {   // (the fills' own: the swaps go on as ever)
+            std::fprintf(stderr,
+                         "maya-hy4: the refill after the prompt (%ld main, %d helper copies) was up after %d tokens, "
+                         "%.1f s\n", refill_main, refill_helper, refill_tok, (now_ms() - refill_ms) / 1000.0);
+            refill_tok = -1;
+        }
     }
     phase(pt.adapt);
     st.ms_total += now_ms() - t0;
     st.ms_cpu += cpu_ms;
     ++st.tokens;
-    if (ptimes && ++pt.tokens == 64) {
+    // (HY4_STEP_BLOCK: the tokens a line, 64)
+    static const int pblock = std::getenv("HY4_STEP_BLOCK") ? std::max(1, std::atoi(std::getenv("HY4_STEP_BLOCK"))) : 64;
+    if (ptimes && ++pt.tokens == pblock) {
         const double n = (double) pt.tokens;
         std::fprintf(stderr,
-                     "maya-hy4: step phases, ms a token (64 tokens): embed %.2f, attention+sync %.2f, routing %.2f, GPU "
+                     "maya-hy4: step phases, ms a token (%d tokens): embed %.2f, attention+sync %.2f, routing %.2f, GPU "
                      "launches %.2f, CPU lane %.2f (%.1f experts, %.3f ms each), tail %.2f, head %.2f, adapt %.2f; "
                      "total %.2f\n",
-                     pt.embed / n, pt.att / n, pt.route / n, pt.glaunch / n, pt.cpu / n, pt.cpu_experts / n,
+                     pblock, pt.embed / n, pt.att / n, pt.route / n, pt.glaunch / n, pt.cpu / n, pt.cpu_experts / n,
                      pt.cpu_experts ? pt.cpu / pt.cpu_experts : 0.0, pt.tail / n, pt.head / n, pt.adapt / n,
                      (pt.embed + pt.att + pt.route + pt.glaunch + pt.cpu + pt.tail + pt.head + pt.adapt) / n);
+        std::fprintf(stderr,
+                     "maya-hy4:   (caches: main %zu copies to come, %ld copies so far; helper %d on the way + %d of a "
+                     "fill to release, %ld copies so far)\n",
+                     ec.pend.size() - ec.pend_head + (size_t) ec.finflight, ec.copies, hc.inflight, hc.fill_left,
+                     hc.copies);
         pt = PhaseTimes{};
     }
     return h_logits;

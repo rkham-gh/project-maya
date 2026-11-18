@@ -978,7 +978,7 @@ class DroppedRetry(unittest.TestCase):
 
     def test_twice_before_the_answer_is_an_error(self):
         tok, eng, svc = self.run_svc([0, 0])
-        with self.assertRaises(ValueError) as cm:
+        with self.assertRaises(EngineFault) as cm:   # (the engine's error, not a bad request)
             list(svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()))
         self.assertIn("the conversation was dropped", str(cm.exception))
         self.assertEqual(eng.calls, 2)
@@ -1063,9 +1063,14 @@ class NonFiniteRetry(unittest.TestCase):
         self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
 
     def test_twice_is_an_error(self):
-        out, done, err, calls = self.answer([0, 0])
-        self.assertIn("non-finite", err)
-        self.assertEqual(calls, 2)
+        # (the engine's error - EngineFault, a 422 engine_error when not streamed - not a 400 invalid request)
+        tok = ByteTokenizer()
+        eng = NonFiniteEngine(tok, "all good, and then some", [0, 0])
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with self.assertRaises(EngineFault) as cm:
+            list(svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()))
+        self.assertIn("non-finite", str(cm.exception))
+        self.assertEqual(eng.calls, 2)
 
     def test_other_errors_are_not_retried(self):
         class Broken(MockEngine):
