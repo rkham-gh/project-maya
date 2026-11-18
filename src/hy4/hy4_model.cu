@@ -8,7 +8,8 @@
 //     MLA:  qr = rmsnorm(W_qa a); q = W_qb qr [H][192 nope | 64 rope]; kv = W_kva a; the cache row
 //           [rmsnorm(kv[0:512]), rope(kv[512:576])]; o_h = v_b_h softmax(q'_h K^T / 16 + the head's sink) K[:, 0:512]
 //           with q'_h = [k_b_h q_nope_h, rope(q_pe_h)] over the last 512 keys (sliding-window layers, rope base 1e4)
-//           or all of them (sparse layers, 1e7; the indexer's top-2048 selection is not in yet);
+//           or the indexer's choice (sparse layers, 1e7: past 2048 keys, the top 511 groups of 4 by the scores of the
+//           pooled keys, and the token's own group);
 //           R_s += post_s rmsnorm(W_o (o sigmoid(W_gate a)), post_attention_norm)
 //     x = sum_s pre_s R_s (the FFN's); f = rmsnorm(x, ffn_norm)
 //     FFN:  layer 0 a SwiGLU FFN; the others the MoE - the top 16 of sigmoid(W_r f) + exp_probs_b, weighted by the
@@ -144,6 +145,12 @@ struct Layer {
     float *q_a_norm = nullptr, *kv_a_norm = nullptr;
     __half* kv = nullptr;   // the cache: kv_rows rows of 576 (F16)
     int kv_rows = 0;
+    // the indexer (the sparse layers): its key and query projections, the key's norm, the heads' weights (F32), the
+    // pooling's value and gate projections, position embedding [kpool][dim] and norm; the open group's value | gate
+    // rows (ring [kpool][2 dim]) and the complete groups' pooled keys (pooled [max_ctx / kpool][dim])
+    DMat idx_k, idx_qb, idx_proj, idx_v, idx_g;
+    float *idx_knorm = nullptr, *idx_ape = nullptr, *idx_pnorm = nullptr;
+    float *idx_ring = nullptr, *idx_pooled = nullptr;
     // the hyper-connections: before the attention (a) and before the FFN (f); fn [2 hc][hc E], scale [2], base [2 hc]
     float *hca_fn = nullptr, *hca_scale = nullptr, *hca_base = nullptr;
     float *hcf_fn = nullptr, *hcf_scale = nullptr, *hcf_base = nullptr;
@@ -199,6 +206,14 @@ struct Engine::Impl {
     float *xd_a = nullptr, *xd_f = nullptr, *xd_h = nullptr, *xd_m = nullptr, *xd_l = nullptr, *xd_e = nullptr;
     // Engram: a token's rows for every module [n_eg][cols][dim] (F32, from h_eg), the normed rows, the projection
     float *eg_rows_d = nullptr, *eg_y = nullptr, *eg_kvo = nullptr;
+    // the indexer's: the token's key (raw, normed), value, gate, the heads' queries [nh][dim] and weights [nh], the
+    // groups' scores, the cells chosen and their count; snap_ring the open groups' rows at snap_pos
+    float *ik = nullptr, *ikn = nullptr, *iv = nullptr, *ig = nullptr, *iq = nullptr, *iw = nullptr, *iscore = nullptr;
+    int *cells = nullptr, *ncell = nullptr;
+    int8_t* xq_i = nullptr;
+    float* xd_i = nullptr;
+    float* snap_ring = nullptr;
+    int max_pools = 0;
     // host (pinned)
     float *h_f = nullptr, *h_rlog = nullptr, *h_tail = nullptr, *h_logits = nullptr, *h_eg = nullptr;
     int* h_pos = nullptr;
@@ -657,13 +672,32 @@ const float* Engine::prefill(const int* ids, int n, void (*progress)(void*, int)
 }
 
 bool Engine::snapshot() {
-    p->snap_pos = p->pos;
+    Impl& m = *p;
+    // (the indexer's open groups: their slots are written again by the tokens after the snapshot)
+    const size_t ring = (size_t) m.g.idx_kpool * 2 * m.g.idx_dim * sizeof(float);
+    uint8_t* at = (uint8_t*) m.snap_ring;
+    for (const Layer& l : m.L)
+        if (l.idx) {
+            CK(cudaMemcpyAsync(at, l.idx_ring, ring, cudaMemcpyDeviceToDevice, m.s));
+            at += ring;
+        }
+    CK(cudaStreamSynchronize(m.s));
+    m.snap_pos = m.pos;
     return true;
 }
 
 bool Engine::restore() {
-    if (p->snap_pos < 0) return false;
-    p->pos = p->snap_pos;
+    Impl& m = *p;
+    if (m.snap_pos < 0) return false;
+    const size_t ring = (size_t) m.g.idx_kpool * 2 * m.g.idx_dim * sizeof(float);
+    const uint8_t* at = (const uint8_t*) m.snap_ring;
+    for (Layer& l : m.L)
+        if (l.idx) {
+            CK(cudaMemcpyAsync(l.idx_ring, at, ring, cudaMemcpyDeviceToDevice, m.s));
+            at += ring;
+        }
+    CK(cudaStreamSynchronize(m.s));
+    m.pos = m.snap_pos;
     return true;
 }
 
@@ -941,6 +975,21 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
         //  tokens of context it keeps every one anyway)
         l.kv_rows = max_ctx;
         l.kv = dalloc<__half>((size_t) l.kv_rows * 576);
+        if (l.idx) {
+            const int D = g.idx_dim, NH = g.idx_heads, KP = g.idx_kpool;
+            if (!mat(b + "indexer.attn_k.weight", E, D, l.idx_k, err) ||
+                !mat(b + "indexer.attn_q_b.weight", g.q_lora, NH * D, l.idx_qb, err) ||
+                !mat(b + "indexer.proj.weight", E, NH, l.idx_proj, err) ||
+                !mat(b + "indexer_compressor_value.weight", D, D, l.idx_v, err) ||
+                !mat(b + "indexer_compressor_gate.weight", D, D, l.idx_g, err))
+                return false;
+            if (!(l.idx_knorm = f32(b + "indexer.k_norm.weight", (size_t) D, err)) ||
+                !(l.idx_ape = f32(b + "indexer_compressor_ape.weight", (size_t) KP * D, err)) ||
+                !(l.idx_pnorm = f32(b + "indexer_compressor_norm.weight", (size_t) D, err)))
+                return false;
+            l.idx_ring = dalloc<float>((size_t) KP * 2 * D);
+            l.idx_pooled = dalloc<float>((size_t) (max_ctx / KP + 1) * D);
+        }
         for (size_t e = 0; e < g.eg_layers.size(); ++e)
             if (g.eg_layers[e] == il) l.eg = (int) e;
         if (l.eg >= 0) {
@@ -1058,6 +1107,32 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
         eg_kvo = dalloc<float>((size_t) (HC + 1) * E);
     }
     hist.reserve((size_t) max_ctx);
+    {
+        int n_idx = 0;
+        for (const Layer& l : L) n_idx += l.idx;
+        if (n_idx) {
+            const int D = g.idx_dim, NH = g.idx_heads, KP = g.idx_kpool;
+            if (KP < 2 || D != 128 || NH > 16 || g.idx_top_k % KP != 0 || !g.idx_tail || g.idx_top_k / KP - 1 > 1024 ||
+                g.rope_dim >= D) {
+                err = "an indexer this engine does not take (it is written for Hy4 Flash's: 128 wide, at most 16 heads, "
+                      "a pool size dividing top_k, the token's own group kept)";
+                return false;
+            }
+            max_pools = max_ctx / KP + 1;
+            ik = dalloc<float>(D);
+            ikn = dalloc<float>(D);
+            iv = dalloc<float>(D);
+            ig = dalloc<float>(D);
+            iq = dalloc<float>((size_t) NH * D);
+            iw = dalloc<float>(NH);
+            iscore = dalloc<float>((size_t) max_pools);
+            cells = dalloc<int>((size_t) g.idx_top_k + KP);
+            ncell = dalloc<int>(1);
+            xq_i = dalloc<int8_t>(D);
+            xd_i = dalloc<float>(D / 32);
+            snap_ring = dalloc<float>((size_t) n_idx * KP * 2 * D);
+        }
+    }
 
     int threads = o.threads > 0 ? o.threads : (int) std::max(1u, std::thread::hardware_concurrency() / 2);
     pool.reset(new Pool(threads - 1));
@@ -2194,12 +2269,32 @@ void Engine::Impl::tok_attn(Layer& l) {
     k::hc_read(R, l.hca_fn, 2 * HC, l.hca_scale, l.hca_base, HC, E, g.eps, g.hc_eps, g.hc_mag, hmix, x, hpost, s);
     k::norm_q8(x, l.attn_norm, g.eps, a, xq_a, xd_a, E, s);
     {
-        const DMat* ms[3] = {&l.q_a, &l.kv_a, &l.wgate};
-        float* ys[3] = {qa, kva, gh};
-        mv_many(ms, ys, 3, a, xq_a, xd_a);
+        const DMat* ms[5] = {&l.q_a, &l.kv_a, &l.wgate, &l.idx_k, &l.idx_proj};
+        float* ys[5] = {qa, kva, gh, ik, iw};
+        mv_many(ms, ys, l.idx ? 5 : 3, a, xq_a, xd_a);
     }
     k::norm_q8(qa, l.q_a_norm, g.eps, nullptr, xq_m, xd_m, g.q_lora, s);
-    mv(l.q_b, nullptr, xq_m, xd_m, qf);
+    {
+        const DMat* ms[2] = {&l.q_b, &l.idx_qb};
+        float* ys[2] = {qf, iq};
+        mv_many(ms, ys, l.idx ? 2 : 1, nullptr, xq_m, xd_m);
+    }
+    if (l.idx) {
+        // the indexer: the key normed, its value and gate rows into the open group (pooled when the group ends), the
+        // query roped at the token's position, the complete groups scored and the cells chosen
+        const int D = g.idx_dim, NH = g.idx_heads, KP = g.idx_kpool;
+        k::eg_rows(ik, l.idx_knorm, 1, D, g.eps, ikn, xq_i, xd_i, s);
+        {
+            const DMat* ms[2] = {&l.idx_v, &l.idx_g};
+            float* ys[2] = {iv, ig};
+            mv_many(ms, ys, 2, ikn, xq_i, xd_i);
+        }
+        k::idx_store(iv, ig, dpos, KP, D, l.idx_ring, s);
+        k::idx_pool(l.idx_ring, l.idx_ape, l.idx_pnorm, dpos, KP, D, g.eps, l.theta_scale, l.idx_pooled, s);
+        k::mla_rope_q(iq, 1, NH, D, D - g.rope_dim, 0, dpos, l.theta_scale, s);
+        k::idx_score(iq, iw, l.idx_pooled, dpos, KP, NH, D, 1.0f / std::sqrt((float) (D * NH)), max_pools, iscore, s);
+        k::idx_select(iscore, dpos, KP, g.idx_top_k / KP - g.idx_tail, cells, ncell, s);
+    }
     k::q8(qf, 1, H * g.qk_head, xq_m, xd_m, s);   // (q_nope's int8 rows: head h's at qk_head h, 32-value blocks)
     {
         // k_b a head: q_nope -> the cache's 512
@@ -2216,8 +2311,11 @@ void Engine::Impl::tok_attn(Layer& l) {
     }
     k::mla_rope_q(qf, 1, H, g.qk_head, nope, 0, dpos, l.theta_scale, s);
     k::mla_kv_store(kva, l.kv_a_norm, g.eps, l.kv, 1, 0, dpos, l.theta_scale, s);
-    k::mla_decode(qabs, qf, g.qk_head, nope, l.kv, dpos, l.swa ? g.swa_window : 0, l.sinks, H, mla_scale, attn_nsp,
-                  attn_scr, mo, xq_m, xd_m, s);
+    // (HY4_IDX_DENSE=1: the sparse layers attend to every key, the indexer's choice ignored - a check of what it does)
+    static const bool dense = std::getenv("HY4_IDX_DENSE") && std::atoi(std::getenv("HY4_IDX_DENSE")) != 0;
+    const bool sel = l.idx && !dense;
+    k::mla_decode(qabs, qf, g.qk_head, nope, l.kv, dpos, l.swa ? g.swa_window : 0, sel ? cells : nullptr,
+                  sel ? ncell : nullptr, l.sinks, H, mla_scale, attn_nsp, attn_scr, mo, xq_m, xd_m, s);
     {
         // v_b a head: the 512 -> v_head
         iq::MvJob j[64];

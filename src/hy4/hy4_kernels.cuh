@@ -103,11 +103,11 @@ void mla_kv_store(const float* kva, const float* w, float eps, __half* cache, in
 int mla_nsp(int rows);
 size_t mla_scratch_floats(int H, int nsp);
 /// One token's attention at *dpos over the cache rows 0 .. *dpos (win > 0: only the last win of them, a sliding
-/// window): qa [H][512] (k_b q_nope), qf [H][qk] (the roped q_pe at nope), scale; sinks (null: none) a logit a head
+/// window; cells set: the rows cells[0 .. *ncell) instead, the indexer's choice): qa [H][512] (k_b q_nope), qf [H][qk] (the roped q_pe at nope), scale; sinks (null: none) a logit a head
 /// added to the softmax's sum; out [H][512] F32 and its int8 rows (oq, od: q8's over the row of H 512, null: none).
 void mla_decode(const float* qa, const float* qf, int qk, int nope, const __half* cache, const int* dpos, int win,
-                const float* sinks, int H, float scale, int nsp, float* scratch, float* out, int8_t* oq, float* od,
-                cudaStream_t s);
+                const int* cells, const int* ncell, const float* sinks, int H, float scale, int nsp, float* scratch,
+                float* out, int8_t* oq, float* od, cudaStream_t s);
 /// y[h][d] = x[h][d] sigmoid(g[h]) (rows of hd, H heads) and its int8 rows (q, d; null: none), y F32 (may be x).
 void head_gate(const float* x, const float* g, int H, int hd, float* y, int8_t* q, float* dq, cudaStream_t s);
 /// (the prompt path) the same for T rows [T][H][hd] with gates [T][H], into F16.
@@ -155,6 +155,20 @@ void eg_update(const float* kv, const float* kb, const float* gw, const float* h
 /// y = (flags[0] ? cpu : 0) + (flags[1] ? gpu : 0) (n values, a multiple of 32) and its int8 rows.
 void lat_sum_q8(const float* cpu, const float* gpu, const int* flags, int n, float* y, int8_t* q, float* d,
                 cudaStream_t s);
+
+/// The indexer (sparse layers): the token's value and gate rows (dim each) into the open group's slot of ring
+/// [kpool][2 dim].
+void idx_store(const float* iv, const float* ig, const int* dpos, int kpool, int dim, float* ring, cudaStream_t s);
+/// When *dpos ends a group: its pooled key (softmax over the members of gate + ape, per element, weighting value; then
+/// RMS-normed times w; RoPE on its last 64 values at the group's first position) into pooled[*dpos / kpool].
+void idx_pool(const float* ring, const float* ape, const float* w, const int* dpos, int kpool, int dim, float eps,
+              float theta_scale, float* pooled, cudaStream_t s);
+/// score[g] = sum_h relu(q_h . pooled_g) w_h scale for the complete groups before the token's own (q [nh][dim]).
+void idx_score(const float* q, const float* w, const float* pooled, const int* dpos, int kpool, int nh, int dim,
+               float scale, int max_pools, float* score, cudaStream_t s);
+/// The cells the token attends to: all of them up to *dpos while there are no more than top_pools complete groups
+/// before its own, else the top top_pools groups' cells and its own group's; *ncell their count.
+void idx_select(const float* score, const int* dpos, int kpool, int top_pools, int* cells, int* ncell, cudaStream_t s);
 
 /// (--selftest) nothing yet; true.
 bool selftest();

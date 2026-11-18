@@ -1,5 +1,6 @@
 // src/hy4/hy4_kernels.cu - maya-hy4's own device kernels (ling_kernels.cuh).
 #include "hy4_kernels.cuh"
+#include "hy4_topk.cuh"
 
 #include <cuda_bf16.h>
 
@@ -428,13 +429,17 @@ __host__ __device__ inline int mla_split_keys(int n_kv, int nsp) {
 __global__ void __launch_bounds__(kMlaThreads) mla_decode_kernel(const float* __restrict__ qa,
                                                                  const float* __restrict__ qf, int qk, int nope,
                                                                  const __half* __restrict__ cache,
-                                                                 const int* __restrict__ dpos, int win, int nsp,
+                                                                 const int* __restrict__ dpos, int win,
+                                                                 const int* __restrict__ cells,
+                                                                 const int* __restrict__ ncell, int nsp,
                                                                  float scale, float* __restrict__ part) {
     extern __shared__ float sm[];
     const int split = blockIdx.x, hg = blockIdx.y, t = threadIdx.x;
-    const int n_kv = *dpos + 1, j_lo = win > 0 ? max(0, n_kv - win) : 0, S = mla_split_keys(n_kv - j_lo, nsp);
-    const int j0 = j_lo + split * S, j1 = min(n_kv, j0 + S);
-    if (j0 >= n_kv) return;   // (a split past the keys: the combine reads only those before)
+    const int n_kv = *dpos + 1, j_lo = win > 0 ? max(0, n_kv - win) : 0;
+    const int n = cells ? *ncell : n_kv - j_lo, S = mla_split_keys(n, nsp);
+    const int j0 = split * S, j1 = min(n, j0 + S);
+    if (j0 >= n) return;   // (a split past the keys: the combine reads only those before)
+    auto row = [&](int j) { return cells ? cells[j] : j_lo + j; };
     float* qs = sm;                           // [HG][576]
     float* sc = qs + kMlaHG * kMlaD;          // [HG][tile]
     float* mrow = sc + kMlaHG * kMlaTile;     // [HG] the running max
@@ -458,7 +463,7 @@ __global__ void __launch_bounds__(kMlaThreads) mla_decode_kernel(const float* __
             const int kk = t & (kMlaTile - 1), hq = (t / kMlaTile) * 4;
             float a4[4] = {0.0f, 0.0f, 0.0f, 0.0f};
             if (kk < nk) {
-                const uint4* kr = reinterpret_cast<const uint4*>(cache + (size_t) (jt + kk) * kMlaD);
+                const uint4* kr = reinterpret_cast<const uint4*>(cache + (size_t) row(jt + kk) * kMlaD);
                 for (int c = 0; c < kMlaD / 8; ++c) {
                     const uint4 u = kr[c];
                     const __half2* k2 = reinterpret_cast<const __half2*>(&u);
@@ -521,7 +526,7 @@ __global__ void __launch_bounds__(kMlaThreads) mla_decode_kernel(const float* __
             acc1[hl] *= f;
         }
         for (int i = 0; i < nk; ++i) {
-            const __half* vr = cache + (size_t) (jt + i) * kMlaD;
+            const __half* vr = cache + (size_t) row(jt + i) * kMlaD;
             const float v0 = __half2float(vr[t]), v1 = __half2float(vr[t + kMlaThreads]);
 #pragma unroll
             for (int hl = 0; hl < kMlaHG; ++hl) {
@@ -547,10 +552,10 @@ __global__ void __launch_bounds__(kMlaThreads) mla_decode_kernel(const float* __
 // grid H, block 512: the splits' partial sums merged (the splits that hold keys), and the row's int8 rounding
 // A head's sink (sinks set): one more logit in the softmax's sum, with no value row (ggml_soft_max_add_sinks).
 __global__ void mla_combine_kernel(const float* __restrict__ part, int nsp, const int* __restrict__ dpos, int win,
-                                   const float* __restrict__ sinks, float* __restrict__ out, int8_t* __restrict__ oq,
-                                   float* __restrict__ od) {
+                                   const int* __restrict__ ncell, const float* __restrict__ sinks,
+                                   float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od) {
     const int h = blockIdx.x, d = threadIdx.x;
-    const int n_kv = *dpos + 1, n = win > 0 ? min(n_kv, win) : n_kv, S = mla_split_keys(n, nsp);
+    const int n_kv = *dpos + 1, n = ncell ? *ncell : win > 0 ? min(n_kv, win) : n_kv, S = mla_split_keys(n, nsp);
     const int used = min(nsp, (n + S - 1) / S);
     const float* pp = part + (size_t) h * nsp * (kMlaV + 2);
     float M = sinks ? sinks[h] : -INFINITY;
@@ -841,12 +846,12 @@ void mla_kv_store(const float* kva, const float* w, float eps, __half* cache, in
 int mla_nsp(int rows) { return std::max(128, (rows + 1023) / 1024); }
 size_t mla_scratch_floats(int H, int nsp) { return (size_t) H * nsp * (kMlaV + 2); }
 void mla_decode(const float* qa, const float* qf, int qk, int nope, const __half* cache, const int* dpos, int win,
-                const float* sinks, int H, float scale, int nsp, float* scratch, float* out, int8_t* oq, float* od,
-                cudaStream_t s) {
+                const int* cells, const int* ncell, const float* sinks, int H, float scale, int nsp, float* scratch,
+                float* out, int8_t* oq, float* od, cudaStream_t s) {
     const size_t smem = ((size_t) kMlaHG * kMlaD + (size_t) kMlaHG * kMlaTile + 3 * kMlaHG) * sizeof(float);   // 41 KB
-    mla_decode_kernel<<<dim3(nsp, H / kMlaHG), kMlaThreads, smem, s>>>(qa, qf, qk, nope, cache, dpos, win, nsp, scale,
-                                                                       scratch);
-    mla_combine_kernel<<<H, kMlaV, 0, s>>>(scratch, nsp, dpos, win, sinks, out, oq, od);
+    mla_decode_kernel<<<dim3(nsp, H / kMlaHG), kMlaThreads, smem, s>>>(qa, qf, qk, nope, cache, dpos, win, cells, ncell,
+                                                                       nsp, scale, scratch);
+    mla_combine_kernel<<<H, kMlaV, 0, s>>>(scratch, nsp, dpos, win, cells ? ncell : nullptr, sinks, out, oq, od);
 }
 void head_gate(const float* x, const float* g, int H, int hd, float* y, int8_t* q, float* dq, cudaStream_t s) {
     const int n = H * hd;
@@ -1025,6 +1030,109 @@ void eg_update(const float* kv, const float* kb, const float* gw, const float* h
 void lat_sum_q8(const float* cpu, const float* gpu, const int* flags, int n, float* y, int8_t* q, float* d,
                 cudaStream_t s) {
     lat_sum_q8_kernel<<<blocks(n, 256), 256, 0, s>>>(cpu, gpu, flags, n, y, q, d);
+}
+
+
+namespace {
+// ------------------------------------------------------------------------------------------------ Hy4: the indexer
+// grid 1, block 2 dim: the token's value and gate rows (iv, ig [dim]) into the open group's slot pos % kpool of ring
+// [kpool][2 dim] (value | gate)
+__global__ void idx_store_kernel(const float* __restrict__ iv, const float* __restrict__ ig, const int* __restrict__ dpos,
+                                 int kpool, int dim, float* __restrict__ ring) {
+    const int t = threadIdx.x, slot = *dpos % kpool;
+    ring[(size_t) slot * 2 * dim + t] = t < dim ? iv[t] : ig[t - dim];
+}
+// grid 1, block dim: when pos ends a group, its pooled key into pooled[pos / kpool]: per element e, the softmax over the
+// group's members m of (gate[m][e] + ape[m][e]) weighting value[m][e]; then RMS-normed (eps) times w; then RoPE (NORM
+// pairs) on its last 64 values at the group's first position
+__global__ void idx_pool_kernel(const float* __restrict__ ring, const float* __restrict__ ape, const float* __restrict__ w,
+                                const int* __restrict__ dpos, int kpool, int dim, float eps, float theta_scale,
+                                float* __restrict__ pooled) {
+    const int pos = *dpos;
+    if ((pos + 1) % kpool != 0) return;
+    const int e = threadIdx.x;
+    float mx = -INFINITY;
+    for (int m = 0; m < kpool; ++m) mx = fmaxf(mx, ring[(size_t) m * 2 * dim + dim + e] + ape[(size_t) m * dim + e]);
+    float den = 0.0f, num = 0.0f;
+    for (int m = 0; m < kpool; ++m) {
+        const float p = expf(ring[(size_t) m * 2 * dim + dim + e] + ape[(size_t) m * dim + e] - mx);
+        den += p;
+        num += p * ring[(size_t) m * 2 * dim + e];
+    }
+    const float v = num / den;
+    const float ss = block_sum(v * v);
+    __shared__ float sv[1024];
+    sv[e] = v * rsqrtf(ss / (float) dim + eps) * w[e];
+    __syncthreads();
+    float* dst = pooled + (size_t) (pos / kpool) * dim;
+    const int nope = dim - 64;
+    if (e < nope) dst[e] = sv[e];
+    else if (((e - nope) & 1) == 0) {
+        float y0, y1;
+        rope_pair(sv[e], sv[e + 1], pos + 1 - kpool, (e - nope) >> 1, theta_scale, y0, y1);
+        dst[e] = y0;
+        dst[e + 1] = y1;
+    }
+}
+// grid ceil(max_pools / 8), block 256 (a warp a pool): score[g] = sum_h relu(q_h . pooled_g) w_h scale for the pools
+// g < pos / kpool (the complete groups before the token's own)
+__global__ void idx_score_kernel(const float* __restrict__ q, const float* __restrict__ w, const float* __restrict__ pooled,
+                                 const int* __restrict__ dpos, int kpool, int nh, int dim, float scale,
+                                 float* __restrict__ score) {
+    const int n_cand = *dpos / kpool;
+    const int g = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (blockIdx.x * 8 >= n_cand) return;
+    __shared__ float sq[16 * 128];
+    __shared__ float sw[16];
+    for (int i = threadIdx.x; i < nh * dim; i += blockDim.x) sq[i] = q[i];
+    if (threadIdx.x < nh) sw[threadIdx.x] = w[threadIdx.x] * scale;
+    __syncthreads();
+    if (g >= n_cand) return;
+    const float* k = pooled + (size_t) g * dim;
+    float kr[4];
+    for (int i = 0; i < 4; ++i) kr[i] = lane + 32 * i < dim ? k[lane + 32 * i] : 0.0f;
+    float acc = 0.0f;
+    for (int h = 0; h < nh; ++h) {
+        float d = 0.0f;
+        for (int i = 0; i < 4; ++i)
+            if (lane + 32 * i < dim) d = fmaf(sq[h * dim + lane + 32 * i], kr[i], d);
+        d = warp_sum(d);
+        acc = fmaf(fmaxf(d, 0.0f), sw[h], acc);
+    }
+    if (lane == 0) score[g] = acc;
+}
+// one block of 1024: the cells the token at pos attends to - every one up to pos while the complete groups before its
+// own are no more than top_pools; else the top top_pools of them by score (their kpool cells each) and its own group's
+// cells up to pos.  ncell[0] their count.
+__global__ void __launch_bounds__(1024) idx_select_kernel(const float* __restrict__ score, const int* __restrict__ dpos,
+                                                          int kpool, int top_pools, int* __restrict__ cells,
+                                                          int* __restrict__ ncell) {
+    const int pos = *dpos, n_cand = pos / kpool;
+    if (n_cand <= top_pools) {
+        for (int j = threadIdx.x; j <= pos; j += blockDim.x) cells[j] = j;
+        if (threadIdx.x == 0) ncell[0] = pos + 1;
+        return;
+    }
+    strata::kernels::dsa::select_top_pools(score, n_cand, top_pools, kpool, cells);
+    const int base = n_cand * kpool, own = pos - base + 1;
+    if (threadIdx.x < own) cells[top_pools * kpool + threadIdx.x] = base + threadIdx.x;
+    if (threadIdx.x == 0) ncell[0] = top_pools * kpool + own;
+}
+}  // namespace
+
+void idx_store(const float* iv, const float* ig, const int* dpos, int kpool, int dim, float* ring, cudaStream_t s) {
+    idx_store_kernel<<<1, 2 * dim, 0, s>>>(iv, ig, dpos, kpool, dim, ring);
+}
+void idx_pool(const float* ring, const float* ape, const float* w, const int* dpos, int kpool, int dim, float eps,
+              float theta_scale, float* pooled, cudaStream_t s) {
+    idx_pool_kernel<<<1, dim, 0, s>>>(ring, ape, w, dpos, kpool, dim, eps, theta_scale, pooled);
+}
+void idx_score(const float* q, const float* w, const float* pooled, const int* dpos, int kpool, int nh, int dim,
+               float scale, int max_pools, float* score, cudaStream_t s) {
+    idx_score_kernel<<<blocks(max_pools, 8), 256, 0, s>>>(q, w, pooled, dpos, kpool, nh, dim, scale, score);
+}
+void idx_select(const float* score, const int* dpos, int kpool, int top_pools, int* cells, int* ncell, cudaStream_t s) {
+    idx_select_kernel<<<1, 1024, 0, s>>>(score, dpos, kpool, top_pools, cells, ncell);
 }
 
 bool selftest() {
