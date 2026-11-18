@@ -69,6 +69,12 @@ class ChatTemplate:
         # turn says "detailed thinking on / off"), GLM's <arg_key> tool calls.  Its tools are written as the client's
         # OpenAI objects (tojson of each, as Hugging Face's and llama.cpp's renderings give them)
         self.ling = "<role>HUMAN</role>" in self.source
+        # Hy4 Flash (Tencent; its GGUF's template): <｜hy_start:S｜>ROLE<｜hy_middle:S｜>...<｜hy_end:S｜> turns, the tags
+        # carrying the template's suffix S (HYTK, ':6124c78e' in AngelSlim's GGUF); thinking by reasoning_effort -
+        # no_think, high (its default) or max, nothing else - and <think:S> ... </think:S>; GLM's <arg_key> tool calls
+        # inside <tool_calls:S>.  OutputParser(hy4=suffix) reads them through Hy4Rewriter.
+        m = re.search(r"set\s+HYTK\s*=\s*'([^']*)'", self.source)
+        self.hy4 = m.group(1) if m and "hy_start" in self.source else None
         # A Qwen3.x template (Qwen3.8-Flash-Next's - unsloth's GGUF copy - and CYBER-FROST's): it writes each tool as
         # `tool | tojson`, and Qwen's reference render (transformers' apply_chat_template, the pack's chat_golden.json)
         # gets the tools in OpenAI's form - {"type": "function", "function": {...}} - so that is how they go in.
@@ -140,6 +146,16 @@ class ChatTemplate:
             # off - "none" / "minimal" turned it off in effort_kwargs already)
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
             kwargs.pop("reasoning_effort", None)
+        if self.hy4 is not None:
+            # Hy4's three words: thinking off is no_think; xhigh / max its max; any other level (and none named) its
+            # high, the template's default.  Its template reads tool.function or a flat tool alike.
+            off = kwargs.pop("enable_thinking", None) is False
+            level = name or kwargs.pop("reasoning_effort", None)
+            kwargs.pop("reasoning_effort", None)
+            kwargs["reasoning_effort"] = ("no_think" if off or level in ("none", "no_think") else
+                                          "max" if level in ("xhigh", "max") else "high")
+            return self.template.render(messages=messages, tools=tools or None,
+                                        add_generation_prompt=add_generation_prompt, **kwargs)
         off = False
         if self.glm_effort:
             off = kwargs.pop("enable_thinking", True) is False
@@ -1073,6 +1089,41 @@ MM_THINK, MM_THINK_END = "<mm:think>", "</mm:think>"
 THINK_AGAIN = "\x00think\x00"   # MinimaxRewriter -> OutputParser: a reasoning block opens (never in model text)
 
 
+class Hy4Rewriter:
+    """Hy4 Flash's tags rewritten, as they stream, into GLM's that OutputParser reads: <think:S> is dropped (the prompt
+    opened the reasoning), </think:S> is </think>, <tool_call:S> / <arg_key:S> / <arg_value:S> and their ends are GLM's,
+    and the <tool_calls:S> ... </tool_calls:S> wrapper around a turn's calls is dropped (S: the template's suffix).  The
+    values stay as written - strings raw, others JSON - which is how GLM's are read, against the tools' schemas.  A tag
+    split across deltas is held until it is whole."""
+
+    def __init__(self, suffix: str):
+        s = suffix
+        self.map = {f"<think{s}>": "", f"</think{s}>": "</think>", f"<tool_calls{s}>": "", f"</tool_calls{s}>": "",
+                    f"<tool_call{s}>": "<tool_call>", f"</tool_call{s}>": "</tool_call>",
+                    f"<arg_key{s}>": "<arg_key>", f"</arg_key{s}>": "</arg_key>",
+                    f"<arg_value{s}>": "<arg_value>", f"</arg_value{s}>": "</arg_value>"}
+        self.buf = ""
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while self.buf:
+            hits = [(i, k) for k in self.map for i in (self.buf.find(k),) if i >= 0]
+            if not hits:
+                keep = max((n for k in self.map for n in range(1, len(k)) if self.buf.endswith(k[:n])), default=0)
+                out.append(self.buf[:len(self.buf) - keep])
+                self.buf = self.buf[len(self.buf) - keep:]
+                break
+            i, k = min(hits)
+            out.append(self.buf[:i] + self.map[k])
+            self.buf = self.buf[i + len(k):]
+        return "".join(out)
+
+    def finish(self) -> str:
+        out, self.buf = self.buf, ""
+        return out
+
+
 def may_be_string(schema, defs: dict | None = None, seen: frozenset = frozenset()) -> bool:
     """Whether a JSON schema admits a string (llama.cpp's common_chat_schema::may_be_string): "type" "string" or a
     list holding it, an anyOf / oneOf with such an alternative, an allOf whose every constraining part admits one, a
@@ -1277,8 +1328,9 @@ class OutputParser:
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
-                 token_only_end: bool = False, unions: bool = False):
+                 token_only_end: bool = False, unions: bool = False, hy4: str | None = None):
         self.state = "reasoning" if thinking else "content"
+        self.hy4 = Hy4Rewriter(hy4) if hy4 is not None else None   # (Hy4 Flash's tags, before anything else reads them)
         # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
         # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
         # the server's own code, would have its reasoning cut there and spill into the answer).  The server closes it
@@ -1539,6 +1591,8 @@ class OutputParser:
     def feed(self, delta: str) -> list[Event]:
         if self.finished:
             return []
+        if self.hy4 is not None:
+            delta = self.hy4.feed(delta)
         if self.dsml is not None:
             delta = self.dsml.feed(delta)
         return self._feed(delta)
@@ -1676,7 +1730,10 @@ class OutputParser:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content)."""
         if self.finished:
             return []
-        out = self._feed(self.dsml.finish()) if self.dsml is not None else []
+        out = self._feed(self.hy4.finish()) if self.hy4 is not None else []
+        if self.finished:
+            return out
+        out += self._feed(self.dsml.finish()) if self.dsml is not None else []
         if self.finished:
             return out
         if self.state == "call" and self.stream_tools and self.scall is not None:

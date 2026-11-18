@@ -157,9 +157,11 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "bailingmoe2"):
+        # (hy_v4 - Hy4 Flash's - is llama.cpp's LLAMA_VOCAB_PRE_TYPE_HY_V4, whose three Isolated splits are
+        #  DeepSeek-V3's character for character: src/llama-vocab.cpp lists it with HUNYUAN_DENSE beside them)
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3", "minimax", "bailingmoe2", "hy_v4"):
             raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3, minimax, "
-                             "bailingmoe2" % pre)
+                             "bailingmoe2, hy_v4" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -179,7 +181,7 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre == "deepseek3" else
+        self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre in ("deepseek3", "hy_v4") else
                     regex.compile(MINIMAX_PATTERN) if pre == "minimax" else
                     regex.compile(BAILING_PATTERN) if pre == "bailingmoe2" else
                     regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))

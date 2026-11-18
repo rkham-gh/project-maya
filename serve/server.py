@@ -2566,7 +2566,9 @@ class Service:
                             # MiniMax-M3.1 with [e~[ (and would start the next turn with ]~b])
                             _special_ids("[e~[") + _special_ids("]~b]") +
                             # Ling-3 with <|role_end|> (and would start the next turn with <role>)
-                            _special_ids("<|role_end|>") + _special_ids("<role>"))
+                            _special_ids("<|role_end|>") + _special_ids("<role>") +
+                            # Hy4 Flash with <｜hy_end:S｜> (its EOS too) and would start the next with <｜hy_start:S｜>
+                            _special_ids("<｜hy_end:6124c78e｜>") + _special_ids("<｜hy_start:6124c78e｜>"))
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
@@ -4402,6 +4404,7 @@ class Service:
                                 stream_tools=True, dsml=getattr(self.template, "deepseek", False),
                                 token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
                                 minimax=getattr(self.template, "minimax", False),
+                                hy4=getattr(self.template, "hy4", None),
                                 strict_tools=responses, single_tool=single_tool,
                                 unions=getattr(self.template, "glm_dsa", False))
         parser = new_parser()
