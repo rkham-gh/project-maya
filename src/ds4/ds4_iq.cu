@@ -1768,6 +1768,8 @@ struct TabJob {
     size_t ys;
     const float* alpha;
     size_t poff, ypoff;   // (part p = blockIdx.y / nj: the matrix at off + p poff, its outputs at y + p ypoff)
+    const uint8_t* wbase;   // (wp null: job j's matrix at wbase + j wstride - mv_strided)
+    size_t wstride;
 };
 template <int T>
 __global__ void __launch_bounds__(kThreads) mv_table_kernel(const TabJob J) {
@@ -1780,7 +1782,7 @@ __global__ void __launch_bounds__(kThreads) mv_table_kernel(const TabJob J) {
     const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= J.n) return;
     float* y = J.y + (size_t) part * J.ypoff + (size_t) j * J.ys;
-    const uint8_t* base = J.wp[j];
+    const uint8_t* base = J.wp ? J.wp[j] : J.wbase + (size_t) j * J.wstride;
     if (base == nullptr) {
         if (lane == 0) y[row] = 0.0f;
         return;
@@ -2407,8 +2409,21 @@ bool mv_table(int type, const uint8_t* const* wp, size_t off, size_t ld, int k, 
     if (nj < 1 || nparts < 1 || (long) nj * nparts > 65535 || n < 1 || block_bytes(type) == 0 ||
         k % block_values(type) != 0 || xs % 32 != 0)
         return false;
-    const TabJob J{wp, off, ld, k, n, nj, xq, xd, xs, y, ys, alpha, poff, ypoff};
+    const TabJob J{wp, off, ld, k, n, nj, xq, xd, xs, y, ys, alpha, poff, ypoff, nullptr, 0};
     const dim3 grid((unsigned) ((n + kWarps - 1) / kWarps), (unsigned) (nj * nparts));
+#define MT_(T) pdl_launch(mv_table_kernel<T>, grid, kThreads, 0, s, J)
+    DS4_IQ_SWITCH_MV(type, MT_)
+#undef MT_
+    return true;
+}
+
+bool mv_strided(int type, const uint8_t* w, size_t wstride, size_t ld, int k, int n, int nj, const int8_t* xq,
+                const float* xd, size_t xs, float* y, size_t ys, cudaStream_t s) {
+    if (nj < 1 || nj > 65535 || n < 1 || w == nullptr || block_bytes(type) == 0 || k % block_values(type) != 0 ||
+        xs % 32 != 0)
+        return false;
+    const TabJob J{nullptr, 0, ld, k, n, nj, xq, xd, xs, y, ys, nullptr, 0, 0, w, wstride};
+    const dim3 grid((unsigned) ((n + kWarps - 1) / kWarps), (unsigned) nj);
 #define MT_(T) pdl_launch(mv_table_kernel<T>, grid, kThreads, 0, s, J)
     DS4_IQ_SWITCH_MV(type, MT_)
 #undef MT_

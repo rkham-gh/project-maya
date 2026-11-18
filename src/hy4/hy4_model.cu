@@ -3418,8 +3418,10 @@ void Engine::Impl::tok_attn(Layer& l) {
         k::idx_select(iscore, dpos, KP, g.idx_top_k / KP - g.idx_tail, cells, ncell, s);
     }
     k::q8(qf, 1, H * g.qk_head, xq_m, xd_m, s);   // (q_nope's int8 rows: head h's at qk_head h, 32-value blocks)
-    {
-        // k_b a head: q_nope -> the cache's 512
+    // k_b a head (q_nope -> the cache's 512): every head in one launch (HY4_HEADS_ONE=0: 8 heads a launch, as before)
+    static const bool heads_one = !(std::getenv("HY4_HEADS_ONE") && std::atoi(std::getenv("HY4_HEADS_ONE")) == 0);
+    if (!heads_one || !iq::mv_strided(l.k_b.type, l.k_b.w, (size_t) g.kv_lora * l.k_b.rb, l.k_b.rb, l.k_b.k, g.kv_lora,
+                                      H, xq_m, xd_m, (size_t) g.qk_head, qabs, (size_t) g.kv_lora, s)) {
         iq::MvJob j[64];
         for (int h0 = 0; h0 < H; h0 += 64) {
             const int nh = std::min(64, H - h0);
@@ -3438,8 +3440,9 @@ void Engine::Impl::tok_attn(Layer& l) {
     const bool sel = l.idx && !dense;
     k::mla_decode(qabs, qf, g.qk_head, nope, l.kv, dpos, l.swa ? g.swa_window : 0, sel ? cells : nullptr,
                   sel ? ncell : nullptr, l.sinks, H, mla_scale, attn_nsp, attn_scr, mo, xq_m, xd_m, s, l.ring);
-    {
-        // v_b a head: the 512 -> v_head
+    // v_b a head (the 512 -> v_head): every head in one launch
+    if (!heads_one || !iq::mv_strided(l.v_b.type, l.v_b.w, (size_t) g.v_head * l.v_b.rb, l.v_b.rb, l.v_b.k, g.v_head,
+                                      H, xq_m, xd_m, (size_t) g.kv_lora, mob, (size_t) g.v_head, s)) {
         iq::MvJob j[64];
         for (int h0 = 0; h0 < H; h0 += 64) {
             const int nh = std::min(64, H - h0);

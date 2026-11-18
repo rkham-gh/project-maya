@@ -167,6 +167,10 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s);
 bool mv_table(int type, const uint8_t* const* wp, size_t off, size_t ld, int k, int n, int nj, const int8_t* xq,
               const float* xd, size_t xs, float* y, size_t ys, const float* alpha, cudaStream_t s, int nparts = 1,
               size_t poff = 0, size_t ypoff = 0);
+/// mv_table's jobs on regularly placed matrices: job j's at w + j wstride (one matrix's row blocks a head, say), its
+/// input xq + j xs (scales xd + j xs / 32), its outputs y + j ys.  The same sums as mv's one-column jobs.
+bool mv_strided(int type, const uint8_t* w, size_t wstride, size_t ld, int k, int n, int nj, const int8_t* xq,
+                const float* xd, size_t xs, float* y, size_t ys, cudaStream_t s);
 
 /// (tests) every value of n rows of k (rows row_bytes(type, k) apart, on the device) as the kernels decode them: sub =
 /// the token / window / light kernels' codes times their scales (d s q - m; IQ1_M through the persistent kernels'
