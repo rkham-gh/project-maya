@@ -279,6 +279,65 @@ struct Engine::Impl {
     void hd_graphs();
     void hd_start();
     void hd_launch(int il);
+    // ---- windowed decode (step_window): T <= wTm tokens a pass, the token path's work with T columns and rows; its
+    // own buffers (sized for wTm at the load), plans and answers, graphs a T (made at the first window)
+    int wTm = 0;   // (HY4_WINDOW_MAX, 6; 0: no windows)
+    float *wx = nullptr, *wa = nullptr, *wf = nullptr, *wao = nullptr, *wfo = nullptr, *wR = nullptr, *whmix = nullptr,
+          *whpost = nullptr, *wqa = nullptr, *wkva = nullptr, *wgh = nullptr, *wqf = nullptr, *wqabs = nullptr,
+          *wmo = nullptr, *wmob = nullptr, *wfg = nullptr, *wfu = nullptr, *wfh = nullptr, *wsg = nullptr,
+          *wsu = nullptr, *wsh = nullptr, *wso = nullptr, *wlat = nullptr, *wlsum = nullptr, *wtail = nullptr,
+          *wlogits = nullptr, *wrlog = nullptr, *wik = nullptr, *wikn = nullptr, *wiv = nullptr, *wig = nullptr,
+          *wiq = nullptr, *wiw = nullptr, *weg_rows = nullptr, *weg_y = nullptr, *weg_kvo = nullptr;
+    int8_t *wxq_a = nullptr, *wxq_f = nullptr, *wxq_h = nullptr, *wxq_m = nullptr, *wxq_l = nullptr, *wxq_e = nullptr,
+           *wxq_i = nullptr;
+    float *wxd_a = nullptr, *wxd_f = nullptr, *wxd_h = nullptr, *wxd_m = nullptr, *wxd_l = nullptr, *wxd_e = nullptr,
+          *wxd_i = nullptr;
+    int *wcells = nullptr, *wncell = nullptr, *wdpos = nullptr, *wtokid = nullptr, *wh_pos = nullptr, *wh_tokid = nullptr;
+    size_t wcell_n = 0;
+    uint8_t *wh_erow = nullptr, *wd_erow = nullptr;
+    float *wh_eg = nullptr, *wh_logits = nullptr;
+    // the main card's experts of a window: [16 wTm] choices
+    float *wec_gu = nullptr, *wec_h = nullptr, *wec_hd = nullptr, *wec_y = nullptr, *wec_routed = nullptr;
+    int8_t* wec_hq = nullptr;
+    const uint8_t** wd_gptr = nullptr;
+    int *wd_sel = nullptr, *wd_need = nullptr;
+    float* wd_wsel = nullptr;
+    // plans and answers (host-mapped; m_: host, md_: the main card's, mdh_: the helper's pointers)
+    size_t wplan_ints = 0, wans_ints = 0;
+    int *mw_plan = nullptr, *mw_ans = nullptr, *mw_hans = nullptr, *mdw_plan = nullptr, *mdw_ans = nullptr,
+        *mdw_hans = nullptr, *mdhw_plan = nullptr, *mdhw_hans = nullptr;
+    // the helper's window buffers
+    float *hw_gu = nullptr, *hw_h = nullptr, *hw_hd = nullptr, *hw_y = nullptr, *hw_qd = nullptr, *hw_w = nullptr;
+    int8_t *hw_hq = nullptr, *hw_qq = nullptr;
+    const uint8_t** hw_gptr = nullptr;
+    int *hw_nh = nullptr, *hw_dpos = nullptr, *hhw_pos = nullptr;
+    // graphs: gxw[T] the main card's segments, hgxw[T] the helper's layers (an empty vector: not made)
+    std::vector<std::vector<cudaGraphExec_t>> gxw, hgxw;
+    int wgraphs = -1;
+    struct NWw {
+        const float *a = nullptr, *b = nullptr, *w = nullptr;
+        bool on = false;
+    } nww;
+    void win_alloc();
+    void mvw(const DMat& m, const float* xf, const int8_t* xq, const float* xd, float* y, int T);
+    void mvw_many(const DMat* const* ms, float* const* ys, int n, const float* xf, const int8_t* xq, const float* xd,
+                  int T);
+    void nww_defer(const float* a_, const float* b_, const float* w_, int T);
+    void nww_flush(int T);
+    void read_norm_w(const float* fn, int nmix, const float* scale, const float* base, float* post_out, const float* wn,
+                     float* y, int8_t* q, float* d, int T);
+    void tokw_attn(Layer& l, int T);
+    void tokw_dense_ffn(const Layer& l, int T);
+    void tokw_router(const Layer& l, int T);
+    void tokw_moe(const Layer& l, int il, int T);
+    void tokw_tail(const Layer& l, int T);
+    void tokw_head(int T);
+    void tokw_seg(int seg, int T);
+    void hdw_layer(const Layer& l, int il, int T);
+    void win_graphs();
+    void pre_step(int rows);
+    const float* step_window(const int* toks, int T);
+
     // Engram's tables and the token history its n-grams read (hist[p]: the token at position p)
     const uint8_t* eg_table = nullptr;
     size_t eg_rb = 0;
@@ -860,6 +919,8 @@ void Engine::clear_stats() {
 bool Engine::save_profile() const { return !p->o.profile.empty() && p->save_profile(p->o.profile); }
 bool Engine::load(const Options& o, std::string& err) { return p->load(o, err); }
 const float* Engine::step(int token) { return p->step(token); }
+const float* Engine::step_window(const int* toks, int T) { return p->step_window(toks, T); }
+int Engine::window_max() const { return p->wTm; }
 const float* Engine::prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx) {
     return p->prefill(ids, n, progress, ctx);
 }
@@ -1447,6 +1508,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
                      dev_bytes / 1e9, ec.own, (dev_bytes - before_ec) / 1e9, ec.slots - ec.arena_end, cls.c_str(),
                      pool->threads(), (now_ms() - t0) / 1000.0, g.eos);
     }
+    win_alloc();
     loaded = true;   // (no dalloc from here on)
     return true;
 }
@@ -4048,6 +4110,20 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
                 cw[nc++] = wi;
             }
         }
+        // (HY4_LANE_LOG=<file>, a measure for windowed decode: each layer's CPU-lane and helper experts, a line a layer -
+        //  "seq il cpu e.. | helper e..")
+        static FILE* lane_log = std::getenv("HY4_LANE_LOG") ? std::fopen(std::getenv("HY4_LANE_LOG"), "w") : nullptr;
+        if (lane_log) {
+            std::fprintf(lane_log, "%d %d", seq, il);
+            for (int i = 0; i < nc; ++i) std::fprintf(lane_log, " %d", csel[i]);
+            std::fputs(" |", lane_log);
+            for (int i = 0; i < nu; ++i) {
+                const int e = pl[2 + i], sl = pl[34 + i];
+                if (sl < 0 && hc.slots && hc.where[(size_t) il * ne + e] >= 0) std::fprintf(lane_log, " %d", e);
+            }
+            std::fputc('\n', lane_log);
+            if (il == g.n_layer - 1) std::fflush(lane_log);
+        }
         ec.lookups += nu;
         ec.hits += nmain;
         hc.hits += nh;
@@ -4135,20 +4211,10 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
     }
 }
 
-const float* Engine::Impl::step(int token) {
-    if (fault || pos >= max_ctx || token < 0 || token >= g.vocab) return nullptr;   // (fault: failed() until reset())
-    const double t0 = now_ms();
-    double cpu_ms = 0.0;
-    const int NL = g.n_lat;
-    static const bool ptimes = std::getenv("HY4_STEP_TIMES") != nullptr;
-    double tp = t0;
-    auto phase = [&](double& acc) {
-        if (!ptimes) return;
-        const double t = now_ms();
-        acc += t - tp;
-        tp = t;
-    };
-    ec_kv_reserve(pos + 1);   // (before the first token's fill: it takes no slot about to be reserved)
+// The work before a token (rows 1) or a window (rows T): the cache rows they write reserved, the first one after a
+// prompt's refills, the token path's graphs, the helper's keep-alive
+void Engine::Impl::pre_step(int rows) {
+    ec_kv_reserve(pos + rows);   // (before the first token's fill: it takes no slot about to be reserved)
     if (pf_open) {   // the first token after a prompt: the prompt path's buffers lent to the cache again, and filled
         pf_open = false;
         // HY4_BG_REFILL (on): both fills in the background - the main cache's copies staged with the swaps' while the
@@ -4187,6 +4253,717 @@ const float* Engine::Impl::step(int token) {
         k::keepalive(hc.ka_ns, hc.ks);
         (void) cudaStreamQuery(hc.ks);   // (submitted now: WDDM holds launches until something does)
     }
+
+}
+
+// ------------------------------------------------------------------------------------------------ windowed decode
+// A window of T tokens a pass (step_window): the token path's work with T columns (the dense set read once), T rows
+// (per token), the attention and the indexer token by token (causal; a group a token closes pooled before the next
+// one scores), the experts of T tokens in one plan and one answer a layer.  Its own buffers, sized here for wTm.
+void Engine::Impl::win_alloc() {
+    const char* v = std::getenv("HY4_WINDOW_MAX");
+    wTm = v ? std::max(0, std::min(8, std::atoi(v))) : 6;
+    if (!dr || !hd) wTm = 0;   // (the device's routing and the helper's own work: its answer each layer)
+    if (wTm < 2) {
+        wTm = 0;
+        return;
+    }
+    const int Tm = wTm, E = g.n_embd, HC = g.hc, NL = g.n_lat, ffm = std::max(g.n_ff, g.n_ff_sh), nu = g.n_used;
+    int Hmax = 0;
+    for (const Layer& l : L) Hmax = std::max(Hmax, l.H);
+    wx = dalloc<float>((size_t) Tm * E);
+    wa = dalloc<float>((size_t) Tm * E);
+    wf = dalloc<float>((size_t) Tm * E);
+    wao = dalloc<float>((size_t) Tm * E);
+    wfo = dalloc<float>((size_t) Tm * E);
+    wR = dalloc<float>((size_t) Tm * HC * E);
+    whmix = dalloc<float>((size_t) Tm * 16);
+    whpost = dalloc<float>((size_t) Tm * 8);
+    wqa = dalloc<float>((size_t) Tm * g.q_lora);
+    wkva = dalloc<float>((size_t) Tm * 576);
+    wgh = dalloc<float>((size_t) Tm * Hmax * g.v_head);
+    wqf = dalloc<float>((size_t) Tm * Hmax * g.qk_head);
+    wqabs = dalloc<float>((size_t) Tm * Hmax * g.kv_lora);
+    wmo = dalloc<float>((size_t) Tm * Hmax * g.kv_lora);
+    wmob = dalloc<float>((size_t) Tm * Hmax * g.v_head);
+    wfg = dalloc<float>((size_t) Tm * g.n_ff);
+    wfu = dalloc<float>((size_t) Tm * g.n_ff);
+    wfh = dalloc<float>((size_t) Tm * g.n_ff);
+    wsg = dalloc<float>((size_t) Tm * g.n_ff_sh);
+    wsu = dalloc<float>((size_t) Tm * g.n_ff_sh);
+    wsh = dalloc<float>((size_t) Tm * g.n_ff_sh);
+    wso = dalloc<float>((size_t) Tm * E);
+    wlat = dalloc<float>((size_t) Tm * NL);
+    wlsum = dalloc<float>((size_t) Tm * NL);
+    wtail = dalloc<float>((size_t) 4 + (size_t) Tm * NL);
+    wlogits = dalloc<float>((size_t) Tm * g.vocab);
+    wrlog = dalloc<float>((size_t) Tm * g.n_expert);
+    const size_t ka = (size_t) std::max(E, Hmax * g.v_head), kh = (size_t) ffm,
+                 km = (size_t) std::max({g.q_lora, Hmax * g.qk_head, Hmax * g.kv_lora});
+    wxq_a = dalloc<int8_t>(Tm * ka);
+    wxd_a = dalloc<float>(Tm * ka / 32);
+    wxq_f = dalloc<int8_t>((size_t) Tm * E);
+    wxd_f = dalloc<float>((size_t) Tm * E / 32);
+    wxq_h = dalloc<int8_t>(Tm * kh);
+    wxd_h = dalloc<float>(Tm * kh / 32);
+    wxq_m = dalloc<int8_t>(Tm * km);
+    wxd_m = dalloc<float>(Tm * km / 32);
+    wxq_l = dalloc<int8_t>((size_t) Tm * NL);
+    wxd_l = dalloc<float>((size_t) Tm * NL / 32);
+    wdpos = dalloc<int>((size_t) Tm * 4);
+    wtokid = dalloc<int>((size_t) Tm);
+    wh_pos = halloc<int>((size_t) Tm * 4);
+    wh_tokid = halloc<int>((size_t) Tm);
+    wh_logits = halloc<float>((size_t) Tm * g.vocab);
+    if (embd_host) {
+        wh_erow = halloc<uint8_t>((size_t) Tm * embd.rb);
+        wd_erow = dalloc<uint8_t>((size_t) Tm * embd.rb);
+    }
+    if (!g.eg_layers.empty()) {
+        const size_t cd = (size_t) g.eg_cols * g.eg_dim;
+        weg_rows = dalloc<float>(g.eg_layers.size() * Tm * cd);
+        wh_eg = halloc<float>(g.eg_layers.size() * Tm * cd);
+        weg_y = dalloc<float>(Tm * cd);
+        wxq_e = dalloc<int8_t>(Tm * cd);
+        wxd_e = dalloc<float>(Tm * cd / 32);
+        weg_kvo = dalloc<float>((size_t) Tm * (HC + 1) * E);
+    }
+    if (max_pools > 0) {
+        const int D = g.idx_dim, NH = g.idx_heads;
+        wik = dalloc<float>((size_t) Tm * D);
+        wikn = dalloc<float>((size_t) Tm * D);
+        wiv = dalloc<float>((size_t) Tm * D);
+        wig = dalloc<float>((size_t) Tm * D);
+        wiq = dalloc<float>((size_t) Tm * NH * D);
+        wiw = dalloc<float>((size_t) Tm * NH);
+        wxq_i = dalloc<int8_t>((size_t) Tm * D);
+        wxd_i = dalloc<float>((size_t) Tm * D / 32);
+        wcell_n = (size_t) g.idx_top_k + g.idx_kpool;
+        wcells = dalloc<int>(Tm * wcell_n);
+        wncell = dalloc<int>((size_t) Tm);
+    }
+    const int ff = g.n_ff_exp;
+    wec_gu = dalloc<float>((size_t) 16 * Tm * 2 * ff);
+    wec_h = dalloc<float>((size_t) 16 * Tm * ff);
+    wec_hq = dalloc<int8_t>((size_t) 16 * Tm * ff);
+    wec_hd = dalloc<float>((size_t) 16 * Tm * ff / 32);
+    wec_y = dalloc<float>((size_t) 16 * Tm * NL);
+    wec_routed = dalloc<float>((size_t) Tm * NL);
+    wd_gptr = (const uint8_t**) dalloc<const uint8_t*>((size_t) 16 * Tm);
+    wd_sel = dalloc<int>((size_t) 16 * Tm);
+    wd_wsel = dalloc<float>((size_t) 16 * Tm);
+    wd_need = dalloc<int>(1);
+    (void) nu;
+    // plans and answers in host-mapped memory, a layer's each
+    wplan_ints = k::winplan_ints(Tm, NL);
+    wans_ints = k::winans_ints(Tm, NL);
+    const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
+    void *hp = nullptr, *ha = nullptr, *hh = nullptr;
+    if (cudaHostAlloc(&hp, (size_t) g.n_layer * wplan_ints * sizeof(int), fl) != cudaSuccess ||
+        cudaHostAlloc(&ha, (size_t) g.n_layer * wans_ints * sizeof(int), fl) != cudaSuccess ||
+        cudaHostAlloc(&hh, (size_t) g.n_layer * wans_ints * sizeof(int), fl) != cudaSuccess) {
+        cudaGetLastError();
+        wTm = 0;
+        std::fprintf(stderr, "maya-hy4: no host-mapped memory for windows: none\n");
+        return;
+    }
+    mw_plan = (int*) hp;
+    mw_ans = (int*) ha;
+    mw_hans = (int*) hh;
+    std::memset(mw_plan, 0, (size_t) g.n_layer * wplan_ints * sizeof(int));
+    std::memset(mw_ans, 0, (size_t) g.n_layer * wans_ints * sizeof(int));
+    std::memset(mw_hans, 0, (size_t) g.n_layer * wans_ints * sizeof(int));
+    CK(cudaHostGetDevicePointer((void**) &mdw_plan, mw_plan, 0));
+    CK(cudaHostGetDevicePointer((void**) &mdw_ans, mw_ans, 0));
+    CK(cudaHostGetDevicePointer((void**) &mdw_hans, mw_hans, 0));
+    if (hd) {
+        OnDev od(hc.dev);
+        CK(cudaHostGetDevicePointer((void**) &mdhw_plan, mw_plan, 0));
+        CK(cudaHostGetDevicePointer((void**) &mdhw_hans, mw_hans, 0));
+        auto dev_alloc = [&](size_t bytes) {
+            void* p = nullptr;
+            CK(cudaMalloc(&p, bytes));
+            CK(cudaMemset(p, 0, bytes));
+            hc.bytes += bytes;
+            return p;
+        };
+        hw_gu = (float*) dev_alloc((size_t) 16 * Tm * 2 * ff * sizeof(float));
+        hw_h = (float*) dev_alloc((size_t) 16 * Tm * ff * sizeof(float));
+        hw_hq = (int8_t*) dev_alloc((size_t) 16 * Tm * ff);
+        hw_hd = (float*) dev_alloc((size_t) 16 * Tm * ff / 32 * sizeof(float));
+        hw_y = (float*) dev_alloc((size_t) 16 * Tm * NL * sizeof(float));
+        hw_qq = (int8_t*) dev_alloc((size_t) Tm * NL);
+        hw_qd = (float*) dev_alloc((size_t) Tm * NL / 32 * sizeof(float));
+        hw_w = (float*) dev_alloc((size_t) 16 * Tm * sizeof(float));
+        hw_gptr = (const uint8_t**) dev_alloc((size_t) 16 * Tm * sizeof(uint8_t*));
+        hw_nh = (int*) dev_alloc(sizeof(int));
+        hw_dpos = (int*) dev_alloc((size_t) Tm * 4 * sizeof(int));
+        CK(cudaDeviceSynchronize());
+        void* p = nullptr;
+        CK(cudaHostAlloc(&p, (size_t) Tm * 4 * sizeof(int), cudaHostAllocPortable));
+        hhw_pos = (int*) p;
+    }
+    if (o.verbose)
+        std::fprintf(stderr, "maya-hy4: windows of up to %d tokens (HY4_WINDOW_MAX); their buffers at the load\n", Tm);
+}
+
+// y [T][m.n] = m x [T][m.k]: T columns of one GEMV (the matrix read once); a float matrix a column at a time
+void Engine::Impl::mvw(const DMat& m, const float* xf, const int8_t* xq, const float* xd, float* y, int T) {
+    if (is_float(m.type)) {
+        for (int t = 0; t < T; ++t)
+            k::gemv_f(m.w, m.type, m.rb, xf + (size_t) t * m.k, y + (size_t) t * m.n, m.n, m.k, s, m.bf16_of_f32);
+        return;
+    }
+    iq::MvJob j = job(m, 0, m.n, xq, xd, y);
+    j.ncol = T;
+    j.ycs = (size_t) m.n;
+    run_jobs(&j, 1);
+}
+void Engine::Impl::mvw_many(const DMat* const* ms, float* const* ys, int n, const float* xf, const int8_t* xq,
+                            const float* xd, int T) {
+    iq::MvJob jobs[8];
+    int nj = 0;
+    for (int i = 0; i < n; ++i) {
+        const DMat& m = *ms[i];
+        if (is_float(m.type)) {
+            mvw(m, xf, xq, xd, ys[i], T);
+            continue;
+        }
+        jobs[nj] = job(m, 0, m.n, xq, xd, ys[i]);
+        jobs[nj].ncol = T;
+        jobs[nj].ycs = (size_t) m.n;
+        ++nj;
+    }
+    run_jobs(jobs, nj);
+}
+
+void Engine::Impl::nww_defer(const float* a_, const float* b_, const float* w_, int T) {
+    nww_flush(T);
+    nww.a = a_;
+    nww.b = b_;
+    nww.w = w_;
+    nww.on = true;
+}
+void Engine::Impl::nww_flush(int T) {
+    if (!nww.on) return;
+    nww.on = false;
+    k::norm_write_rows(nww.a, nww.b, nww.w, g.eps, whpost, g.hc, g.n_embd, wR, T, s);
+}
+void Engine::Impl::read_norm_w(const float* fn, int nmix, const float* scale, const float* base, float* post_out,
+                               const float* wn, float* y, int8_t* q, float* d, int T) {
+    const int E = g.n_embd, HC = g.hc;
+    if (nww.on) {
+        nww.on = false;
+        if (k::hc_step(nww.a, nww.b, nww.w, whpost, g.eps, HC, E, wR, fn, nmix, scale, base, g.hc_eps, g.hc_mag, whmix,
+                       wx, post_out, wn, y, q, d, s, T))
+            return;
+        k::norm_write_rows(nww.a, nww.b, nww.w, g.eps, whpost, HC, E, wR, T, s);
+    }
+    k::hc_read_rows(wR, fn, nmix, scale, base, HC, E, g.eps, g.hc_eps, g.hc_mag, whmix, wx, post_out, T, s);
+    for (int t = 0; t < T; ++t)
+        k::norm_q8(wx + (size_t) t * E, wn, g.eps, y ? y + (size_t) t * E : nullptr, q + (size_t) t * E,
+                   d + (size_t) t * E / 32, E, s);
+}
+
+void Engine::Impl::tokw_attn(Layer& l, int T) {
+    const int E = g.n_embd, H = l.H, HC = g.hc, nope = g.qk_head - g.rope_dim;
+    if (l.eg >= 0) {
+        nww_flush(T);
+        const int cd = g.eg_cols * g.eg_dim;
+        k::eg_rows(weg_rows + (size_t) l.eg * wTm * cd, l.eg_lnorm, g.eg_cols * T, g.eg_dim, kEgEps, weg_y, wxq_e,
+                   wxd_e, s, g.eg_cols);
+        mvw(l.eg_kv, weg_y, wxq_e, wxd_e, weg_kvo, T);
+        k::eg_update_rows(weg_kvo, l.eg_kv_b, l.eg_gate, l.eg_hs, l.eg_gamma, HC, E, kEgEps, wR, T, s);
+    }
+    read_norm_w(l.hca_fn, 2 * HC, l.hca_scale, l.hca_base, whpost, l.attn_norm, wa, wxq_a, wxd_a, T);
+    {
+        const DMat* ms[5] = {&l.q_a, &l.kv_a, &l.wgate, &l.idx_k, &l.idx_proj};
+        float* ys[5] = {wqa, wkva, wgh, wik, wiw};
+        mvw_many(ms, ys, l.idx ? 5 : 3, wa, wxq_a, wxd_a, T);
+    }
+    for (int t = 0; t < T; ++t)
+        k::norm_q8(wqa + (size_t) t * g.q_lora, l.q_a_norm, g.eps, nullptr, wxq_m + (size_t) t * g.q_lora,
+                   wxd_m + (size_t) t * g.q_lora / 32, g.q_lora, s);
+    {
+        const DMat* ms[2] = {&l.q_b, &l.idx_qb};
+        float* ys[2] = {wqf, wiq};
+        mvw_many(ms, ys, l.idx ? 2 : 1, nullptr, wxq_m, wxd_m, T);
+    }
+    const int D = g.idx_dim, NH = g.idx_heads, KP = g.idx_kpool;
+    if (l.idx) {
+        k::eg_rows(wik, l.idx_knorm, T, D, g.eps, wikn, wxq_i, wxd_i, s, 1);
+        const DMat* ms[2] = {&l.idx_v, &l.idx_g};
+        float* ys[2] = {wiv, wig};
+        mvw_many(ms, ys, 2, wikn, wxq_i, wxd_i, T);
+    }
+    k::q8(wqf, T, H * g.qk_head, wxq_m, wxd_m, s);   // (q_nope's int8 rows, a token's at t H qk)
+    for (int t = 0; t < T; ++t)
+        if (!iq::mv_strided(l.k_b.type, l.k_b.w, (size_t) g.kv_lora * l.k_b.rb, l.k_b.rb, l.k_b.k, g.kv_lora, H,
+                            wxq_m + (size_t) t * H * g.qk_head, wxd_m + (size_t) t * H * g.qk_head / 32,
+                            (size_t) g.qk_head, wqabs + (size_t) t * H * g.kv_lora, (size_t) g.kv_lora, s)) {
+            std::fprintf(stderr, "maya-hy4: no strided GEMV for k_b (type %d)\n", l.k_b.type);
+            std::abort();
+        }
+    static const bool dense = std::getenv("HY4_IDX_DENSE") && std::atoi(std::getenv("HY4_IDX_DENSE")) != 0;
+    const bool sel = l.idx && !dense;
+    const size_t kvd = (size_t) l.kv_a.n;
+    // token by token: the indexer (a group closed by token t pooled before token t + 1 scores), the rope, the cache
+    // row at pos + t, the attention over the keys up to it (the int8 rows of its output where q_nope's were)
+    for (int t = 0; t < T; ++t) {
+        const int* dp = wdpos + 4 * t;
+        int* cl = wcells ? wcells + (size_t) t * wcell_n : nullptr;
+        int* nc = wncell ? wncell + t : nullptr;
+        if (l.idx) {
+            float* iqt = wiq + (size_t) t * NH * D;
+            k::idx_store(wiv + (size_t) t * D, wig + (size_t) t * D, dp, KP, D, l.idx_ring, s);
+            k::idx_pool(l.idx_ring, l.idx_ape, l.idx_pnorm, dp, KP, D, g.eps, l.theta_scale, l.idx_pooled, s);
+            k::mla_rope_q(iqt, 1, NH, D, D - g.rope_dim, 0, dp, l.theta_scale, s);
+            k::idx_score(iqt, wiw + (size_t) t * NH, l.idx_pooled, dp, KP, NH, D, 1.0f / std::sqrt((float) (D * NH)),
+                         max_pools, iscore, s);
+            k::idx_select(iscore, dp, KP, g.idx_top_k / KP - g.idx_tail, cl, nc, s);
+        }
+        float* qft = wqf + (size_t) t * H * g.qk_head;
+        k::mla_rope_q(qft, 1, H, g.qk_head, nope, 0, dp, l.theta_scale, s);
+        k::mla_kv_store(wkva + (size_t) t * kvd, l.kv_a_norm, g.eps, l.kv, 1, 0, dp, l.theta_scale, s, l.ring);
+        k::mla_decode(wqabs + (size_t) t * H * g.kv_lora, qft, g.qk_head, nope, l.kv, dp, l.swa ? g.swa_window : 0,
+                      sel ? cl : nullptr, sel ? nc : nullptr, l.sinks, H, mla_scale, attn_nsp, attn_scr,
+                      wmo + (size_t) t * H * g.kv_lora, wxq_m + (size_t) t * H * g.kv_lora,
+                      wxd_m + (size_t) t * H * g.kv_lora / 32, s, l.ring);
+    }
+    for (int t = 0; t < T; ++t)
+        if (!iq::mv_strided(l.v_b.type, l.v_b.w, (size_t) g.v_head * l.v_b.rb, l.v_b.rb, l.v_b.k, g.v_head, H,
+                            wxq_m + (size_t) t * H * g.kv_lora, wxd_m + (size_t) t * H * g.kv_lora / 32,
+                            (size_t) g.kv_lora, wmob + (size_t) t * H * g.v_head, (size_t) g.v_head, s)) {
+            std::fprintf(stderr, "maya-hy4: no strided GEMV for v_b (type %d)\n", l.v_b.type);
+            std::abort();
+        }
+    k::head_gate(wmob, wgh, H * g.v_head * T, 1, wmob, wxq_a, wxd_a, s);   // (a gate a value, as tok_attn)
+    mvw(l.wo, nullptr, wxq_a, wxd_a, wao, T);
+    nww_defer(wao, nullptr, l.post_attn, T);
+}
+
+void Engine::Impl::tokw_dense_ffn(const Layer& l, int T) {
+    const int HC = g.hc;
+    read_norm_w(l.hcf_fn, 2 * HC, l.hcf_scale, l.hcf_base, whpost, l.ffn_norm, wf, wxq_f, wxd_f, T);
+    {
+        const DMat* ms[2] = {&l.gate, &l.up};
+        float* ys[2] = {wfg, wfu};
+        mvw_many(ms, ys, 2, wf, wxq_f, wxd_f, T);
+    }
+    k::swiglu(wfg, wfu, wfh, g.n_ff * T, 0.0f, s);
+    k::q8(wfh, T, g.n_ff, wxq_h, wxd_h, s);
+    mvw(l.down, wfh, wxq_h, wxd_h, wfo, T);
+    nww_defer(wfo, nullptr, l.post_ffn, T);
+}
+
+void Engine::Impl::tokw_router(const Layer& l, int T) {
+    const int HC = g.hc;
+    read_norm_w(l.hcf_fn, 2 * HC, l.hcf_scale, l.hcf_base, whpost, l.ffn_norm, wf, wxq_f, wxd_f, T);
+    mvw(l.gate_inp, wf, wxq_f, wxd_f, wrlog, T);
+    mvw(l.lat_down, wf, wxq_f, wxd_f, wlat, T);
+    k::q8(wlat, T, g.n_lat, wxq_l, wxd_l, s);
+}
+
+void Engine::Impl::tokw_moe(const Layer& l, int il, int T) {
+    const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used, ne = g.n_expert;
+    const CpuLayer& c = l.cl;
+    k::route(wrlog, ne, l.exp_bias_d, T, ne, 1, 1, nu, g.exp_scale, wd_sel, wd_wsel, s);
+    k::moe_plan_w(wd_sel, wd_wsel, T, wTm, nu, wlat, wxq_l, wxd_l, NL, d_where + (size_t) il * ne, d_slotptr, wd_gptr,
+                  wd_need, mdw_plan + (size_t) il * wplan_ints, wdpos, s);
+    const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru;
+    auto tab = [&](int type, size_t off, size_t ld, int kk, int n, const int8_t* xq, const float* xd, size_t xs,
+                   float* y, size_t ys, const float* alpha, int nparts, size_t poff, size_t ypoff, int xdiv) {
+        if (!iq::mv_table(type, wd_gptr, off, ld, kk, n, T * nu, xq, xd, xs, y, ys, alpha, s, nparts, poff, ypoff, xdiv)) {
+            std::fprintf(stderr, "maya-hy4: no table GEMV for the experts' type %d (k %d)\n", type, kk);
+            std::abort();
+        }
+    };
+    // the main card's experts: a job a (token, choice), a token's input its latent's rows
+    if (c.tg == c.tu && c.rg == c.ru) {
+        tab(c.tg, 0, c.rg, NL, ff, wxq_l, wxd_l, (size_t) NL, wec_gu, (size_t) 2 * ff, nullptr, 2, gb, (size_t) ff, nu);
+    } else {
+        tab(c.tg, 0, c.rg, NL, ff, wxq_l, wxd_l, (size_t) NL, wec_gu, (size_t) 2 * ff, nullptr, 1, 0, 0, nu);
+        tab(c.tu, gb, c.ru, NL, ff, wxq_l, wxd_l, (size_t) NL, wec_gu + ff, (size_t) 2 * ff, nullptr, 1, 0, 0, nu);
+    }
+    k::swiglu_f32_rows(wec_gu, T * nu, ff, l.clamp_exp, wec_h, s);
+    k::q8(wec_h, T * nu, ff, wec_hq, wec_hd, s);
+    tab(c.td, gb + ub, c.rd, ff, NL, wec_hq, wec_hd, (size_t) ff, wec_y, (size_t) NL, wd_wsel, 1, 0, 0, 1);
+    for (int t = 0; t < T; ++t)
+        k::sum_rows(wec_y + (size_t) t * nu * NL, nu, NL, wec_routed + (size_t) t * NL, s);
+    // the shared expert, unclamped
+    {
+        const DMat* ms[2] = {&l.sh_gate, &l.sh_up};
+        float* ys[2] = {wsg, wsu};
+        mvw_many(ms, ys, 2, wf, wxq_f, wxd_f, T);
+    }
+    k::swiglu(wsg, wsu, wsh, g.n_ff_sh * T, 0.0f, s);
+    k::q8(wsh, T, g.n_ff_sh, wxq_h, wxd_h, s);
+    mvw(l.sh_down, wsh, wxq_h, wxd_h, wso, T);
+    k::moe_wait2_w(mdw_ans + (size_t) il * wans_ints, mdw_hans + (size_t) il * wans_ints, wd_need, wdpos, T, NL, wtail,
+                   md_diag, s);
+}
+
+void Engine::Impl::tokw_tail(const Layer& l, int T) {
+    k::lat_sum_q8(wtail + 4, wec_routed, (const int*) wtail, g.n_lat * T, wlsum, wxq_l, wxd_l, s);
+    mvw(l.lat_up, wlsum, wxq_l, wxd_l, wfo, T);
+    nww_defer(wfo, wso, l.post_ffn, T);
+}
+
+void Engine::Impl::tokw_head(int T) {
+    const int HC = g.hc;
+    read_norm_w(head_fn, HC, head_scale, head_base, nullptr, out_norm, wa, wxq_a, wxd_a, T);
+    mvw(output, wa, wxq_a, wxd_a, wlogits, T);
+    CK(cudaMemcpyAsync(wh_logits, wlogits, (size_t) T * g.vocab * sizeof(float), cudaMemcpyDeviceToHost, s));
+}
+
+void Engine::Impl::tokw_seg(int seg, int T) {
+    if (seg == g.n_layer) {
+        tokw_tail(L[(size_t) g.n_layer - 1], T);
+        tokw_head(T);
+        return;
+    }
+    if (seg == 0) {
+        if (!k::embed_rows(embd_host ? wd_erow : embd.w, embd.type, embd.rb, wtokid, T, g.n_embd, wx, s)) {
+            std::fprintf(stderr, "maya-hy4: no embedding rows for type %d\n", embd.type);
+            std::abort();
+        }
+        k::hc_init_rows(wx, g.hc, g.n_embd, wR, T, s);
+        if (eg_table)
+            CK(cudaMemcpyAsync(weg_rows, wh_eg, g.eg_layers.size() * wTm * g.eg_cols * g.eg_dim * sizeof(float),
+                               cudaMemcpyHostToDevice, s));
+        for (int il = 0; il <= g.n_dense && il < g.n_layer; ++il) {
+            Layer& l = L[(size_t) il];
+            tokw_attn(l, T);
+            if (l.dense) tokw_dense_ffn(l, T);
+            else {
+                tokw_router(l, T);
+                tokw_moe(l, il, T);
+            }
+        }
+        return;
+    }
+    Layer& l = L[(size_t) seg];
+    tokw_tail(L[(size_t) seg - 1], T);
+    tokw_attn(l, T);
+    tokw_router(l, T);
+    tokw_moe(l, seg, T);
+}
+
+// A MoE layer's window on the helper card, on hc.s (the helper current)
+void Engine::Impl::hdw_layer(const Layer& l, int il, int T) {
+    const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used, ne = g.n_expert;
+    const CpuLayer& c = l.cl;
+    const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru;
+    k::hd_plan_w(mdhw_plan + (size_t) il * wplan_ints, T, wTm, nu, NL, hd_where + (size_t) il * ne, hd_slotptr,
+                 hw_gptr, hw_w, hw_qq, hw_qd, hw_nh, hw_dpos, mdh_diag + 1, hc.s);
+    auto tab = [&](int type, size_t off, size_t ld, int kk, int n, const int8_t* xq, const float* xd, size_t xs,
+                   float* y, size_t ys, const float* alpha, int nparts, size_t poff, size_t ypoff, int xdiv) {
+        if (!iq::mv_table(type, hw_gptr, off, ld, kk, n, T * nu, xq, xd, xs, y, ys, alpha, hc.s, nparts, poff, ypoff,
+                          xdiv)) {
+            std::fprintf(stderr, "maya-hy4: no table GEMV for the experts' type %d (k %d) on the helper\n", type, kk);
+            std::abort();
+        }
+    };
+    if (c.tg == c.tu && c.rg == c.ru) {
+        tab(c.tg, 0, c.rg, NL, ff, hw_qq, hw_qd, (size_t) NL, hw_gu, (size_t) 2 * ff, nullptr, 2, gb, (size_t) ff, nu);
+    } else {
+        tab(c.tg, 0, c.rg, NL, ff, hw_qq, hw_qd, (size_t) NL, hw_gu, (size_t) 2 * ff, nullptr, 1, 0, 0, nu);
+        tab(c.tu, gb, c.ru, NL, ff, hw_qq, hw_qd, (size_t) NL, hw_gu + ff, (size_t) 2 * ff, nullptr, 1, 0, 0, nu);
+    }
+    k::swiglu_f32_rows(hw_gu, T * nu, ff, l.clamp_exp, hw_h, hc.s);
+    k::q8(hw_h, T * nu, ff, hw_hq, hw_hd, hc.s);
+    tab(c.td, gb + ub, c.rd, ff, NL, hw_hq, hw_hd, (size_t) ff, hw_y, (size_t) NL, hw_w, 1, 0, 0, 1);
+    k::hd_answer_w(hw_y, T, nu, hw_nh, NL, mdhw_hans + (size_t) il * wans_ints, hw_dpos, hc.s);
+}
+
+// Every window size's graphs, the main card's segments and the helper's layers (at the first window: the T = 1 ones
+// are made at the first token the same way, cudaStreamCaptureModeThreadLocal)
+void Engine::Impl::win_graphs() {
+    wgraphs = 0;
+    const char* v = std::getenv("HY4_GRAPHS");
+    if (v && std::atoi(v) == 0) return;
+    const double t0 = now_ms();
+    size_t f0 = 0, tot = 0, hf0 = 0, htot = 0;
+    CK(cudaMemGetInfo(&f0, &tot));
+    if (hd) {
+        OnDev od(hc.dev);
+        CK(cudaMemGetInfo(&hf0, &htot));
+    }
+    gxw.assign((size_t) wTm + 1, {});
+    hgxw.assign((size_t) wTm + 1, {});
+    bool ok = true;
+    for (int T = 2; T <= wTm && ok; ++T) {
+        auto& gx_ = gxw[(size_t) T];
+        gx_.assign((size_t) g.n_layer + 1, nullptr);
+        auto capture = [&](int seg) {
+            cudaGraph_t gr_ = nullptr;
+            if (cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return false;
+            tokw_seg(seg, T);
+            if (cudaStreamEndCapture(s, &gr_) != cudaSuccess || !gr_) return false;
+            const bool r = cudaGraphInstantiate(&gx_[(size_t) seg], gr_, 0) == cudaSuccess;
+            cudaGraphDestroy(gr_);
+            return r;
+        };
+        ok = capture(0);
+        for (int il = g.n_dense + 1; il < g.n_layer && ok; ++il) ok = capture(il);
+        ok = ok && capture(g.n_layer);
+        if (ok && hd) {
+            OnDev od(hc.dev);
+            auto& hg = hgxw[(size_t) T];
+            hg.assign((size_t) g.n_layer, nullptr);
+            for (int il = g.n_dense; il < g.n_layer && ok; ++il) {
+                cudaGraph_t gr_ = nullptr;
+                ok = cudaStreamBeginCapture(hc.s, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+                if (!ok) break;
+                hdw_layer(L[(size_t) il], il, T);
+                ok = cudaStreamEndCapture(hc.s, &gr_) == cudaSuccess && gr_ &&
+                     cudaGraphInstantiate(&hg[(size_t) il], gr_, 0) == cudaSuccess;
+                if (gr_) cudaGraphDestroy(gr_);
+            }
+        }
+    }
+    if (!ok) {
+        cudaGetLastError();
+        std::fprintf(stderr, "maya-hy4: the windows' CUDA graphs could not be made; their kernels go one by one\n");
+        for (auto& v1 : gxw)
+            for (auto& e : v1)
+                if (e) cudaGraphExecDestroy(e);
+        for (auto& v1 : hgxw)
+            for (auto& e : v1)
+                if (e) cudaGraphExecDestroy(e);
+        gxw.clear();
+        hgxw.clear();
+        return;
+    }
+    wgraphs = 1;
+    size_t f1 = 0, hf1 = 0;
+    CK(cudaMemGetInfo(&f1, &tot));
+    if (hd) {
+        OnDev od(hc.dev);
+        CK(cudaMemGetInfo(&hf1, &htot));
+    }
+    if (o.verbose)
+        std::fprintf(stderr,
+                     "maya-hy4: the windows' graphs (T = 2..%d) in %.1f s; VRAM free %.0f -> %.0f MB on the main card, "
+                     "%.0f -> %.0f MB on the helper\n",
+                     wTm, (now_ms() - t0) / 1000.0, f0 / 1048576.0, f1 / 1048576.0, hf0 / 1048576.0, hf1 / 1048576.0);
+}
+
+// A window of T tokens at pos (each fed and kept: 7a-i) -> their T x vocab logits (host), pos + T; nullptr when
+// windows are off, T is out of range or they do not fit (the caller steps), or a card gave up (failed())
+const float* Engine::Impl::step_window(const int* toks, int T) {
+    if (fault || wTm < 2 || T < 2 || T > wTm || pos + T > max_ctx) return nullptr;
+    for (int t = 0; t < T; ++t)
+        if (toks[t] < 0 || toks[t] >= g.vocab) return nullptr;
+    const double t0 = now_ms();
+    pre_step(T);
+    if (wgraphs < 0) win_graphs();
+    const int NL = g.n_lat, ne = g.n_expert, ff = g.n_ff_exp, nu = g.n_used, Tm = wTm;
+    // the tokens' rows, Engram's rows (each token's n-grams over the history and the window's tokens before it), the
+    // positions
+    if ((int) hist.size() < pos + T) hist.resize((size_t) pos + T);
+    for (int t = 0; t < T; ++t) hist[(size_t) (pos + t)] = toks[t];
+    if (embd_host) {
+        for (int t = 0; t < T; ++t)
+            std::memcpy(wh_erow + (size_t) t * embd.rb, embd.w + (size_t) toks[t] * embd.rb, embd.rb);
+        CK(cudaMemcpyAsync(wd_erow, wh_erow, (size_t) T * embd.rb, cudaMemcpyHostToDevice, s));
+    }
+    if (eg_table) {
+        const size_t cd = (size_t) g.eg_cols * g.eg_dim;
+        for (size_t e = 0; e < g.eg_layers.size(); ++e)
+            for (int t = 0; t < T; ++t) eg_row((int) e, toks[t], pos + t, wh_eg + (e * Tm + t) * cd);
+    }
+    const int seq = ++tseq;
+    for (int t = 0; t < T; ++t) {
+        wh_pos[4 * t + 0] = pos + t;
+        wh_pos[4 * t + 1] = embd_host ? t : toks[t];
+        wh_pos[4 * t + 2] = seq;
+        wh_pos[4 * t + 3] = 0;
+        wh_tokid[t] = embd_host ? t : toks[t];
+    }
+    CK(cudaMemcpyAsync(wdpos, wh_pos, (size_t) T * 4 * sizeof(int), cudaMemcpyHostToDevice, s));
+    CK(cudaMemcpyAsync(wtokid, wh_tokid, (size_t) T * sizeof(int), cudaMemcpyHostToDevice, s));
+    dr_where();
+    if (hd) {   // the helper's slots and positions, then its first MoE layer's window
+        if (hgraphs < 0) hd_graphs();
+        OnDev od(hc.dev);
+        const size_t nk = hwhere_up.size();
+        bool diff = false;
+        for (size_t i = 0; i < nk; ++i) {
+            const int v = hc.where[i] >= 0 ? hc.where[i] : -1;
+            hh_where[i] = v;
+            diff |= v != hwhere_up[i];
+        }
+        if (diff) {
+            std::memcpy(hwhere_up.data(), hh_where, nk * sizeof(int));
+            CK(cudaMemcpyAsync(hd_where, hh_where, nk * sizeof(int), cudaMemcpyHostToDevice, hc.s));
+        }
+        std::memcpy(hhw_pos, wh_pos, (size_t) T * 4 * sizeof(int));
+        CK(cudaMemcpyAsync(hw_dpos, hhw_pos, (size_t) T * 4 * sizeof(int), cudaMemcpyHostToDevice, hc.s));
+    }
+    auto hd_go = [&](int il) {
+        OnDev od(hc.dev);
+        if (wgraphs > 0) CK(cudaGraphLaunch(hgxw[(size_t) T][(size_t) il], hc.s));
+        else hdw_layer(L[(size_t) il], il, T);
+        (void) cudaStreamQuery(hc.s);
+    };
+    if (hd) hd_go(g.n_dense);
+    if (wgraphs > 0) CK(cudaGraphLaunch(gxw[(size_t) T][0], s));
+    else tokw_seg(0, T);
+    (void) cudaStreamQuery(s);
+    const double tg0 = now_ms();
+    double ms_wait = 0, ms_lane = 0;
+    long n_cpu = 0;
+    bool staging = false;
+    std::vector<int> cnt((size_t) T), csel((size_t) T * 16);
+    std::vector<float> cw((size_t) T * 16);
+    for (int il = g.n_dense; il < g.n_layer; ++il) {
+        Layer& l = L[(size_t) il];
+        volatile const int* pl = mw_plan + (size_t) il * wplan_ints;
+        const double tw = now_ms();
+        for (unsigned spin = 1; pl[0] != seq; ++spin) {
+            _mm_pause();
+            if ((spin & 0xfffu) == 0 && now_ms() - tw > 60000.0) {
+                std::fprintf(stderr, "maya-hy4: layer %d's window plan did not come in 60 s (window %d)\n", il, seq);
+                std::abort();
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        ms_wait += now_ms() - tw;
+        bool launched = false;
+        auto launch_next = [&] {
+            if (launched) return;
+            launched = true;
+            const int seg = il + 1;
+            if (wgraphs > 0) CK(cudaGraphLaunch(gxw[(size_t) T][(size_t) seg], s));
+            else tokw_seg(seg, T);
+            (void) cudaStreamQuery(s);
+            if (hd && il + 1 < g.n_layer) hd_go(il + 1);
+        };
+        // each token's choices: the scores (7a-i: every token kept), the CPU lane's in the token's order
+        int nc_all = 0, nh = 0;
+        for (int t = 0; t < T; ++t) {
+            cnt[(size_t) t] = 0;
+            for (int i = 0; i < nu; ++i) {
+                const int j = t * nu + i;
+                const int e = pl[k::kWinHead + j], sl = pl[k::kWinHead + 32 * Tm + j], wb = pl[k::kWinHead + 16 * Tm + j];
+                const size_t key = (size_t) il * ne + e;
+                ec.score[key] += 1.0f;
+                if (sl >= 0) continue;
+                if (hc.slots && hc.where[key] >= 0) {
+                    ++nh;
+                    continue;
+                }
+                float wi;
+                std::memcpy(&wi, &wb, sizeof(float));
+                csel[(size_t) t * 16 + cnt[(size_t) t]] = e;
+                cw[(size_t) t * 16 + cnt[(size_t) t]] = wi;
+                ++cnt[(size_t) t];
+                ++nc_all;
+            }
+        }
+        ec.lookups += (long) T * nu;
+        ec.hits += pl[2];
+        hc.hits += nh;
+        if (nc_all == 0) launch_next();
+        if (staging) {
+            ec_stage_end();
+            staging = false;
+        }
+        if (nc_all) {
+            const double c0 = now_ms();
+            const float* xin = (const float*) (pl + k::winplan_lat(Tm));
+            int* ans = mw_ans + (size_t) il * wans_ints;
+            float* part = (float*) (ans + k::kAnsHead);
+            lane.begin_window(*pool, l.cl, NL, ff, T, cnt.data(), csel.data(), cw.data(), xin, part);
+            launch_next();
+            lane.end();
+            std::atomic_thread_fence(std::memory_order_release);
+            ((volatile int*) ans)[0] = seq;
+            ms_lane += now_ms() - c0;
+            n_cpu += nc_all;
+        }
+        launch_next();
+        staging = ec_stage_begin(ec.piece, false);
+    }
+    if (staging) ec_stage_end();
+    const bool st4 = ec_stage_begin(4 * ec.piece, false);
+    CK(cudaStreamSynchronize(s));
+    if (st4) ec_stage_end();
+    if (hd && m_diag[1] != hdiag_seen) {
+        hdiag_seen = m_diag[1];
+        fault = true;
+        std::fprintf(stderr, "maya-hy4: the helper card gave up waiting for a window's plan (%u times so far)\n",
+                     hdiag_seen);
+    }
+    if (m_diag[0] != diag_seen) {
+        diag_seen = m_diag[0];
+        fault = true;
+        std::fprintf(stderr, "maya-hy4: the device gave up waiting for a window's answer (%u times so far)\n", diag_seen);
+    }
+    pos += T;
+    if (fault) return nullptr;
+    // the window's end: the scores decay T tokens' worth, the caches' swaps and the helper's update once
+    if (ec.slots) {
+        ec_arrive();
+        ec_fcollect(false, false);
+        const float dT = std::pow(ec.decay, (float) T);
+        for (float& v : ec.score) v *= dT;
+        const long before = ec.tok;
+        ec.tok += T;
+        if (ec.tok / ec.every != before / ec.every) ec_adapt();
+    }
+    if (hc.slots && hc.fill_left > 0) {
+        hc_update(std::min(hc.fill_left, hc.fill_batch), false, true);
+        if (hc.issued == 0 && hc.inflight == 0) hc.fill_left = 0;
+        else hc.fill_left -= hc.issued;
+    } else if (hc.slots) {
+        const long before = hc.tok;
+        hc.tok += T;
+        if (hc.tok / hc.every != before / hc.every) hc_update(hc.per, true, hc.bg);
+    }
+    const double ms = now_ms() - t0;
+    st.ms_total += ms;
+    st.ms_cpu += ms_lane;
+    st.tokens += T;
+    // (HY4_STEP_TIMES) a window's time, by its size: the whole pass, the waits for the plans (the GPUs' work), the CPU
+    // lane, and its experts
+    static const bool ptimes = std::getenv("HY4_STEP_TIMES") != nullptr;
+    if (ptimes) {
+        static double acc[9][4] = {};
+        static int nw[9] = {};
+        acc[T][0] += ms;
+        acc[T][1] += ms_wait;
+        acc[T][2] += ms_lane;
+        acc[T][3] += (double) n_cpu;
+        if (++nw[T] == 16) {
+            const double n = 16.0;
+            std::fprintf(stderr,
+                         "maya-hy4: windows of %d (16): %.2f ms a pass (%.2f a token): plan waits %.2f, CPU lane %.2f "
+                         "(%.1f experts); %.1f ms from the first launch\n",
+                         T, acc[T][0] / n, acc[T][0] / n / T, acc[T][1] / n, acc[T][2] / n, acc[T][3] / n,
+                         now_ms() - tg0);
+            nw[T] = 0;
+            for (double& v : acc[T]) v = 0;
+        }
+    }
+    return wh_logits;
+}
+
+const float* Engine::Impl::step(int token) {
+    if (fault || pos >= max_ctx || token < 0 || token >= g.vocab) return nullptr;   // (fault: failed() until reset())
+    const double t0 = now_ms();
+    double cpu_ms = 0.0;
+    const int NL = g.n_lat;
+    static const bool ptimes = std::getenv("HY4_STEP_TIMES") != nullptr;
+    double tp = t0;
+    auto phase = [&](double& acc) {
+        if (!ptimes) return;
+        const double t = now_ms();
+        acc += t - tp;
+        tp = t;
+    };
+    pre_step(1);
 
     // the token's row (to d_erow, decoded by segment 0), its Engram rows (h_eg, copied up by segment 0), the position
     // and the row's index on the device

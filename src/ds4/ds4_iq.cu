@@ -1770,6 +1770,7 @@ struct TabJob {
     size_t poff, ypoff;   // (part p = blockIdx.y / nj: the matrix at off + p poff, its outputs at y + p ypoff)
     const uint8_t* wbase;   // (wp null: job j's matrix at wbase + j wstride - mv_strided)
     size_t wstride;
+    int xdiv;   // (job j's input is input j / xdiv: 1 its own)
 };
 template <int T>
 __global__ void __launch_bounds__(kThreads) mv_table_kernel(const TabJob J) {
@@ -1789,8 +1790,8 @@ __global__ void __launch_bounds__(kThreads) mv_table_kernel(const TabJob J) {
     }
     const uint8_t* w = base + J.off + (size_t) part * J.poff + (size_t) row * J.ld;
     const int nsb = J.k / 32;
-    const int8_t* xq = J.xq + (size_t) j * J.xs;
-    const float* xd = J.xd + (size_t) j * (J.xs / 32);
+    const int8_t* xq = J.xq + (size_t) (j / J.xdiv) * J.xs;
+    const float* xd = J.xd + (size_t) (j / J.xdiv) * (J.xs / 32);
     float acc = 0.0f;
     for (int kb = lane; kb < nsb; kb += 32) {
         Sub sb;
@@ -2405,11 +2406,11 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
 
 bool mv_table(int type, const uint8_t* const* wp, size_t off, size_t ld, int k, int n, int nj, const int8_t* xq,
               const float* xd, size_t xs, float* y, size_t ys, const float* alpha, cudaStream_t s, int nparts,
-              size_t poff, size_t ypoff) {
+              size_t poff, size_t ypoff, int xdiv) {
     if (nj < 1 || nparts < 1 || (long) nj * nparts > 65535 || n < 1 || block_bytes(type) == 0 ||
         k % block_values(type) != 0 || xs % 32 != 0)
         return false;
-    const TabJob J{wp, off, ld, k, n, nj, xq, xd, xs, y, ys, alpha, poff, ypoff, nullptr, 0};
+    const TabJob J{wp, off, ld, k, n, nj, xq, xd, xs, y, ys, alpha, poff, ypoff, nullptr, 0, std::max(1, xdiv)};
     const dim3 grid((unsigned) ((n + kWarps - 1) / kWarps), (unsigned) (nj * nparts));
 #define MT_(T) pdl_launch(mv_table_kernel<T>, grid, kThreads, 0, s, J)
     DS4_IQ_SWITCH_MV(type, MT_)
@@ -2422,7 +2423,7 @@ bool mv_strided(int type, const uint8_t* w, size_t wstride, size_t ld, int k, in
     if (nj < 1 || nj > 65535 || n < 1 || w == nullptr || block_bytes(type) == 0 || k % block_values(type) != 0 ||
         xs % 32 != 0)
         return false;
-    const TabJob J{nullptr, 0, ld, k, n, nj, xq, xd, xs, y, ys, nullptr, 0, 0, w, wstride};
+    const TabJob J{nullptr, 0, ld, k, n, nj, xq, xd, xs, y, ys, nullptr, 0, 0, w, wstride, 1};
     const dim3 grid((unsigned) ((n + kWarps - 1) / kWarps), (unsigned) nj);
 #define MT_(T) pdl_launch(mv_table_kernel<T>, grid, kThreads, 0, s, J)
     DS4_IQ_SWITCH_MV(type, MT_)

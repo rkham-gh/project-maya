@@ -166,7 +166,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s);
 /// same type and rows), their outputs at y + p ypoff (an expert's gate and up in one launch).
 bool mv_table(int type, const uint8_t* const* wp, size_t off, size_t ld, int k, int n, int nj, const int8_t* xq,
               const float* xd, size_t xs, float* y, size_t ys, const float* alpha, cudaStream_t s, int nparts = 1,
-              size_t poff = 0, size_t ypoff = 0);
+              size_t poff = 0, size_t ypoff = 0, int xdiv = 1);   // (xdiv: job j reads input j / xdiv)
 /// mv_table's jobs on regularly placed matrices: job j's at w + j wstride (one matrix's row blocks a head, say), its
 /// input xq + j xs (scales xd + j xs / 32), its outputs y + j ys.  The same sums as mv's one-column jobs.
 bool mv_strided(int type, const uint8_t* w, size_t wstride, size_t ld, int k, int n, int nj, const int8_t* xq,

@@ -74,6 +74,10 @@ public:
     /// One token at pos(): the next token's logits (host memory, geo().vocab values), pos + 1.  nullptr when pos() is
     /// at max_ctx().
     const float* step(int token);
+    /// T tokens at pos() in one pass (windowed decode, 2 <= T <= window_max()): their T x vocab logits (host memory,
+    /// token t's at t vocab), pos + T.  nullptr: windows off, T out of range, not fitting (step them), or failed().
+    const float* step_window(const int* toks, int T);
+    int window_max() const;   // (HY4_WINDOW_MAX, 6; 0: no windows)
     /// n tokens at pos() as one prompt: the logits after the last one (as step()), pos + n.  nullptr when they do not
     /// fit before max_ctx().  progress (when set) is called as they go, with the tokens read so far.
     const float* prefill(const int* ids, int n, void (*progress)(void*, int) = nullptr, void* ctx = nullptr);

@@ -60,10 +60,27 @@ class CpuLane {
 public:
     void begin(Pool& pool, const CpuLayer& L, int n_embd, int n_ff, const int* experts, const float* w, int n,
                const float* x, float* out);
+    /// A window of T tokens (windowed decode): token t's cnt[t] experts experts[t * 16 + k] (weights w[..]), its input
+    /// x + t n_embd, its sum out + t n_embd (0 where it has none).  Each distinct expert read once: gate / up jobs an
+    /// (expert, band) over every token that chose it, then down jobs a band - each expert's rows for all its tokens,
+    /// each token's sum in its own order (the single token's).  end() as for begin().
+    void begin_window(Pool& pool, const CpuLayer& L, int n_embd, int n_ff, int T, const int* cnt, const int* experts,
+                      const float* w, const float* x, float* out);
     void end();
 
 private:
     void job(int j);
+    void job_w(int j);
+    static constexpr int kWMax = 16 * 8;   // (a window's entries at most: 16 a token, 8 tokens)
+    // the window's: T, per token its entries' count and first entry; per distinct expert u its id, entries and their
+    // tokens; entry -> its weight
+    int wT_ = 0, wU_ = 0;
+    int wcnt_[8] = {}, wfirst_[8] = {};
+    int wexp_[kWMax] = {}, wn_[kWMax] = {}, went_[kWMax][8] = {}, wtok_[kWMax][8] = {};
+    int wentu_[kWMax] = {};   // (entry -> its distinct expert)
+    float ww_[kWMax] = {};
+    std::vector<uint8_t> wag_, wau_;   // [T] activations of x
+    std::atomic<int> wdone_[kWMax];
     static constexpr int kMax = 16;
     Pool* pool_ = nullptr;
     const CpuLayer* L_ = nullptr;

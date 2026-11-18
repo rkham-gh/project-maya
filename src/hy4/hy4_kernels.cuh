@@ -249,7 +249,37 @@ void hd_answer(const float* y, int nu, const int* nh, int nl, int* hans, const i
 /// norm_q8(x, wn, eps, y, q, d, n) in one launch, the same bits (false, nothing launched: a shape it does not take).
 bool hc_step(const float* a, const float* b, const float* wpost, const float* post_in, float eps, int hc, int n,
              float* R, const float* fn, int nmix, const float* scale, const float* base, float hc_eps, float mag,
-             float* mix, float* x, float* post_out, const float* wn, float* y, int8_t* q, float* d, cudaStream_t s);
+             float* mix, float* x, float* post_out, const float* wn, float* y, int8_t* q, float* d, cudaStream_t s,
+             int T = 1);   // (T tokens: a block each - a, b, x, y, q rows of n, R [T][hc][n], post [T][hc], mix [T][16])
+
+// ------------------------------------------------------------------------------------------------ a window's routing
+/// A window's plan (T <= Tm tokens, one sequence number), ints: [0] the sequence number once the rest is there, [1] T,
+/// [2] the choices on the main card; from kWinHead the choices [Tm][16]: experts, then weights (float bits) at + 16 Tm,
+/// then main-card slots (-1: not there) at + 32 Tm; the latents F32 [Tm][nl] at winplan_lat, their int8 rows
+/// [Tm][nl] and scales [Tm][nl / 32] after.  An answer: [0] the sequence number, [1] the helper's count, the sums
+/// [Tm][nl] (F32) from kAnsHead.
+constexpr int kWinHead = 64;
+#ifdef __CUDACC__
+__host__ __device__
+#endif
+inline size_t winplan_lat(int Tm) { return ((size_t) kWinHead + 48 * (size_t) Tm + 15) & ~(size_t) 15; }
+inline size_t winplan_ints(int Tm, int nl) {
+    return (winplan_lat(Tm) + (size_t) Tm * nl + (size_t) Tm * nl / 4 + (size_t) Tm * nl / 32 + 63) & ~(size_t) 63;
+}
+inline size_t winans_ints(int Tm, int nl) { return ((size_t) kAnsHead + (size_t) Tm * nl + 63) & ~(size_t) 63; }
+/// moe_plan for a window: T tokens' nu choices each (sel, w [T][nu]), their latents (lat, xq, xd [T][nl..]).
+void moe_plan_w(const int* sel, const float* w, int T, int Tm, int nu, const float* lat, const int8_t* xq,
+                const float* xd, int nl, const int* where, const uint8_t* const* slotptr, const uint8_t** gptr,
+                int* need, int* plan, const int* dpos, cudaStream_t s);
+/// moe_wait2 for a window: tail + 4 + t nl = the host's sum (0 where it has none) + the helper's (0 likewise).
+void moe_wait2_w(const int* ans, const int* hans, const int* need, const int* dpos, int T, int nl, float* tail,
+                 unsigned* diag, cudaStream_t s);
+/// hd_plan for a window: the choices not on the main card that the helper holds, their weights, the int8 rows [T].
+void hd_plan_w(const int* plan, int T, int Tm, int nu, int nl, const int* where, const uint8_t* const* slotptr,
+               const uint8_t** gptr, float* w, int8_t* xq, float* xd, int* nh, const int* dpos, unsigned* diag,
+               cudaStream_t s);
+/// hd_answer for a window: each token's nu rows of y [T nu][nl] summed in order into the answer [T][nl].
+void hd_answer_w(const float* y, int T, int nu, const int* nh, int nl, int* hans, const int* dpos, cudaStream_t s);
 
 /// The decode attention's kernel chosen, at the load (HY4_MLA_TC=0: the FP32 one): true, the tensor cores'.
 bool mla_init();

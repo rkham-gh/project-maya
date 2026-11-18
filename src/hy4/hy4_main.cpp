@@ -314,6 +314,10 @@ int main(int argc, char** argv) {
         const int steps = follow.empty() ? n_gen : (int) follow.size();
         // (HY4_LOGITS_DUMP=<file>: every position's logits appended, F32 [vocab] each - a KL check's input)
         static FILE* ldump = std::getenv("HY4_LOGITS_DUMP") ? std::fopen(std::getenv("HY4_LOGITS_DUMP"), "wb") : nullptr;
+        // (HY4_RUNS_WINDOW=<T>, a check of windowed decode: a follow fed T tokens a pass - the same lines as one by one)
+        static const int rwin = std::getenv("HY4_RUNS_WINDOW") ? std::atoi(std::getenv("HY4_RUNS_WINDOW")) : 0;
+        std::vector<float> wbuf;
+        int wleft = 0;   // (positions of the window's logits still to print)
         for (int n = 0; n < steps && lg; ++n) {
             if (ldump) std::fwrite(lg, sizeof(float), (size_t) V, ldump);
             std::vector<int> idx((size_t) V);
@@ -331,6 +335,23 @@ int main(int argc, char** argv) {
             std::printf("\n");
             std::fflush(stdout);
             if (follow.empty() && pick == eos) break;
+            if (wleft > 0) {   // (the window's next position)
+                lg += V;
+                --wleft;
+                continue;
+            }
+            const int W = !follow.empty() && rwin >= 2 ? std::min(rwin, steps - n) : 1;
+            if (W >= 2 && W <= eng.window_max()) {
+                const float* lw = eng.step_window(follow.data() + n, W);
+                if (!lw) {
+                    lg = nullptr;
+                    break;
+                }
+                wbuf.assign(lw, lw + (size_t) W * V);
+                lg = wbuf.data();
+                wleft = W - 1;
+                continue;
+            }
             lg = eng.step(pick);
         }
         if (ldump) std::fflush(ldump);

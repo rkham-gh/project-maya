@@ -170,7 +170,7 @@ void CpuLane::begin(Pool& pool, const CpuLayer& L, int n_embd, int n_ff, const i
     if (!one_act_) dg::iq_cpu_quant(L.act_u, x, n_embd, au_.data());
     bands_gu_ = (n_ff + kRowsGU - 1) / kRowsGU;
     bands_d_ = (n_embd + kRowsD - 1) / kRowsD;
-    if (!fn_) fn_ = [this](int j) { job(j); };
+    fn_ = [this](int j) { job(j); };
     pool.start(n_ * bands_gu_ + bands_d_, &fn_);
 }
 
@@ -220,6 +220,136 @@ void CpuLane::job(int j) {
     for (int i = 0; i < n_; ++i) {
         const float* oi = o_.data() + (size_t) i * n_embd;
         for (int c = r0; c < r1; ++c) out_[c] += w_[i] * oi[c];
+    }
+}
+
+void CpuLane::begin_window(Pool& pool, const CpuLayer& L, int n_embd, int n_ff, int T, const int* cnt,
+                           const int* experts, const float* w, const float* x, float* out) {
+    pool_ = &pool;
+    L_ = &L;
+    n_embd_ = n_embd;
+    n_ff_ = n_ff;
+    out_ = out;
+    wT_ = std::min(T, 8);
+    // the entries in token order (token t's in its order), the distinct experts in order of first use
+    int ne = 0;
+    wU_ = 0;
+    for (int t = 0; t < wT_; ++t) {
+        wcnt_[t] = std::min(cnt[t], 16);
+        wfirst_[t] = ne;
+        for (int k = 0; k < wcnt_[t]; ++k, ++ne) {
+            const int e = experts[t * 16 + k];
+            ww_[ne] = w[t * 16 + k];
+            int u = 0;
+            while (u < wU_ && wexp_[u] != e) ++u;
+            if (u == wU_) {
+                wexp_[u] = e;
+                wn_[u] = 0;
+                ++wU_;
+            }
+            went_[u][wn_[u]] = ne;
+            wtok_[u][wn_[u]] = t;
+            ++wn_[u];
+            wentu_[ne] = u;
+        }
+    }
+    n_ = ne;
+    for (int t = 0; t < wT_; ++t)
+        if (wcnt_[t] == 0) std::fill(out + (size_t) t * n_embd, out + (size_t) (t + 1) * n_embd, 0.0f);
+    if (ne == 0) {
+        pool_ = nullptr;
+        return;
+    }
+    for (int u = 0; u < wU_; ++u) wdone_[u].store(0, std::memory_order_relaxed);
+    ready_.store(0, std::memory_order_relaxed);
+    same_ = L.tg == L.tu && L.act_g == L.act_u;
+    one_act_ = L.act_g == L.act_u;
+    wag_.resize((size_t) wT_ * L.ab_g);
+    wau_.resize((size_t) wT_ * L.ab_u);
+    h_.resize((size_t) kWMax * n_ff * 2);
+    o_.resize((size_t) kWMax * n_embd);
+    hq_.resize((size_t) kWMax * L.ab_d);
+    for (int t = 0; t < wT_; ++t) {
+        if (wcnt_[t] == 0) continue;
+        dg::iq_cpu_quant(L.act_g, x + (size_t) t * n_embd, n_embd, wag_.data() + (size_t) t * L.ab_g);
+        if (!one_act_) dg::iq_cpu_quant(L.act_u, x + (size_t) t * n_embd, n_embd, wau_.data() + (size_t) t * L.ab_u);
+    }
+    bands_gu_ = (n_ff + kRowsGU - 1) / kRowsGU;
+    bands_d_ = (n_embd + kRowsD - 1) / kRowsD;
+    fn_ = [this](int j) { job_w(j); };
+    pool.start(wU_ * bands_gu_ + bands_d_, &fn_);
+}
+
+void CpuLane::job_w(int j) {
+    const CpuLayer& L = *L_;
+    const int n_ff = n_ff_, n_embd = n_embd_;
+    if (j < wU_ * bands_gu_) {
+        // gate / up: rows [r0, r1) of distinct expert u for every token that chose it
+        const int u = j / bands_gu_, r0 = (j % bands_gu_) * kRowsGU, r1 = std::min(n_ff, r0 + kRowsGU);
+        const size_t e = (size_t) wexp_[u];
+        const int nt = wn_[u];
+        const void* act[8];
+        const void* actu[8];
+        float* hi[8];
+        float* ui[8];
+        for (int k = 0; k < nt; ++k) {
+            const int t = wtok_[u][k], en = went_[u][k];
+            act[k] = wag_.data() + (size_t) t * L.ab_g;
+            actu[k] = one_act_ ? act[k] : wau_.data() + (size_t) t * L.ab_u;
+            hi[k] = h_.data() + (size_t) en * n_ff;
+            ui[k] = h_.data() + (size_t) (kWMax + en) * n_ff;
+        }
+        if (same_) {
+            dg::iq_cpu_gate_up(L.fmt, L.gate + e * n_ff * L.rg, L.up + e * n_ff * L.ru, act, nt, hi, r0, r1, L.limit);
+        } else {
+            dg::iq_cpu_rows(L.tg, L.gate + e * n_ff * L.rg, L.rg, n_embd, act, nt, hi, r0, r1);
+            dg::iq_cpu_rows(L.tu, L.up + e * n_ff * L.ru, L.ru, n_embd, actu, nt, ui, r0, r1);
+            const float lim = L.limit;
+            for (int k = 0; k < nt; ++k)
+                for (int r = r0; r < r1; ++r) {
+                    float g = hi[k][r], uu = ui[k][r];
+                    if (lim > 0.0f) {
+                        g = std::fmin(g, lim);
+                        uu = std::fmin(std::fmax(uu, -lim), lim);
+                    }
+                    hi[k][r] = g / (1.0f + std::exp(-g)) * uu;
+                }
+        }
+        // the expert's last band: its entries' h as the down rows' activations
+        if (wdone_[u].fetch_add(1, std::memory_order_acq_rel) == bands_gu_ - 1) {
+            for (int k = 0; k < nt; ++k) {
+                const int en = went_[u][k];
+                dg::iq_cpu_quant(L.act_d, h_.data() + (size_t) en * n_ff, n_ff, hq_.data() + (size_t) en * L.ab_d);
+            }
+            ready_.fetch_add(1, std::memory_order_acq_rel);
+        }
+        return;
+    }
+    // down: rows [r0, r1) of every distinct expert for all its entries, then each token's weighted sum in its order
+    const int b = j - wU_ * bands_gu_, r0 = b * kRowsD, r1 = std::min(n_embd, r0 + kRowsD);
+    while (ready_.load(std::memory_order_acquire) < wU_) HY4_PAUSE();
+    for (int u = 0; u < wU_; ++u) {
+        const size_t e = (size_t) wexp_[u];
+        const int nt = wn_[u];
+        const void* act[8];
+        float* oi[8];
+        for (int k = 0; k < nt; ++k) {
+            const int en = went_[u][k];
+            act[k] = hq_.data() + (size_t) en * L.ab_d;
+            oi[k] = o_.data() + (size_t) en * n_embd;
+        }
+        dg::iq_cpu_rows(L.td, L.down + e * n_embd * L.rd, L.rd, n_ff, act, nt, oi, r0, r1);
+    }
+    for (int t = 0; t < wT_; ++t) {
+        if (wcnt_[t] == 0) continue;
+        float* ot = out_ + (size_t) t * n_embd;
+        for (int c = r0; c < r1; ++c) ot[c] = 0.0f;
+        for (int k = 0; k < wcnt_[t]; ++k) {
+            const int en = wfirst_[t] + k;
+            const float* oe = o_.data() + (size_t) en * n_embd;
+            const float wk = ww_[en];
+            for (int c = r0; c < r1; ++c) ot[c] += wk * oe[c];
+        }
     }
 }
 
