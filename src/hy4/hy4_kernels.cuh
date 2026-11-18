@@ -250,6 +250,9 @@ bool hc_step(const float* a, const float* b, const float* wpost, const float* po
 
 /// The decode attention's kernel chosen, at the load (HY4_MLA_TC=0: the FP32 one): true, the tensor cores'.
 bool mla_init();
+/// (HY4_MLA_QMAX=1) the largest |q| the tensor cores' kernel has seen so far: the 512 (out[0]) and the rope part
+/// (out[1]); false: not recorded.
+bool mla_qmax(float* out);
 
 /// (--selftest) nothing yet; true.
 bool selftest();

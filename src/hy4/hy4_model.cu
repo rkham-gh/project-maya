@@ -4277,6 +4277,10 @@ const float* Engine::Impl::step(int token) {
                      pblock, pt.embed / n, pt.att / n, pt.route / n, pt.glaunch / n, pt.cpu / n, pt.cpu_experts / n,
                      pt.cpu_experts ? pt.cpu / pt.cpu_experts : 0.0, pt.tail / n, pt.head / n, pt.adapt / n,
                      (pt.embed + pt.att + pt.route + pt.glaunch + pt.cpu + pt.tail + pt.head + pt.adapt) / n);
+        float qm[2];
+        if (k::mla_qmax(qm))
+            std::fprintf(stderr, "maya-hy4:   (HY4_MLA_QMAX: the largest |q| so far: %.1f in the 512, %.1f in the rope "
+                         "part; F16 holds 65,504 x 16)\n", qm[0], qm[1]);
         std::fprintf(stderr,
                      "maya-hy4:   (caches: main %zu copies to come, %ld copies so far; helper %d on the way + %d of a "
                      "fill to release, %ld copies so far)\n",

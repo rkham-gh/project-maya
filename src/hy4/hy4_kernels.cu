@@ -11,6 +11,7 @@
 #include <functional>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -571,7 +572,8 @@ __global__ void __launch_bounds__(kTcThreads) mla_decode_tc_kernel(const float* 
                                                                    const int* __restrict__ dpos, int win,
                                                                    const int* __restrict__ cells,
                                                                    const int* __restrict__ ncell, int ring, int nsp,
-                                                                   float scale, float* __restrict__ part, int smin) {
+                                                                   float scale, float* __restrict__ part, int smin,
+                                                                   unsigned* qmax) {
 #if __CUDA_ARCH__ >= 800
     using namespace nvcuda;
     extern __shared__ __align__(128) unsigned char smb[];
@@ -598,12 +600,25 @@ __global__ void __launch_bounds__(kTcThreads) mla_decode_tc_kernel(const float* 
             v[i] = d < kMlaV ? *reinterpret_cast<const float4*>(qa + (size_t) h * kMlaV + d)
                              : *reinterpret_cast<const float4*>(qf + (size_t) h * qk + nope + (d - kMlaV));
         }
+        // (scaled before F16: the scores need it anyway, and |q| gets 16x the headroom under F16's 65,504)
 #pragma unroll
         for (int i = 0; i < kPer; ++i) {
             const int x = (t + i * kTcThreads) * 4, hl = x / kMlaD, d = x % kMlaD;
             __half2* q2 = reinterpret_cast<__half2*>(qs + (size_t) hl * kQS + d);
-            q2[0] = __floats2half2_rn(v[i].x, v[i].y);
-            q2[1] = __floats2half2_rn(v[i].z, v[i].w);
+            q2[0] = __floats2half2_rn(v[i].x * scale, v[i].y * scale);
+            q2[1] = __floats2half2_rn(v[i].z * scale, v[i].w * scale);
+        }
+        if (qmax) {   // (HY4_MLA_QMAX: the largest |q|, the 512 and the rope part apart - positive floats order as ints)
+            float m0 = 0.0f, m1 = 0.0f;
+#pragma unroll
+            for (int i = 0; i < kPer; ++i) {
+                const int d = ((t + i * kTcThreads) * 4) % kMlaD;
+                const float m = fmaxf(fmaxf(fabsf(v[i].x), fabsf(v[i].y)), fmaxf(fabsf(v[i].z), fabsf(v[i].w)));
+                if (d < kMlaV) m0 = fmaxf(m0, m);
+                else m1 = fmaxf(m1, m);
+            }
+            atomicMax(qmax, __float_as_uint(m0));
+            atomicMax(qmax + 1, __float_as_uint(m1));
         }
     }
     for (int x = t * 4; x < kMlaHG * kMlaV; x += kTcThreads * 4)
@@ -646,7 +661,7 @@ __global__ void __launch_bounds__(kTcThreads) mla_decode_tc_kernel(const float* 
         // the online softmax: warp w the heads 4 w .. 4 w + 3 (a key a lane)
         for (int hl = 4 * warp; hl < 4 * warp + 4; ++hl) {
             const float* sh = sc + (size_t) hl * kTcTile;
-            const float v0 = lane < nk ? sh[lane] * scale : -INFINITY;
+            const float v0 = lane < nk ? sh[lane] : -INFINITY;   // (the queries came scaled)
             const float mx = warp_max(v0);
             const float m_old = mrow[hl], m_new = fmaxf(m_old, mx);
             const float p0 = lane < nk ? __expf(v0 - m_new) : 0.0f;
@@ -1028,9 +1043,20 @@ void mla_kv_store(const float* kva, const float* w, float eps, __half* cache, in
 int mla_nsp(int rows) { return std::max(128, (rows + 1023) / 1024); }
 // (mla_init, at the load: the tensor cores' kernel and its shared memory, outside any graph capture)
 static bool g_mla_tc = false;
+static unsigned* g_mla_qmax = nullptr;   // (HY4_MLA_QMAX=1: the largest |q| seen, [2] on the device)
+bool mla_qmax(float* out) {
+    if (!g_mla_qmax) return false;
+    unsigned u[2] = {0, 0};
+    if (cudaMemcpy(u, g_mla_qmax, sizeof u, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    std::memcpy(out, u, sizeof u);
+    return true;
+}
 bool mla_init() {
     const char* v = std::getenv("HY4_MLA_TC");
     g_mla_tc = false;
+    if (const char* qm = std::getenv("HY4_MLA_QMAX"))
+        if (std::atoi(qm) != 0 && cudaMalloc((void**) &g_mla_qmax, 2 * sizeof(unsigned)) == cudaSuccess)
+            cudaMemset(g_mla_qmax, 0, 2 * sizeof(unsigned));
     if (v && std::atoi(v) == 0) return false;
     int dev = 0, major = 0;
     if (cudaGetDevice(&dev) != cudaSuccess ||
@@ -1060,7 +1086,8 @@ void mla_decode(const float* qa, const float* qf, int qk, int nope, const __half
     }();
     if (g_mla_tc)
         mla_decode_tc_kernel<<<dim3(nsp, H / kMlaHG), kTcThreads, kTcSmem, s>>>(qa, qf, qk, nope, cache, dpos, win, cells,
-                                                                                ncell, ring, nsp, scale, scratch, smin);
+                                                                                ncell, ring, nsp, scale, scratch, smin,
+                                                                                g_mla_qmax);
     else
         mla_decode_kernel<<<dim3(nsp, H / kMlaHG), kMlaThreads, smem, s>>>(qa, qf, qk, nope, cache, dpos, win, cells,
                                                                            ncell, ring, nsp, scale, scratch, smin);
