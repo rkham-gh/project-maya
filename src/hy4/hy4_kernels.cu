@@ -398,11 +398,11 @@ __global__ void mla_rope_q_kernel(float* __restrict__ q, int H, int qk, int nope
 // grid T, block 256
 __global__ void mla_kv_store_kernel(const float* __restrict__ kva, const float* __restrict__ w, float eps,
                                     __half* __restrict__ cache, int pos0, const int* __restrict__ dpos,
-                                    float theta_scale) {
+                                    float theta_scale, int ring) {
     const int t = blockIdx.x, tid = threadIdx.x;
     const int pos = (dpos ? *dpos : pos0) + t;
     const float* r = kva + (size_t) t * 576;
-    __half* dst = cache + (size_t) pos * 576;
+    __half* dst = cache + (size_t) (ring > 0 ? pos % ring : pos) * 576;
     const float a0 = r[tid], a1 = r[tid + 256];
     const float ss = block_sum(a0 * a0 + a1 * a1);
     const float sc = rsqrtf(ss / 512.0f + eps);
@@ -431,7 +431,7 @@ __global__ void __launch_bounds__(kMlaThreads) mla_decode_kernel(const float* __
                                                                  const __half* __restrict__ cache,
                                                                  const int* __restrict__ dpos, int win,
                                                                  const int* __restrict__ cells,
-                                                                 const int* __restrict__ ncell, int nsp,
+                                                                 const int* __restrict__ ncell, int ring, int nsp,
                                                                  float scale, float* __restrict__ part) {
     extern __shared__ float sm[];
     const int split = blockIdx.x, hg = blockIdx.y, t = threadIdx.x;
@@ -439,7 +439,7 @@ __global__ void __launch_bounds__(kMlaThreads) mla_decode_kernel(const float* __
     const int n = cells ? *ncell : n_kv - j_lo, S = mla_split_keys(n, nsp);
     const int j0 = split * S, j1 = min(n, j0 + S);
     if (j0 >= n) return;   // (a split past the keys: the combine reads only those before)
-    auto row = [&](int j) { return cells ? cells[j] : j_lo + j; };
+    auto row = [&](int j) { return cells ? cells[j] : ring > 0 ? (j_lo + j) % ring : j_lo + j; };
     float* qs = sm;                           // [HG][576]
     float* sc = qs + kMlaHG * kMlaD;          // [HG][tile]
     float* mrow = sc + kMlaHG * kMlaTile;     // [HG] the running max
@@ -840,17 +840,17 @@ void mla_rope_q(float* q, int T, int H, int qk, int nope, int pos0, const int* d
     if (T > 0) mla_rope_q_kernel<<<T * H, 32, 0, s>>>(q, H, qk, nope, pos0, dpos, theta_scale);
 }
 void mla_kv_store(const float* kva, const float* w, float eps, __half* cache, int T, int pos0, const int* dpos,
-                  float theta_scale, cudaStream_t s) {
-    if (T > 0) mla_kv_store_kernel<<<T, 256, 0, s>>>(kva, w, eps, cache, pos0, dpos, theta_scale);
+                  float theta_scale, cudaStream_t s, int ring) {
+    if (T > 0) mla_kv_store_kernel<<<T, 256, 0, s>>>(kva, w, eps, cache, pos0, dpos, theta_scale, ring);
 }
 int mla_nsp(int rows) { return std::max(128, (rows + 1023) / 1024); }
 size_t mla_scratch_floats(int H, int nsp) { return (size_t) H * nsp * (kMlaV + 2); }
 void mla_decode(const float* qa, const float* qf, int qk, int nope, const __half* cache, const int* dpos, int win,
                 const int* cells, const int* ncell, const float* sinks, int H, float scale, int nsp, float* scratch,
-                float* out, int8_t* oq, float* od, cudaStream_t s) {
+                float* out, int8_t* oq, float* od, cudaStream_t s, int ring) {
     const size_t smem = ((size_t) kMlaHG * kMlaD + (size_t) kMlaHG * kMlaTile + 3 * kMlaHG) * sizeof(float);   // 41 KB
     mla_decode_kernel<<<dim3(nsp, H / kMlaHG), kMlaThreads, smem, s>>>(qa, qf, qk, nope, cache, dpos, win, cells, ncell,
-                                                                       nsp, scale, scratch);
+                                                                       ring, nsp, scale, scratch);
     mla_combine_kernel<<<H, kMlaV, 0, s>>>(scratch, nsp, dpos, win, cells ? ncell : nullptr, sinks, out, oq, od);
 }
 void head_gate(const float* x, const float* g, int H, int hd, float* y, int8_t* q, float* dq, cudaStream_t s) {

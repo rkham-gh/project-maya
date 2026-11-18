@@ -143,8 +143,8 @@ struct Layer {
     // the gated MLA
     DMat q_a, q_b, kv_a, k_b, v_b, wgate, wo;   // k_b: H x 512 rows of 192 (q_nope -> the cache's 512); v_b: H x 256 of 512
     float *q_a_norm = nullptr, *kv_a_norm = nullptr;
-    __half* kv = nullptr;   // the cache: kv_rows rows of 576 (F16)
-    int kv_rows = 0;
+    __half* kv = nullptr;   // the cache: kv_rows rows of 576 (F16); a sliding-window layer's a ring (ring rows)
+    int kv_rows = 0, ring = 0;
     // the indexer (the sparse layers): its key and query projections, the key's norm, the heads' weights (F32), the
     // pooling's value and gate projections, position embedding [kpool][dim] and norm; the open group's value | gate
     // rows (ring [kpool][2 dim]) and the complete groups' pooled keys (pooled [max_ctx / kpool][dim])
@@ -169,7 +169,9 @@ struct Layer {
     float clamp_exp = 0.0f;
 };
 
-constexpr float kEgEps = 1.1920929e-07f;   // (Engram's norms: the fp32 machine epsilon, as the reference)
+constexpr float kEgEps = 1.1920929e-07f;
+// the sliding-window layers' cache rows: the window and room past it (the prompt path's chunks will need more)
+constexpr int kSwaRing = 1024;   // (Engram's norms: the fp32 machine epsilon, as the reference)
 
 struct Engine::Impl {
     Options o;
@@ -213,6 +215,7 @@ struct Engine::Impl {
     int8_t* xq_i = nullptr;
     float* xd_i = nullptr;
     float* snap_ring = nullptr;
+    uint8_t* snap_kv = nullptr;   // the sliding-window layers' rings at snap_pos
     int max_pools = 0;
     // host (pinned)
     float *h_f = nullptr, *h_rlog = nullptr, *h_tail = nullptr, *h_logits = nullptr, *h_eg = nullptr;
@@ -681,6 +684,13 @@ bool Engine::snapshot() {
             CK(cudaMemcpyAsync(at, l.idx_ring, ring, cudaMemcpyDeviceToDevice, m.s));
             at += ring;
         }
+    // (and the sliding-window layers' rings: the rows the window still reads are written again past the snapshot)
+    at = (uint8_t*) m.snap_kv;
+    for (const Layer& l : m.L)
+        if (l.ring) {
+            CK(cudaMemcpyAsync(at, l.kv, (size_t) l.ring * 576 * sizeof(__half), cudaMemcpyDeviceToDevice, m.s));
+            at += (size_t) l.ring * 576 * sizeof(__half);
+        }
     CK(cudaStreamSynchronize(m.s));
     m.snap_pos = m.pos;
     return true;
@@ -695,6 +705,12 @@ bool Engine::restore() {
         if (l.idx) {
             CK(cudaMemcpyAsync(l.idx_ring, at, ring, cudaMemcpyDeviceToDevice, m.s));
             at += ring;
+        }
+    at = (const uint8_t*) m.snap_kv;
+    for (Layer& l : m.L)
+        if (l.ring) {
+            CK(cudaMemcpyAsync(l.kv, at, (size_t) l.ring * 576 * sizeof(__half), cudaMemcpyDeviceToDevice, m.s));
+            at += (size_t) l.ring * 576 * sizeof(__half);
         }
     CK(cudaStreamSynchronize(m.s));
     m.pos = m.snap_pos;
@@ -973,7 +989,10 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
             return false;
         // (the sparse layers' attention is dense for now: the indexer's selection comes next, and below its top_k
         //  tokens of context it keeps every one anyway)
-        l.kv_rows = max_ctx;
+        // a sliding-window layer reads only its last swa_window rows: a ring of kSwaRing rows (position p in row
+        // p % kSwaRing), not a row for every position - 30 layers x 1.1 KB a token of VRAM the expert cache keeps
+        l.ring = l.swa ? kSwaRing : 0;
+        l.kv_rows = l.swa ? kSwaRing : max_ctx;
         l.kv = dalloc<__half>((size_t) l.kv_rows * 576);
         if (l.idx) {
             const int D = g.idx_dim, NH = g.idx_heads, KP = g.idx_kpool;
@@ -1107,6 +1126,11 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
         eg_kvo = dalloc<float>((size_t) (HC + 1) * E);
     }
     hist.reserve((size_t) max_ctx);
+    {
+        size_t rb = 0;
+        for (const Layer& l : L) rb += (size_t) l.ring * 576 * sizeof(__half);
+        if (rb) snap_kv = dalloc<uint8_t>(rb);
+    }
     {
         int n_idx = 0;
         for (const Layer& l : L) n_idx += l.idx;
@@ -1323,6 +1347,7 @@ void Engine::Impl::ec_alloc() {
     if (base && (!kvv || std::atoi(kvv) != 0)) {
         const size_t b = ec.cls_bytes[(size_t) ec.lend_cls], row = (size_t) 576 * sizeof(__half);
         for (const Layer& l : L) {
+            if (l.ring) continue;
             const size_t bytes = (size_t) l.kv_rows * row;
             for (size_t end = bytes; end >= b && end - b >= (size_t) kKvSlack * row; end -= b) {
                 ec.ptr.push_back((uint8_t*) l.kv + (end - b));
@@ -2310,12 +2335,12 @@ void Engine::Impl::tok_attn(Layer& l) {
         }
     }
     k::mla_rope_q(qf, 1, H, g.qk_head, nope, 0, dpos, l.theta_scale, s);
-    k::mla_kv_store(kva, l.kv_a_norm, g.eps, l.kv, 1, 0, dpos, l.theta_scale, s);
+    k::mla_kv_store(kva, l.kv_a_norm, g.eps, l.kv, 1, 0, dpos, l.theta_scale, s, l.ring);
     // (HY4_IDX_DENSE=1: the sparse layers attend to every key, the indexer's choice ignored - a check of what it does)
     static const bool dense = std::getenv("HY4_IDX_DENSE") && std::atoi(std::getenv("HY4_IDX_DENSE")) != 0;
     const bool sel = l.idx && !dense;
     k::mla_decode(qabs, qf, g.qk_head, nope, l.kv, dpos, l.swa ? g.swa_window : 0, sel ? cells : nullptr,
-                  sel ? ncell : nullptr, l.sinks, H, mla_scale, attn_nsp, attn_scr, mo, xq_m, xd_m, s);
+                  sel ? ncell : nullptr, l.sinks, H, mla_scale, attn_nsp, attn_scr, mo, xq_m, xd_m, s, l.ring);
     {
         // v_b a head: the 512 -> v_head
         iq::MvJob j[64];

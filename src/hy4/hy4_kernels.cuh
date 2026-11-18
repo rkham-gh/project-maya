@@ -95,10 +95,12 @@ void kda_out(const float* o, const float* gr, const float* w, float eps, int T, 
 /// RoPE (ggml's NORM: pairs (2i, 2i + 1), theta = pos theta_scale^i) on q [T][H][qk]'s 64 values from nope on, in
 /// place, pos = (dpos ? *dpos : pos0) + t.
 void mla_rope_q(float* q, int T, int H, int qk, int nope, int pos0, const int* dpos, float theta_scale, cudaStream_t s);
+/// (ring > 0: the cache is a ring of that many rows, position p in row p % ring - mla_kv_store's and mla_decode's
+/// sliding-window layers.)
 /// The cache rows of T tokens: kva [T][576] -> cache[pos][0:512] = F16(rmsnorm(kva[0:512]) w), [512:576] =
 /// F16(rope(kva[512:576])), pos = (dpos ? *dpos : pos0) + t.
 void mla_kv_store(const float* kva, const float* w, float eps, __half* cache, int T, int pos0, const int* dpos,
-                  float theta_scale, cudaStream_t s);
+                  float theta_scale, cudaStream_t s, int ring = 0);
 /// The decode attention's splits (a fixed grid: the position read on the device).
 int mla_nsp(int rows);
 size_t mla_scratch_floats(int H, int nsp);
@@ -107,7 +109,7 @@ size_t mla_scratch_floats(int H, int nsp);
 /// added to the softmax's sum; out [H][512] F32 and its int8 rows (oq, od: q8's over the row of H 512, null: none).
 void mla_decode(const float* qa, const float* qf, int qk, int nope, const __half* cache, const int* dpos, int win,
                 const int* cells, const int* ncell, const float* sinks, int H, float scale, int nsp, float* scratch,
-                float* out, int8_t* oq, float* od, cudaStream_t s);
+                float* out, int8_t* oq, float* od, cudaStream_t s, int ring = 0);
 /// y[h][d] = x[h][d] sigmoid(g[h]) (rows of hd, H heads) and its int8 rows (q, d; null: none), y F32 (may be x).
 void head_gate(const float* x, const float* g, int H, int hd, float* y, int8_t* q, float* dq, cudaStream_t s);
 /// (the prompt path) the same for T rows [T][H][hd] with gates [T][H], into F16.
