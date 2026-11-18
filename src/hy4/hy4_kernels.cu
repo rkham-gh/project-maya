@@ -984,6 +984,107 @@ __global__ void __launch_bounds__(1024) norm_write_kernel(const float* __restric
         for (int i = 0; i < hc; ++i) R[(size_t) i * n + c] = fmaf(p[i], y, R[(size_t) i * n + c]);
     }
 }
+
+// ------------------------------------------------------------------------------------------------ a fused boundary
+// One sublayer's end and the next one's start in one block of 1024 (the token path): norm_write (y = rmsnorm(a + b) w,
+// R_i += post_i y), hc_read's mixes (hc_mix: nmix dots of fn's rows with R over hc n, each scaled by R's rms), its read
+// (x = sum_i pre_i R_i, the next post weights) and norm_q8 of x - each phase's sums in its own kernel's order (its
+// threads' loops, its block_sum's two stages: 1024 threads for norm_write, 256 for a mix as hc_mix's blocks, 256 for
+// norm_q8), so the same bits as the four launches.  n a multiple of 1024 and of 256 x kPerT at most; hc <= 8; nmix
+// <= 16.
+__device__ __forceinline__ float group_sum(float v, float* part, int g, int wid, int lane) {   // 256-thread block_sum
+    v = warp_sum(v);
+    if (lane == 0) part[g * 8 + wid] = v;
+    __syncthreads();
+    float t = lane < 8 ? part[g * 8 + lane] : 0.0f;
+    t = warp_sum(t);
+    __syncthreads();
+    return t;
+}
+__global__ void __launch_bounds__(1024) hc_step_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                                                       const float* __restrict__ wpost, const float* post_in, float eps,
+                                                       int hc, int n, float* R, const float* __restrict__ fn, int nmix,
+                                                       const float* __restrict__ scale, const float* __restrict__ base,
+                                                       float hc_eps, float mag, float* __restrict__ mix, float* x,
+                                                       float* post_out, const float* __restrict__ wn, float* y,
+                                                       int8_t* __restrict__ q, float* __restrict__ d) {
+    __shared__ float part[32];
+    __shared__ float s_mix[16];
+    __shared__ float s_sc;
+    const int t = threadIdx.x, lane = t & 31, g = t >> 8, tt = t & 255, gw = (t >> 5) & 7;
+    // norm_write (its 1024 threads, its order); the post weights read before this kernel writes the next ones
+    float p[8];
+    for (int i = 0; i < hc; ++i) p[i] = post_in[i];
+    {
+        float ss = 0.0f;
+        for (int c = t; c < n; c += blockDim.x) {
+            const float v = a[c] + (b ? b[c] : 0.0f);
+            ss = fmaf(v, v, ss);
+        }
+        ss = block_sum(ss);
+        const float sc = rsqrtf(ss / (float) n + eps);
+        for (int c = t; c < n; c += blockDim.x) {
+            const float yv = (a[c] + (b ? b[c] : 0.0f)) * sc * wpost[c];
+            for (int i = 0; i < hc; ++i) R[(size_t) i * n + c] = fmaf(p[i], yv, R[(size_t) i * n + c]);
+        }
+    }
+    __syncthreads();
+    // hc_mix: group g takes mixes g, g + 4, ..; each its kernel's 256-thread loop and block_sum
+    const int m = hc * n;
+    for (int r0 = 0; r0 < nmix; r0 += 4) {
+        const int r = r0 + g;
+        float dot = 0.0f, ss = 0.0f;
+        if (r < nmix) {
+            const float* w = fn + (size_t) r * m;
+            for (int c = tt; c < m; c += 256) {
+                const float rv = R[c];
+                dot = fmaf(w[c], rv, dot);
+                ss = fmaf(rv, rv, ss);
+            }
+        }
+        __shared__ float gpart[32];
+        dot = group_sum(dot, gpart, g, gw, lane);
+        ss = group_sum(ss, gpart, g, gw, lane);
+        if (tt == 0 && r < nmix) s_mix[r] = dot * rsqrtf(ss / (float) m + eps);
+    }
+    __syncthreads();
+    // hc_read: the pre weights, the next post weights, x
+    float pre[8];
+    for (int i = 0; i < hc; ++i) pre[i] = sigmoidf_(s_mix[i] * scale[0] + base[i]) + hc_eps;
+    if (post_out && t < hc) post_out[t] = sigmoidf_(s_mix[hc + t] * scale[1] + base[hc + t]) * mag + hc_eps;
+    if (t < nmix) mix[t] = s_mix[t];
+    for (int c = t; c < n; c += blockDim.x) {
+        float v = 0.0f;
+        for (int i = 0; i < hc; ++i) v = fmaf(pre[i], R[(size_t) i * n + c], v);
+        x[c] = v;
+    }
+    __syncthreads();
+    // norm_q8: its sum of squares in its 256 threads' order (group 0), then every thread its values' int8 rows (a warp
+    // 32 consecutive ones, as there)
+    if (g == 0) {
+        const int per = n / 256;
+        float ss = 0.0f;
+        for (int k = 0; k < per; ++k) {
+            const float xc = x[tt + 256 * k];
+            ss += xc * xc;
+        }
+        ss = warp_sum(ss);
+        if (lane == 0) part[gw] = ss;
+    }
+    __syncthreads();
+    if (t < 32) {
+        float v = lane < 8 ? part[lane] : 0.0f;
+        v = warp_sum(v);
+        if (t == 0) s_sc = rsqrtf(v / (float) n + eps);
+    }
+    __syncthreads();
+    const float sc = s_sc;
+    for (int c = t; c < n; c += blockDim.x) {
+        const float av = x[c] * sc * wn[c];
+        if (y) y[c] = av;
+        warp_q8(av, q + c, d + c / 32);
+    }
+}
 // grid n / 256: R_i = x for every stream (the embedding into the hc streams)
 __global__ void hc_init_kernel(const float* __restrict__ x, int hc, int n, float* __restrict__ R) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1062,6 +1163,14 @@ void hc_read(const float* R, const float* fn, int nmix, const float* scale, cons
 void norm_write(const float* a, const float* b, const float* w, float eps, const float* post, int hc, int n, float* R,
                 cudaStream_t s) {
     norm_write_kernel<<<1, 1024, 0, s>>>(a, b, w, eps, post, hc, n, R);
+}
+bool hc_step(const float* a, const float* b, const float* wpost, const float* post_in, float eps, int hc, int n,
+             float* R, const float* fn, int nmix, const float* scale, const float* base, float hc_eps, float mag,
+             float* mix, float* x, float* post_out, const float* wn, float* y, int8_t* q, float* d, cudaStream_t s) {
+    if (n % 1024 != 0 || n / 256 > kPerT || hc > 8 || nmix > 16 || 2 * hc > 16) return false;
+    hc_step_kernel<<<1, 1024, 0, s>>>(a, b, wpost, post_in, eps, hc, n, R, fn, nmix, scale, base, hc_eps, mag, mix, x,
+                                     post_out, wn, y, q, d);
+    return true;
 }
 void hc_init(const float* x, int hc, int n, float* R, cudaStream_t s) {
     hc_init_kernel<<<blocks(n, 256), 256, 0, s>>>(x, hc, n, R);

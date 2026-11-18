@@ -242,6 +242,12 @@ void hd_plan(const int* plan, int nu, int nl, const int* where, const uint8_t* c
 /// the sequence number dpos[2] last.
 void hd_answer(const float* y, int nu, const int* nh, int nl, int* hans, const int* dpos, cudaStream_t s);
 
+/// norm_write(a, b, wpost, eps, post_in, hc, n, R), then hc_read(R, fn, nmix, scale, base, ..., mix, x, post_out) and
+/// norm_q8(x, wn, eps, y, q, d, n) in one launch, the same bits (false, nothing launched: a shape it does not take).
+bool hc_step(const float* a, const float* b, const float* wpost, const float* post_in, float eps, int hc, int n,
+             float* R, const float* fn, int nmix, const float* scale, const float* base, float hc_eps, float mag,
+             float* mix, float* x, float* post_out, const float* wn, float* y, int8_t* q, float* d, cudaStream_t s);
+
 /// (--selftest) nothing yet; true.
 bool selftest();
 

@@ -243,6 +243,16 @@ struct Engine::Impl {
     void dr_alloc();
     void dr_where();
     void tok_moe(const Layer& l, int il);
+    // A sublayer's post-norm write held back (nw) until the next read of the streams, which takes it in one launch
+    // (k::hc_step: HY4_HC_FUSE, on); nw_flush writes it on its own (something else reads R first: Engram)
+    struct NW {
+        const float *a = nullptr, *b = nullptr, *w = nullptr;
+        bool on = false;
+    } nw;
+    void nw_defer(const float* a_, const float* b_, const float* w_);
+    void nw_flush();
+    void read_norm(const float* fn, int nmix, const float* scale, const float* base, float* post_out, const float* wn,
+                   float* y, int8_t* q, float* d);
     void step_dr(double& cpu_ms, double& tp);
     // ... and the helper card's experts from its own queued work (hd_alloc): its slots for every key (hwhere, as
     // where), their pointers, a layer's choices there, weights, latent and count, the position; its answers in
@@ -3373,13 +3383,13 @@ void Engine::Impl::eg_fill(int token) {
 void Engine::Impl::tok_attn(Layer& l) {
     const int E = g.n_embd, H = l.H, HC = g.hc, nope = g.qk_head - g.rope_dim;
     if (l.eg >= 0) {
+        nw_flush();   // (Engram changes the streams before their read)
         const int cd = g.eg_cols * g.eg_dim;
         k::eg_rows(eg_rows_d + (size_t) l.eg * cd, l.eg_lnorm, g.eg_cols, g.eg_dim, kEgEps, eg_y, xq_e, xd_e, s);
         mv(l.eg_kv, eg_y, xq_e, xd_e, eg_kvo);
         k::eg_update(eg_kvo, l.eg_kv_b, l.eg_gate, l.eg_hs, l.eg_gamma, HC, E, kEgEps, R, s);
     }
-    k::hc_read(R, l.hca_fn, 2 * HC, l.hca_scale, l.hca_base, HC, E, g.eps, g.hc_eps, g.hc_mag, hmix, x, hpost, s);
-    k::norm_q8(x, l.attn_norm, g.eps, a, xq_a, xd_a, E, s);
+    read_norm(l.hca_fn, 2 * HC, l.hca_scale, l.hca_base, hpost, l.attn_norm, a, xq_a, xd_a);
     {
         const DMat* ms[5] = {&l.q_a, &l.kv_a, &l.wgate, &l.idx_k, &l.idx_proj};
         float* ys[5] = {qa, kva, gh, ik, iw};
@@ -3443,14 +3453,46 @@ void Engine::Impl::tok_attn(Layer& l) {
     }
     k::head_gate(mob, gh, H * g.v_head, 1, mob, xq_a, xd_a, s);   // (the gate a value: sigmoid(W_gate a) elementwise)
     mv(l.wo, nullptr, xq_a, xd_a, ao);
-    k::norm_write(ao, nullptr, l.post_attn, g.eps, hpost, HC, E, R, s);
+    nw_defer(ao, nullptr, l.post_attn);
+}
+
+void Engine::Impl::nw_defer(const float* a_, const float* b_, const float* w_) {
+    static const bool fuse = !(std::getenv("HY4_HC_FUSE") && std::atoi(std::getenv("HY4_HC_FUSE")) == 0);
+    if (!fuse) {
+        k::norm_write(a_, b_, w_, g.eps, hpost, g.hc, g.n_embd, R, s);
+        return;
+    }
+    nw_flush();
+    nw.a = a_;
+    nw.b = b_;
+    nw.w = w_;
+    nw.on = true;
+}
+void Engine::Impl::nw_flush() {
+    if (!nw.on) return;
+    nw.on = false;
+    k::norm_write(nw.a, nw.b, nw.w, g.eps, hpost, g.hc, g.n_embd, R, s);
+}
+// The streams' read (hc_read: nmix mixes, the next post weights into post_out unless null) and its norm's int8 rows;
+// with a held-back write, all in one launch
+void Engine::Impl::read_norm(const float* fn, int nmix, const float* scale, const float* base, float* post_out,
+                             const float* wn, float* y, int8_t* q, float* d) {
+    const int E = g.n_embd, HC = g.hc;
+    if (nw.on) {
+        nw.on = false;
+        if (k::hc_step(nw.a, nw.b, nw.w, hpost, g.eps, HC, E, R, fn, nmix, scale, base, g.hc_eps, g.hc_mag, hmix, x,
+                       post_out, wn, y, q, d, s))
+            return;
+        k::norm_write(nw.a, nw.b, nw.w, g.eps, hpost, HC, E, R, s);
+    }
+    k::hc_read(R, fn, nmix, scale, base, HC, E, g.eps, g.hc_eps, g.hc_mag, hmix, x, post_out, s);
+    k::norm_q8(x, wn, g.eps, y, q, d, E, s);
 }
 
 // The dense layer's FFN (no clamp), its post-norm written back to the streams
 void Engine::Impl::tok_dense_ffn(const Layer& l) {
-    const int E = g.n_embd, HC = g.hc;
-    k::hc_read(R, l.hcf_fn, 2 * HC, l.hcf_scale, l.hcf_base, HC, E, g.eps, g.hc_eps, g.hc_mag, hmix, x, hpost, s);
-    k::norm_q8(x, l.ffn_norm, g.eps, f, xq_f, xd_f, E, s);
+    const int HC = g.hc;
+    read_norm(l.hcf_fn, 2 * HC, l.hcf_scale, l.hcf_base, hpost, l.ffn_norm, f, xq_f, xd_f);
     {
         const DMat* ms[2] = {&l.gate, &l.up};
         float* ys[2] = {fg, fu};
@@ -3459,16 +3501,15 @@ void Engine::Impl::tok_dense_ffn(const Layer& l) {
     k::swiglu(fg, fu, fh, g.n_ff, 0.0f, s);
     k::q8(fh, 1, g.n_ff, xq_h, xd_h, s);
     mv(l.down, fh, xq_h, xd_h, fo);
-    k::norm_write(fo, nullptr, l.post_ffn, g.eps, hpost, HC, E, R, s);
+    nw_defer(fo, nullptr, l.post_ffn);
 }
 
 // A MoE layer's router: f = rmsnorm(the streams' read) and its int8 rows (the shared expert's and the latent
 // projection's input), the logits (F32 router), the latent l = routed_down f and its int8 rows (the VRAM experts'
 // input); l and the logits to the host.
 void Engine::Impl::tok_router(const Layer& l) {
-    const int E = g.n_embd, HC = g.hc;
-    k::hc_read(R, l.hcf_fn, 2 * HC, l.hcf_scale, l.hcf_base, HC, E, g.eps, g.hc_eps, g.hc_mag, hmix, x, hpost, s);
-    k::norm_q8(x, l.ffn_norm, g.eps, f, xq_f, xd_f, E, s);
+    const int HC = g.hc;
+    read_norm(l.hcf_fn, 2 * HC, l.hcf_scale, l.hcf_base, hpost, l.ffn_norm, f, xq_f, xd_f);
     mv(l.gate_inp, f, xq_f, xd_f, rlog);
     mv(l.lat_down, f, xq_f, xd_f, lat);
     k::q8(lat, 1, g.n_lat, xq_l, xd_l, s);
@@ -3483,14 +3524,13 @@ void Engine::Impl::tok_tail(const Layer& l) {
     if (!dr) CK(cudaMemcpyAsync(d_tail, h_tail, tail_bytes(), cudaMemcpyHostToDevice, s));   // (else moe_wait's)
     k::lat_sum_q8(d_tail + 4, ec.routed, (const int*) d_tail, g.n_lat, lsum, xq_l, xd_l, s);
     mv(l.lat_up, lsum, xq_l, xd_l, fo);
-    k::norm_write(fo, so, l.post_ffn, g.eps, hpost, g.hc, g.n_embd, R, s);
+    nw_defer(fo, so, l.post_ffn);
 }
 
 // The output head: the streams' read (pre only), the norm, the logits to the host
 void Engine::Impl::tok_head() {
-    const int E = g.n_embd, HC = g.hc;
-    k::hc_read(R, head_fn, HC, head_scale, head_base, HC, E, g.eps, g.hc_eps, g.hc_mag, hmix, x, nullptr, s);
-    k::norm_q8(x, out_norm, g.eps, a, xq_a, xd_a, E, s);
+    const int HC = g.hc;
+    read_norm(head_fn, HC, head_scale, head_base, nullptr, out_norm, a, xq_a, xd_a);
     mv(output, a, xq_a, xd_a, logits);
     CK(cudaMemcpyAsync(h_logits, logits, (size_t) g.vocab * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
@@ -3723,6 +3763,11 @@ void Engine::Impl::dr_alloc() {
     if (!dr) return;
     const int NL = g.n_lat;
     const size_t nk = (size_t) g.n_layer * g.n_expert;
+    if (NL % 128 != 0) {   // (the plan's 16-byte copies of the int8 rows and scales: nl / 16 and nl / 128 pieces)
+        std::fprintf(stderr, "maya-hy4: the latent's width %d is not a multiple of 128: the host routes\n", NL);
+        dr = false;
+        return;
+    }
     plan_ints = k::plan_ints(NL);
     ans_ints = ((size_t) k::kAnsHead + NL + 63) & ~(size_t) 63;
     const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
