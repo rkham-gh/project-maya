@@ -590,7 +590,10 @@ struct Engine::Impl {
         long lookups = 0, hits = 0, copies = 0, tok = 0;
         float decay = 0.99f, margin = 1.5f;
         int every = 2, per = 16;
-        int prompt = 0;   // how a prompt chunk's choices count (HY4_CACHE_PROMPT; pf_score)
+        // how a prompt chunk's choices count (HY4_CACHE_PROMPT; pf_score).  2: on the written tokens' scale, the layer's
+        // scores decayed as T tokens would - raw counts (0) leave ~1,000 an expert after 32K against decode's ~1 a token,
+        // and the cache cannot swap for hundreds of tokens (the review's meas-v4: 32K 20.0 -> 18.0 ms a token)
+        int prompt = 2;
         float *gu = nullptr, *h = nullptr, *y = nullptr, *routed = nullptr, *hd = nullptr;
         int8_t* hq = nullptr;
         cudaEvent_t copied = nullptr;
