@@ -441,6 +441,21 @@ struct Engine::Impl {
         int *h_ids = nullptr, *h_cnt = nullptr, *h_off = nullptr;
         uint8_t* Erows = nullptr;
         double copy_bytes = 0, copy_ms = 0, moe_ms = 0, attn_ms = 0;
+        // Hy4's: the hc streams [C][hc][E], the second output (the shared expert's), the hc mixes and posts, the latent
+        // rows (in, out, F32 and F16), Engram's piece (rows F32 from h_egr, normed, F16, projected), the attention's
+        // piece, the indexer's (keys, values, gates, weights, queries, the choice's bits and sel_on, the scoring tile)
+        float *R = nullptr, *Y2 = nullptr, *MIX = nullptr, *POST = nullptr, *LAT = nullptr, *YL = nullptr;
+        __half *LATh = nullptr, *YLh = nullptr;
+        float *EGR = nullptr, *EGY = nullptr, *KVO = nullptr, *h_egr = nullptr;
+        __half* EGYh = nullptr;
+        float *QA = nullptr, *KVA = nullptr, *GATE = nullptr, *Q = nullptr, *OB = nullptr;
+        __half *QAh = nullptr, *QH = nullptr, *Qcat = nullptr, *O16 = nullptr, *OBh = nullptr, *Kbuf = nullptr;
+        float *IK = nullptr, *IKN = nullptr, *IV = nullptr, *IG = nullptr, *IW = nullptr, *IQ = nullptr, *IA = nullptr,
+              *IS = nullptr;
+        __half* IKNh = nullptr;
+        unsigned* bits = nullptr;
+        int *sel_on = nullptr, *icells = nullptr;
+        int nwords = 0, top_pools = 0, tqi = 1;
     } pf;
     // The experts' copies to the GPU: the CPU lane's threads copy into two pinned buffers in turn and the DMA takes each
     // from there (the driver's own staging of pageable memory moved 4-15 GB/s on this machine; this held ~14 for
@@ -463,6 +478,9 @@ struct Engine::Impl {
     void pf_kda(Layer& l, int T);
     void pf_mla(Layer& l, int T, int pos0);
     void pf_dense(const Layer& l, int T);
+    void pf_index(Layer& l, const float* A_, const __half* Ah_, int T, int p0);
+    void pf_attn(Layer& l, const float* A_, const __half* Ah_, int T, int p0, float* Y_);
+    void eg_row(int e, int token, int p, float* dst) const;
     void pf_moe(const Layer& l, int T);
     void chunk(const int* ids, int T, bool want_logits);
     const float* prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx);
@@ -2189,12 +2207,133 @@ bool Engine::Impl::load_profile(const std::string& path) {
 }
 
 // ------------------------------------------------------------------------------------------------ the prompt path
-// The prompt path is the token path for now (a prompt's tokens one at a time); what the expert cache uses of its
-// buffers is made here: the copy stream and the pinned staging.  (maya-ling's chunked prompt path - the dense matrices
-// through cuBLAS, the routed experts streamed to the GPU - is the next step: src/ling/ling_model.cu's pf_*.)
+// ------------------------------------------------------------------------------------------------ the prompt path
+// A chunk of up to C tokens a layer at a time on the GPU (maya-ling's): the dense matrices decoded to F16 and
+// multiplied by cuBLAS (F32 sums); the hc streams' reads and writes, the norms and the Engram rows row by row; a layer's
+// attention in pieces of `sub` tokens - the sliding-window layers' keys gathered from their ring with the piece's own
+// into one buffer, the sparse layers' over their whole cache with the indexer's choice as a mask (its pooled keys made
+// for the groups the piece ends, each token's top 511 groups by an F32 GEMM of its queries against them); the scores'
+// softmax with the window / choice, the causal mask and each head's sink; the router in F32; the routed experts in the
+// latent width - each one some token of the chunk chose copied to a VRAM slot (the copy stream, `stage` slots ahead),
+// decoded to F16 and multiplied for its tokens, its output added to theirs times their weights, expert by expert in id
+// order - then routed_up, the shared expert on the full width, the sum post-normed into the streams.
 bool Engine::Impl::pf_alloc(std::string& err) {
-    (void) err;
+    const int Cn = pf.C = std::max(64, o.chunk);
+    pf.Ca = std::max(16, std::min(o.sub, Cn));
+    const int Ca = pf.Ca, E = g.n_embd, HC = g.hc, NL = g.n_lat, ne = g.n_expert, nu = g.n_used;
+    const int ffe = g.n_ff_exp, ffd = g.n_ff, ffs = g.n_ff_sh, ql = g.q_lora, QK = g.qk_head, V = g.v_head;
+    const int Hm = *std::max_element(g.n_head.begin(), g.n_head.end()), nope = QK - g.rope_dim;
+    const int cd = g.eg_cols * g.eg_dim, D = g.idx_dim, NH = g.idx_heads, KP = std::max(1, g.idx_kpool);
+    if (cublasCreate(&pf.cb) != CUBLAS_STATUS_SUCCESS) {
+        err = "cuBLAS did not start";
+        return false;
+    }
+    cublasSetStream(pf.cb, s);
     CK(cudaStreamCreateWithFlags(&pf.cs, cudaStreamNonBlocking));
+    const size_t CE = (size_t) Cn * E;
+    size_t mib = 768;
+    if (const char* v = std::getenv("HY4_SCORES_MIB")) mib = (size_t) std::max(64, std::atoi(v));
+    pf.s_elems = (mib << 20) / 6;   // S F32 and P F16
+    pf.w1_elems = std::max({(size_t) 2 * ffd * E, (size_t) 2 * ffe * NL, (size_t) 2 * ffs * E, (size_t) Hm * V * E,
+                            (size_t) Hm * QK * ql, (size_t) Hm * 512 * nope, (size_t) Hm * V * 512,
+                            (size_t) (HC + 1) * E * std::max(cd, 1), (size_t) NL * E, (size_t) NH * D * ql});
+    pf.w2_elems = std::max({(size_t) ffd * E, (size_t) ffe * NL, (size_t) ffs * E});
+    for (const Layer& l : L)
+        if (!l.dense) pf.slot_bytes = std::max(pf.slot_bytes, expert_bytes((int) (&l - L.data())));
+    pf.GE = std::max(1, std::min(ne, o.stage));
+    pf.nwords = (max_pools + 31) / 32;
+    pf.top_pools = g.idx_kpool ? g.idx_top_k / KP - g.idx_tail : 0;
+    // the indexer's scoring tile: tokens whose [heads][pools] scores take at most HY4_IDX_MIB (256 MB)
+    size_t imib = 256;
+    if (const char* v = std::getenv("HY4_IDX_MIB")) imib = (size_t) std::max(16, std::atoi(v));
+    pf.tqi = max_pools ? (int) std::max<size_t>(1, std::min<size_t>(Ca, (imib << 20) / ((size_t) NH * max_pools * 4)))
+                       : 1;
+    const size_t gu_cols = (size_t) std::max(ffe, ffs) * 2;
+    // Every buffer in one arena (none holds anything from one prompt to the next, so the expert cache can borrow it,
+    // and each is written before it is read): the same list twice, first its size, then its pointers, 256-byte aligned.
+    for (int pass = 0; pass < 2; ++pass) {
+        size_t at = 0;
+        auto carve = [&](auto*& ptr, size_t n) {
+            using T = std::remove_reference_t<decltype(*ptr)>;
+            if (pass == 1) ptr = (T*) (pf.arena + at);
+            at += (n * sizeof(T) + 255) & ~(size_t) 255;
+        };
+        carve(pf.ids, (size_t) Cn);
+        carve(pf.R, (size_t) Cn * HC * E);
+        carve(pf.X, CE);
+        carve(pf.A, CE);
+        carve(pf.Y, CE);
+        carve(pf.Y2, CE);
+        carve(pf.Ah, CE);
+        carve(pf.MIX, (size_t) Cn * 2 * HC);
+        carve(pf.POST, (size_t) Cn * HC);
+        carve(pf.RL, (size_t) Cn * ne);
+        carve(pf.sel, (size_t) Cn * nu);
+        carve(pf.wts, (size_t) Cn * nu);
+        carve(pf.cnt, (size_t) ne);
+        carve(pf.off, (size_t) ne);
+        carve(pf.list, (size_t) Cn * nu);
+        carve(pf.wl, (size_t) Cn * nu);
+        carve(pf.LAT, (size_t) Cn * NL);
+        carve(pf.LATh, (size_t) Cn * NL);
+        carve(pf.YL, (size_t) Cn * NL);
+        carve(pf.YLh, (size_t) Cn * NL);
+        carve(pf.Xe, (size_t) Cn * NL);
+        carve(pf.Ye, (size_t) Cn * std::max(E, NL));
+        carve(pf.GU, (size_t) Cn * gu_cols);
+        carve(pf.He, (size_t) Cn * std::max(ffe, ffs));
+        // Engram (a piece of `sub` rows at a time)
+        carve(pf.EGR, (size_t) Ca * std::max(cd, 1));
+        carve(pf.EGY, (size_t) Ca * std::max(cd, 1));
+        carve(pf.EGYh, (size_t) Ca * std::max(cd, 1));
+        carve(pf.KVO, (size_t) Ca * (HC + 1) * E);
+        // the attention's piece
+        carve(pf.QA, (size_t) Ca * ql);
+        carve(pf.QAh, (size_t) Ca * ql);
+        carve(pf.KVA, (size_t) Ca * 576);
+        carve(pf.GATE, (size_t) Ca * Hm * V);
+        carve(pf.Q, (size_t) Ca * Hm * QK);
+        carve(pf.QH, (size_t) Ca * Hm * QK);
+        carve(pf.Qcat, (size_t) Ca * Hm * 576);
+        carve(pf.O16, (size_t) Ca * Hm * 512);
+        carve(pf.OB, (size_t) Ca * Hm * V);
+        carve(pf.OBh, (size_t) Ca * Hm * V);
+        carve(pf.Kbuf, (size_t) (Ca + std::max(g.swa_window, 1)) * 576);
+        if (max_pools) {   // the indexer's
+            carve(pf.IK, (size_t) Ca * D);
+            carve(pf.IKN, (size_t) Ca * D);
+            carve(pf.IKNh, (size_t) Ca * D);
+            carve(pf.IV, (size_t) Ca * D);
+            carve(pf.IG, (size_t) Ca * D);
+            carve(pf.IW, (size_t) Ca * NH);
+            carve(pf.IQ, (size_t) Ca * NH * D);
+            carve(pf.bits, (size_t) Ca * pf.nwords);
+            carve(pf.sel_on, (size_t) Ca);
+            carve(pf.IA, (size_t) pf.tqi * NH * max_pools);
+            carve(pf.IS, (size_t) pf.tqi * max_pools);
+            carve(pf.icells, (size_t) pf.tqi * std::max(1, pf.top_pools) * KP);
+        }
+        carve(pf.S, pf.s_elems);
+        carve(pf.P, pf.s_elems);
+        carve(pf.W1, pf.w1_elems);
+        carve(pf.W2, pf.w2_elems);
+        // two group buffers in turn, `stage` experts each (the copy of one group while the other's are multiplied)
+        carve(pf.gbuf[0], (size_t) pf.GE * pf.slot_bytes);
+        carve(pf.gbuf[1], (size_t) pf.GE * pf.slot_bytes);
+        if (embd_host) carve(pf.Erows, (size_t) Cn * embd.rb);   // (a chunk's embedding rows)
+        if (pass == 0) {
+            pf.arena_bytes = at;
+            pf.arena = dalloc<uint8_t>(at);
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        CK(cudaEventCreateWithFlags(&pf.gready[i], cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&pf.gfreed[i], cudaEventDisableTiming));
+    }
+    pf.h_ids = halloc<int>(Cn);
+    pf.h_cnt = halloc<int>(ne);
+    pf.h_off = halloc<int>(ne + 1);
+    if (cd) pf.h_egr = halloc<float>((size_t) Ca * cd);
     const char* pg = std::getenv("HY4_PF_PAGEABLE");
     if (!pg || std::atoi(pg) == 0) {
         stg.cap = (size_t) 64 << 20;
@@ -2205,25 +2344,10 @@ bool Engine::Impl::pf_alloc(std::string& err) {
             CK(cudaEventCreateWithFlags(&stg.ev[1], cudaEventDisableTiming));
         } else {
             cudaGetLastError();
-            std::fprintf(stderr, "maya-hy4: no pinned staging for the experts' copies (the driver's is used)\n");
+            std::fprintf(stderr, "maya-hy4: no pinned staging for the prompt path's copies (the driver's is used)\n");
         }
     }
     return true;
-}
-
-const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx) {
-    if (n <= 0 || pos + n > max_ctx) return nullptr;
-    const double t0 = now_ms();
-    const float* lg = nullptr;
-    for (int i = 0; i < n; ++i) {
-        lg = step(ids[i]);
-        if (!lg) return nullptr;
-        if (progress && (i + 1) % 64 == 0) progress(ctx, i + 1);
-    }
-    if (progress) progress(ctx, n);
-    st.pf_ms += now_ms() - t0;
-    st.pf_tokens += n;
-    return lg;
 }
 
 void Engine::Impl::stage_copy(uint8_t* dst, const uint8_t* src, size_t len) {
@@ -2250,34 +2374,447 @@ void Engine::Impl::stage_copy(uint8_t* dst, const uint8_t* src, size_t len) {
     }
 }
 
+void Engine::Impl::f16w(const DMat& m, __half* dst) {
+    if (!iq::f16_rows(m.type, m.w, m.k, m.n, (uint16_t*) dst, m.k, s)) {
+        std::fprintf(stderr, "maya-hy4: no F16 rows for type %d\n", m.type);
+        std::abort();
+    }
+}
+
+void Engine::Impl::gemm(const __half* X, int ldx, const __half* W, int ldw, float* Y, int ldy, int T, int n, int k,
+                        float alpha, float beta_) {
+    // Y [T][n] (row-major, ldy) = alpha X [T][k] . W [n][k]^T + beta Y: column-major Y^T = W . X^T
+    const cublasStatus_t r = cublasGemmEx(pf.cb, CUBLAS_OP_T, CUBLAS_OP_N, n, T, k, &alpha, W, CUDA_R_16F, ldw, X,
+                                          CUDA_R_16F, ldx, &beta_, Y, CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F,
+                                          CUBLAS_GEMM_DEFAULT);
+    if (r != CUBLAS_STATUS_SUCCESS) {
+        std::fprintf(stderr, "maya-hy4: cuBLAS GEMM %dx%dx%d failed (%d)\n", T, n, k, (int) r);
+        std::abort();
+    }
+}
+
+// y [T][n] = x W^T: a float matrix in F32 (x the F32 rows: cublasSgemm, as llama.cpp's F32 weights), else W decoded to
+// F16 and x's F16 rows
+void Engine::Impl::lin(const DMat& m, const __half* xh, const float* xf, int T, float* y) {
+    if (m.type == 0) {
+        const float one = 1.0f, zero = 0.0f;
+        if (cublasSgemm(pf.cb, CUBLAS_OP_T, CUBLAS_OP_N, m.n, T, m.k, &one, (const float*) m.w, m.k, xf, m.k, &zero, y,
+                        m.n) != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "maya-hy4: cuBLAS F32 GEMM failed\n");
+            std::abort();
+        }
+        return;
+    }
+    if (is_float(m.type) && m.type != 30) {
+        std::fprintf(stderr, "maya-hy4: a F16 matrix in the prompt path (not taken)\n");
+        std::abort();
+    }
+    f16w(m, pf.W1);
+    gemm(xh, m.k, pf.W1, m.k, y, m.n, T, m.n, m.k);
+}
+
+namespace {
+void cublas_ok(cublasStatus_t r, const char* what) {
+    if (r != CUBLAS_STATUS_SUCCESS) {
+        std::fprintf(stderr, "maya-hy4: cuBLAS %s failed (%d)\n", what, (int) r);
+        std::abort();
+    }
+}
+}  // namespace
+
+// The indexer for a piece of T tokens at p0 (a sparse layer): its keys' value and gate rows, the pooled keys of the
+// groups the piece ends, the open group's rows into the ring; then each token's choice (pf.bits / pf.sel_on)
+void Engine::Impl::pf_index(Layer& l, const float* A_, const __half* Ah_, int T, int p0) {
+    const int D = g.idx_dim, NH = g.idx_heads, KP = g.idx_kpool;
+    lin(l.idx_k, Ah_, A_, T, pf.IK);
+    lin(l.idx_proj, Ah_, A_, T, pf.IW);
+    k::rmsnorm(pf.IK, l.idx_knorm, pf.IKN, T, D, g.eps, s);
+    k::to_f16(pf.IKN, pf.IKNh, (size_t) T * D, s);
+    lin(l.idx_v, pf.IKNh, pf.IKN, T, pf.IV);
+    lin(l.idx_g, pf.IKNh, pf.IKN, T, pf.IG);
+    const int g0 = p0 / KP, g1 = (p0 + T) / KP;   // (the groups that end in the piece: g0 .. g1)
+    k::idx_pool_rows(pf.IV, pf.IG, l.idx_ring, l.idx_ape, l.idx_pnorm, p0, g0, g1 - g0, KP, D, g.eps, l.theta_scale,
+                     l.idx_pooled, s);
+    const int open0 = std::max(p0, g1 * KP);      // (the open group's members in the piece)
+    k::idx_ring_put(pf.IV, pf.IG, p0, open0 - p0, p0 + T - open0, KP, D, l.idx_ring, s);
+    lin(l.idx_qb, pf.QAh, nullptr, T, pf.IQ);
+    k::mla_rope_q(pf.IQ, T, NH, D, D - g.rope_dim, p0, nullptr, l.theta_scale, s);
+    const int npool = (p0 + T - 1) / KP;          // (the most groups a token of the piece can choose from)
+    if (npool <= pf.top_pools) {                  // (every token sees every key)
+        CK(cudaMemsetAsync(pf.sel_on, 0, (size_t) T * sizeof(int), s));
+        return;
+    }
+    const float one = 1.0f, zero = 0.0f;
+    for (int t0 = 0; t0 < T; t0 += pf.tqi) {
+        const int tq = std::min(pf.tqi, T - t0);
+        cublas_ok(cublasSgemm(pf.cb, CUBLAS_OP_T, CUBLAS_OP_N, npool, tq * NH, D, &one, l.idx_pooled, D,
+                              pf.IQ + (size_t) t0 * NH * D, D, &zero, pf.IA, npool),
+                  "indexer scores");
+        k::idx_score_rows(pf.IA, pf.IW + (size_t) t0 * NH, NH, npool, tq, p0 + t0, KP,
+                          1.0f / std::sqrt((float) (D * NH)), pf.IS, s);
+        k::idx_select_rows(pf.IS, npool, tq, p0 + t0, KP, pf.top_pools, pf.icells, pf.bits + (size_t) t0 * pf.nwords,
+                           pf.nwords, pf.sel_on + t0, s);
+    }
+}
+
+// A layer's attention for a piece of T tokens at p0 (A_ / Ah_ its normed rows): Y_ [T][E]
+void Engine::Impl::pf_attn(Layer& l, const float* A_, const __half* Ah_, int T, int p0, float* Y_) {
+    const int H = l.H, QK = g.qk_head, V = g.v_head, ql = g.q_lora, nope = QK - g.rope_dim, win = g.swa_window;
+    const float one = 1.0f, zero = 0.0f;
+    lin(l.q_a, Ah_, A_, T, pf.QA);
+    lin(l.kv_a, Ah_, A_, T, pf.KVA);
+    lin(l.wgate, Ah_, A_, T, pf.GATE);
+    k::rmsnorm(pf.QA, l.q_a_norm, pf.QA, T, ql, g.eps, s);
+    k::to_f16(pf.QA, pf.QAh, (size_t) T * ql, s);
+    lin(l.q_b, pf.QAh, nullptr, T, pf.Q);
+    k::to_f16(pf.Q, pf.QH, (size_t) T * H * QK, s);
+    // q's nope part through k_b a head: Qcat[t][h][0:512] (F16), its rope part after it
+    f16w(l.k_b, pf.W1);   // [H][512][nope]
+    cublas_ok(cublasGemmStridedBatchedEx(pf.cb, CUBLAS_OP_T, CUBLAS_OP_N, 512, T, nope, &one, pf.W1, CUDA_R_16F, nope,
+                                         (long long) 512 * nope, pf.QH, CUDA_R_16F, H * QK, QK, &zero, pf.Qcat,
+                                         CUDA_R_16F, H * 576, 576, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+              "k_b batch");
+    k::qpe_f16(pf.Q, pf.Qcat, T, H, QK, nope, p0, l.theta_scale, s);
+    if (l.idx) pf_index(l, A_, Ah_, T, p0);
+    // the keys: a sliding-window layer's from its ring (the window before the piece) and the piece's own, in one
+    // buffer from position kb0; a sparse layer's its cache
+    const __half* K = l.kv;
+    int kb0 = 0;
+    if (l.ring) {
+        kb0 = std::max(0, p0 - (win - 1));
+        k::ring_get(l.kv, l.ring, kb0, p0 - kb0, pf.Kbuf, s);
+        k::mla_kv_store(pf.KVA, l.kv_a_norm, g.eps, pf.Kbuf, T, p0, nullptr, l.theta_scale, s, 0, kb0);
+        const int nput = std::min(T, l.ring);
+        k::ring_put(pf.Kbuf + (size_t) (p0 + T - nput - kb0) * 576, l.ring, p0 + T - nput, nput, l.kv, s);
+        K = pf.Kbuf;
+    } else {
+        k::mla_kv_store(pf.KVA, l.kv_a_norm, g.eps, l.kv, T, p0, nullptr, l.theta_scale, s);
+    }
+    // the attention: tiles of query tokens, each [tq x H rows] x [the keys it can see]
+    auto r8 = [](int v) { return (v + 7) & ~7; };
+    auto first_key = [&](int ta) { return l.ring ? std::max(kb0, p0 + ta - (win - 1)) : 0; };
+    int ta = 0;
+    while (ta < T) {
+        int tq = T - ta;
+        while (tq > 1 && (size_t) H * tq * (size_t) r8(p0 + ta + tq - first_key(ta)) > pf.s_elems) tq = (tq + 1) / 2;
+        const int tb = ta + tq, k0 = first_key(ta), nk = p0 + tb - k0, ld = r8(nk), M = H * tq;
+        cublas_ok(cublasGemmEx(pf.cb, CUBLAS_OP_T, CUBLAS_OP_N, nk, M, 576, &mla_scale, K + (size_t) (k0 - kb0) * 576,
+                               CUDA_R_16F, 576, pf.Qcat + (size_t) ta * H * 576, CUDA_R_16F, 576, &zero, pf.S,
+                               CUDA_R_32F, ld, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                  "scores");
+        k::attn_softmax(pf.S, ld, pf.P, ld, M, nk, H, p0 + ta, k0, l.ring ? win : 0,
+                        l.idx ? pf.bits + (size_t) ta * pf.nwords : nullptr, pf.nwords, l.idx ? pf.sel_on + ta : nullptr,
+                        std::max(1, g.idx_kpool), l.sinks, s);
+        cublas_ok(cublasGemmEx(pf.cb, CUBLAS_OP_N, CUBLAS_OP_N, 512, M, nk, &one, K + (size_t) (k0 - kb0) * 576,
+                               CUDA_R_16F, 576, pf.P, CUDA_R_16F, ld, &zero, pf.O16 + (size_t) ta * H * 512, CUDA_R_16F,
+                               512, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+                  "attention output");
+        ta = tb;
+    }
+    // each head's 512 through v_b, times the gate (a value), then W_o
+    f16w(l.v_b, pf.W1);   // [H][V][512]
+    cublas_ok(cublasGemmStridedBatchedEx(pf.cb, CUBLAS_OP_T, CUBLAS_OP_N, V, T, 512, &one, pf.W1, CUDA_R_16F, 512,
+                                         (long long) V * 512, pf.O16, CUDA_R_16F, H * 512, 512, &zero, pf.OB, CUDA_R_32F,
+                                         H * V, V, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+              "v_b batch");
+    k::head_gate_rows(pf.OB, pf.GATE, T, H * V, 1, pf.OBh, s);
+    lin(l.wo, pf.OBh, nullptr, T, Y_);
+}
+
+void Engine::Impl::pf_dense(const Layer& l, int T) {
+    const int E = g.n_embd, ff = g.n_ff;
+    f16w(l.gate, pf.W1);
+    f16w(l.up, pf.W1 + (size_t) ff * E);
+    f16w(l.down, pf.W2);
+    const int TR = std::max(1, (int) ((size_t) pf.C * 2 * std::max(g.n_ff_exp, g.n_ff_sh) / (2 * (size_t) ff)));
+    for (int r0 = 0; r0 < T; r0 += TR) {
+        const int n = std::min(TR, T - r0);
+        gemm(pf.Ah + (size_t) r0 * E, E, pf.W1, E, pf.GU, 2 * ff, n, 2 * ff, E);
+        k::swiglu_rows(pf.GU, n, ff, 0.0f, pf.He, s);
+        gemm(pf.He, ff, pf.W2, ff, pf.Y + (size_t) r0 * E, E, n, E, ff);
+    }
+}
+
+// A MoE layer for the chunk: Y = routed_up(the routed experts' sum, in the latent width), Y2 = the shared expert's
+void Engine::Impl::pf_moe(const Layer& l, int T) {
+    const int E = g.n_embd, NL = g.n_lat, ne = g.n_expert, nu = g.n_used, ff = g.n_ff_exp, ffs = g.n_ff_sh;
+    // the router in F32 (llama.cpp's F32 weights), the routing on the GPU; the latent rows
+    lin(l.gate_inp, pf.Ah, pf.A, T, pf.RL);
+    lin(l.lat_down, pf.Ah, pf.A, T, pf.LAT);
+    k::to_f16(pf.LAT, pf.LATh, (size_t) T * NL, s);
+    k::route(pf.RL, ne, l.exp_bias_d, T, ne, 1, 1, nu, g.exp_scale, pf.sel, pf.wts, s);
+    CK(cudaMemsetAsync(pf.cnt, 0, (size_t) ne * sizeof(int), s));
+    k::expert_count(pf.sel, T * nu, pf.cnt, s);
+    CK(cudaMemcpyAsync(pf.h_cnt, pf.cnt, (size_t) ne * sizeof(int), cudaMemcpyDeviceToHost, s));
+    CK(cudaStreamSynchronize(s));
+    pf.h_off[0] = 0;
+    for (int e = 0; e < ne; ++e) pf.h_off[e + 1] = pf.h_off[e] + pf.h_cnt[e];
+    CK(cudaMemcpyAsync(pf.off, pf.h_off, (size_t) ne * sizeof(int), cudaMemcpyHostToDevice, s));
+    k::expert_lists(pf.sel, pf.wts, T, nu, ne, pf.off, pf.list, pf.wl, s);
+    CK(cudaMemsetAsync(pf.YL, 0, (size_t) T * NL * sizeof(float), s));
+    const CpuLayer& c = l.cl;
+    const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru, db = (size_t) NL * c.rd;
+    const int il = (int) (&l - L.data()), GE = pf.GE;
+    pf_score(il, pf.h_cnt, T);
+    if (route_log) {
+        std::vector<uint16_t> c16((size_t) ne);
+        for (int e = 0; e < ne; ++e) c16[(size_t) e] = (uint16_t) std::min(pf.h_cnt[e], 65535);
+        const uint8_t hdr[2] = {'P', (uint8_t) il};
+        std::fwrite(hdr, 1, 2, route_log);
+        std::fwrite(c16.data(), 2, c16.size(), route_log);
+    }
+    // The experts in groups of GE: a group's used experts that are not in VRAM copied into one of two group buffers
+    // (each run of consecutive ones in one copy a tensor), laid out as [the gates | the ups | the downs] of the group.
+    for (int e0 = 0; e0 < ne; e0 += GE) {
+        const int e1 = std::min(ne, e0 + GE);
+        bool any = false, copy = false;
+        for (int e = e0; e < e1; ++e)
+            if (pf.h_cnt[e]) {
+                any = true;
+                copy = copy || !ec_blob(il, e);
+            }
+        if (!any) continue;
+        int bi = -1;
+        uint8_t* B = nullptr;
+        if (copy) {
+            bi = (int) (pf.group_ctr++ & 1);
+            B = pf.gbuf[bi];
+            if (pf.group_ctr > 2) CK(cudaStreamWaitEvent(pf.cs, pf.gfreed[bi], 0));
+            const double tc = now_ms();
+            for (int e = e0; e < e1;) {
+                if (!pf.h_cnt[e] || ec_blob(il, e)) {
+                    ++e;
+                    continue;
+                }
+                int r = e;
+                while (r < e1 && pf.h_cnt[r] && !ec_blob(il, r)) ++r;
+                const size_t n = (size_t) (r - e), at = (size_t) (e - e0);
+                stage_copy(B + at * gb, c.gate + (size_t) e * gb, n * gb);
+                stage_copy(B + GE * gb + at * ub, c.up + (size_t) e * ub, n * ub);
+                stage_copy(B + GE * (gb + ub) + at * db, c.down + (size_t) e * db, n * db);
+                pf.copy_bytes += (double) (n * (gb + ub + db));
+                e = r;
+            }
+            pf.copy_ms += now_ms() - tc;
+            CK(cudaEventRecord(pf.gready[bi], pf.cs));
+            CK(cudaStreamWaitEvent(s, pf.gready[bi], 0));
+        }
+        for (int e = e0; e < e1; ++e) {
+            const int rows = pf.h_cnt[e], o0 = pf.h_off[e];
+            if (rows == 0) continue;
+            const uint8_t* blob = ec_blob(il, e);
+            const size_t at = (size_t) (e - e0);
+            const uint8_t* wg = blob ? blob : B + at * gb;
+            const uint8_t* wu = blob ? blob + gb : B + GE * gb + at * ub;
+            const uint8_t* wd = blob ? blob + gb + ub : B + GE * (gb + ub) + at * db;
+            if (!iq::f16_rows(c.tg, wg, NL, ff, (uint16_t*) pf.W1, NL, s) ||
+                !iq::f16_rows(c.tu, wu, NL, ff, (uint16_t*) (pf.W1 + (size_t) ff * NL), NL, s) ||
+                !iq::f16_rows(c.td, wd, ff, NL, (uint16_t*) pf.W2, ff, s)) {
+                std::fprintf(stderr, "maya-hy4: no F16 rows for the experts' types %d / %d / %d\n", c.tg, c.tu, c.td);
+                std::abort();
+            }
+            iq::gather_f16((const uint16_t*) pf.LATh, NL, pf.list + o0, rows, NL, (uint16_t*) pf.Xe, s);
+            gemm(pf.Xe, NL, pf.W1, NL, pf.GU, 2 * ff, rows, 2 * ff, NL);
+            k::swiglu_rows(pf.GU, rows, ff, l.clamp_exp, pf.He, s);
+            gemm(pf.He, ff, pf.W2, ff, pf.Ye, NL, rows, NL, ff);
+            k::scatter_add(pf.Ye, pf.list + o0, pf.wl + o0, rows, NL, pf.YL, s);
+        }
+        if (bi >= 0) CK(cudaEventRecord(pf.gfreed[bi], s));
+    }
+    // routed_up, and the shared expert on every token (no clamp)
+    k::to_f16(pf.YL, pf.YLh, (size_t) T * NL, s);
+    lin(l.lat_up, pf.YLh, pf.YL, T, pf.Y);
+    f16w(l.sh_gate, pf.W1);
+    f16w(l.sh_up, pf.W1 + (size_t) ffs * E);
+    f16w(l.sh_down, pf.W2);
+    gemm(pf.Ah, E, pf.W1, E, pf.GU, 2 * ffs, T, 2 * ffs, E);
+    k::swiglu_rows(pf.GU, T, ffs, 0.0f, pf.He, s);
+    gemm(pf.He, ffs, pf.W2, ffs, pf.Y2, E, T, E, ffs);
+}
+
+void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
+    const int E = g.n_embd, HC = g.hc, Ca = pf.Ca;
+    const int pos0 = pos;
+    ec_kv_reserve(pos0 + T);
+    if ((int) hist.size() < pos0 + T) hist.resize((size_t) pos0 + T);
+    for (int t = 0; t < T; ++t) hist[(size_t) pos0 + t] = ids[t];
+    const uint8_t* ew = embd.w;
+    if (embd_host) {
+        const size_t rb = embd.rb;
+        if (stg.on && stg.cap >= rb) {
+            const int per = (int) std::min<size_t>((size_t) T, stg.cap / rb);
+            for (int t0 = 0; t0 < T; t0 += per) {
+                const int n = std::min(per, T - t0);
+                CK(cudaEventSynchronize(stg.ev[stg.k]));
+                uint8_t* pin = stg.pin[stg.k];
+                pool->run((n + 255) / 256, [&](int j) {
+                    for (int t = j * 256; t < std::min(n, j * 256 + 256); ++t)
+                        std::memcpy(pin + (size_t) t * rb, embd.w + (size_t) ids[t0 + t] * rb, rb);
+                });
+                CK(cudaMemcpyAsync(pf.Erows + (size_t) t0 * rb, pin, (size_t) n * rb, cudaMemcpyHostToDevice, s));
+                CK(cudaEventRecord(stg.ev[stg.k], s));
+                stg.k ^= 1;
+            }
+        } else {
+            for (int t = 0; t < T; ++t)
+                CK(cudaMemcpyAsync(pf.Erows + (size_t) t * rb, embd.w + (size_t) ids[t] * rb, rb,
+                                   cudaMemcpyHostToDevice, s));
+        }
+        ew = pf.Erows;
+        for (int t = 0; t < T; ++t) pf.h_ids[t] = t;
+    } else {
+        std::memcpy(pf.h_ids, ids, (size_t) T * sizeof(int));
+    }
+    CK(cudaMemcpyAsync(pf.ids, pf.h_ids, (size_t) T * sizeof(int), cudaMemcpyHostToDevice, s));
+    if (!k::embed_rows(ew, embd.type, embd.rb, pf.ids, T, E, pf.X, s)) {
+        std::fprintf(stderr, "maya-hy4: no embedding rows for type %d\n", embd.type);
+        std::abort();
+    }
+    k::hc_init_rows(pf.X, HC, E, pf.R, T, s);
+    static const bool times = std::getenv("HY4_PF_TIMES") != nullptr;
+    if (times) CK(cudaStreamSynchronize(s));
+    double tl0 = now_ms();
+    const int cd = g.eg_cols * g.eg_dim;
+    for (int il = 0; il < g.n_layer; ++il) {
+        Layer& l = L[(size_t) il];
+        // Engram: the rows of each piece hashed on the host (the history holds the chunk's tokens), copied up, normed,
+        // projected and written into the streams
+        if (l.eg >= 0) {
+            for (int s0 = 0; s0 < T; s0 += Ca) {
+                const int Ts = std::min(Ca, T - s0);
+                CK(cudaStreamSynchronize(s));   // (h_egr's last piece copied)
+                pool->run((Ts + 63) / 64, [&](int j) {
+                    for (int t = j * 64; t < std::min(Ts, j * 64 + 64); ++t)
+                        eg_row(l.eg, ids[s0 + t], pos0 + s0 + t, pf.h_egr + (size_t) t * cd);
+                });
+                CK(cudaMemcpyAsync(pf.EGR, pf.h_egr, (size_t) Ts * cd * sizeof(float), cudaMemcpyHostToDevice, s));
+                k::eg_rows(pf.EGR, l.eg_lnorm, Ts * g.eg_cols, g.eg_dim, kEgEps, pf.EGY, nullptr, nullptr, s, g.eg_cols);
+                k::to_f16(pf.EGY, pf.EGYh, (size_t) Ts * cd, s);
+                lin(l.eg_kv, pf.EGYh, pf.EGY, Ts, pf.KVO);
+                k::eg_update_rows(pf.KVO, l.eg_kv_b, l.eg_gate, l.eg_hs, l.eg_gamma, HC, E, kEgEps,
+                                  pf.R + (size_t) s0 * HC * E, Ts, s);
+            }
+        }
+        // the attention, `sub` tokens at a time
+        k::hc_read_rows(pf.R, l.hca_fn, 2 * HC, l.hca_scale, l.hca_base, HC, E, g.eps, g.hc_eps, g.hc_mag, pf.MIX, pf.X,
+                        pf.POST, T, s);
+        k::rmsnorm(pf.X, l.attn_norm, pf.A, T, E, g.eps, s);
+        k::to_f16(pf.A, pf.Ah, (size_t) T * E, s);
+        for (int s0 = 0; s0 < T; s0 += Ca) {
+            const int Ts = std::min(Ca, T - s0);
+            pf_attn(l, pf.A + (size_t) s0 * E, pf.Ah + (size_t) s0 * E, Ts, pos0 + s0, pf.Y + (size_t) s0 * E);
+        }
+        k::norm_write_rows(pf.Y, nullptr, l.post_attn, g.eps, pf.POST, HC, E, pf.R, T, s);
+        dump("attn", il, pf.R + (size_t) (T - 1) * HC * E, pos0 + T - 1);
+        if (times) {
+            CK(cudaStreamSynchronize(s));
+            const double t1 = now_ms();
+            pf.attn_ms += t1 - tl0;
+            tl0 = t1;
+        }
+        // the FFN
+        k::hc_read_rows(pf.R, l.hcf_fn, 2 * HC, l.hcf_scale, l.hcf_base, HC, E, g.eps, g.hc_eps, g.hc_mag, pf.MIX, pf.X,
+                        pf.POST, T, s);
+        k::rmsnorm(pf.X, l.ffn_norm, pf.A, T, E, g.eps, s);
+        k::to_f16(pf.A, pf.Ah, (size_t) T * E, s);
+        if (l.dense) {
+            pf_dense(l, T);
+            k::norm_write_rows(pf.Y, nullptr, l.post_ffn, g.eps, pf.POST, HC, E, pf.R, T, s);
+        } else {
+            pf_moe(l, T);
+            k::norm_write_rows(pf.Y, pf.Y2, l.post_ffn, g.eps, pf.POST, HC, E, pf.R, T, s);
+        }
+        dump("ffn ", il, pf.R + (size_t) (T - 1) * HC * E, pos0 + T - 1);
+        if (times) {
+            CK(cudaStreamSynchronize(s));
+            const double t1 = now_ms();
+            pf.moe_ms += t1 - tl0;
+            tl0 = t1;
+        }
+    }
+    if (times)
+        std::fprintf(stderr,
+                     "maya-hy4: prompt path so far: attention %.0f ms, FFN %.0f ms (blocked in copies %.0f ms); working "
+                     "set %.1f GB\n",
+                     pf.attn_ms, pf.moe_ms, pf.copy_ms, working_set_gb());
+    pos = pos0 + T;
+    if (want_logits) {
+        // the head on the last token's streams
+        k::hc_read(pf.R + (size_t) (T - 1) * HC * E, head_fn, HC, head_scale, head_base, HC, E, g.eps, g.hc_eps,
+                   g.hc_mag, hmix, x, nullptr, s);
+        k::norm_q8(x, out_norm, g.eps, a, xq_a, xd_a, E, s);
+        mv(output, a, xq_a, xd_a, logits);
+        CK(cudaMemcpyAsync(h_logits, logits, (size_t) g.vocab * sizeof(float), cudaMemcpyDeviceToHost, s));
+    }
+    CK(cudaStreamSynchronize(s));
+}
+
+const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx) {
+    if (n <= 0 || pos + n > max_ctx) return nullptr;
+    for (int i = 0; i < n; ++i)
+        if (ids[i] < 0 || ids[i] >= g.vocab) return nullptr;
+    const double t0 = now_ms();
+    const float* lg = nullptr;
+    // a short prompt (a turn's few new tokens): the token path's experts on the CPU beat copying the ones it chooses
+    // (HY4_MIN_CHUNK)
+    int min_chunk = 256;
+    if (const char* v = std::getenv("HY4_MIN_CHUNK")) min_chunk = std::max(1, std::atoi(v));
+    if (n < min_chunk) {
+        for (int i = 0; i < n; ++i) lg = step(ids[i]);
+        if (progress) progress(ctx, n);
+        return lg;
+    }
+    // the lent slots back to their buffers until the next token is written (a long prompt comes in pieces)
+    ec_reclaim();
+    pf_open = true;
+    pf_tokens_open += n;
+    for (int c0 = 0; c0 < n; c0 += pf.C) {
+        const int T = std::min(pf.C, n - c0);
+        chunk(ids + c0, T, c0 + T == n);
+        if (progress) progress(ctx, c0 + T);
+    }
+    if (route_log) {
+        std::fputc('E', route_log);
+        std::fflush(route_log);
+    }
+    ec_fill();
+    CK(cudaStreamSynchronize(s));
+    st.pf_ms += now_ms() - t0;
+    st.pf_tokens += n;
+    st.pf_copy_gb = pf.copy_bytes / 1e9;
+    return h_logits;
+}
+
 // Engram's rows for the token at pos (llama.cpp#32517's engram_hash): each module's columns hash the n-gram ending at
 // it - the token and the eg_ngram - 1 before it (hist), each through the token map, a position before 0 the pad's - as
 // rolling = t0 m0 ^ t1 m1 ^ ... (uint64, wrapping) up to order o, row = rolling % prime + offset; the rows' F8_E4M3
 // values to h_eg [module][col][dim] as F32.
-void Engine::Impl::eg_fill(int token) {
-    if (!eg_table) return;
+void Engine::Impl::eg_row(int e, int token, int p, float* dst) const {
     const int ng = g.eg_ngram, nh = g.eg_heads, nc = g.eg_cols, dim = g.eg_dim;
     const int64_t pad = eg_map[(size_t) g.eg_pad];
     auto cid = [&](int t) -> int64_t { return t < 0 || t >= (int) eg_map.size() ? pad : eg_map[(size_t) t]; };
     uint64_t toks[8];
     toks[0] = (uint64_t) cid(token);
-    for (int s1 = 1; s1 < ng; ++s1) toks[s1] = (uint64_t) (pos - s1 < 0 ? pad : cid(hist[(size_t) (pos - s1)]));
-    for (size_t e = 0; e < g.eg_layers.size(); ++e) {
-        const uint64_t* mult = eg_mult.data() + e * ng;
-        const uint64_t* prime = eg_prime.data() + e * nc;
-        const uint64_t* off = eg_off.data() + e * nc;
-        uint64_t rolling = toks[0] * mult[0];
-        for (int o1 = 1; o1 < ng; ++o1) {
-            rolling ^= toks[o1] * mult[o1];
-            for (int h = 0; h < nh; ++h) {
-                const int col = (o1 - 1) * nh + h;
-                const uint64_t row = rolling % prime[col] + off[col];
-                const uint8_t* src = eg_table + row * eg_rb;
-                float* dst = h_eg + ((size_t) e * nc + col) * dim;
-                for (int i = 0; i < dim; ++i) dst[i] = fp8_lut[src[i]];
-            }
+    for (int s1 = 1; s1 < ng; ++s1) toks[s1] = (uint64_t) (p - s1 < 0 ? pad : cid(hist[(size_t) (p - s1)]));
+    const uint64_t* mult = eg_mult.data() + (size_t) e * ng;
+    const uint64_t* prime = eg_prime.data() + (size_t) e * nc;
+    const uint64_t* off = eg_off.data() + (size_t) e * nc;
+    uint64_t rolling = toks[0] * mult[0];
+    for (int o1 = 1; o1 < ng; ++o1) {
+        rolling ^= toks[o1] * mult[o1];
+        for (int h = 0; h < nh; ++h) {
+            const int col = (o1 - 1) * nh + h;
+            const uint64_t row = rolling % prime[col] + off[col];
+            const uint8_t* src = eg_table + row * eg_rb;
+            float* d = dst + (size_t) col * dim;
+            for (int i = 0; i < dim; ++i) d[i] = fp8_lut[src[i]];
         }
     }
+}
+void Engine::Impl::eg_fill(int token) {
+    if (!eg_table) return;
+    for (size_t e = 0; e < g.eg_layers.size(); ++e)
+        eg_row((int) e, token, pos, h_eg + e * g.eg_cols * g.eg_dim);
 }
 
 // A layer's attention for the token at *dpos (Engram first where the layer has a module): the hc streams read, the
@@ -2502,8 +3039,14 @@ const float* Engine::Impl::step(int token) {
         acc += t - tp;
         tp = t;
     };
-    if (pf_open) {   // the first token after a prompt: the helper follows the scores the prompt changed
+    if (pf_open) {   // the first token after a prompt: the prompt path's buffers lent to the cache again, and filled
         pf_open = false;
+        if (ec.arena_end > ec.own) {
+            ec.lent = true;
+            ec_fill();
+        }
+        // The prompt changed the scores, and the main cache with them: the helper follows, with more copies after a
+        // longer prompt (an eighth of its tokens, 64 .. fill_cap).
         hc_update(std::min(hc.fill_cap, std::max(64, (int) std::min<long>(pf_tokens_open / 8, INT_MAX))), false, false);
         pf_tokens_open = 0;
     }

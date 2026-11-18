@@ -100,7 +100,7 @@ void mla_rope_q(float* q, int T, int H, int qk, int nope, int pos0, const int* d
 /// The cache rows of T tokens: kva [T][576] -> cache[pos][0:512] = F16(rmsnorm(kva[0:512]) w), [512:576] =
 /// F16(rope(kva[512:576])), pos = (dpos ? *dpos : pos0) + t.
 void mla_kv_store(const float* kva, const float* w, float eps, __half* cache, int T, int pos0, const int* dpos,
-                  float theta_scale, cudaStream_t s, int ring = 0);
+                  float theta_scale, cudaStream_t s, int ring = 0, int base = 0);
 /// The decode attention's splits (a fixed grid: the position read on the device).
 int mla_nsp(int rows);
 size_t mla_scratch_floats(int H, int nsp);
@@ -149,7 +149,8 @@ void norm_write(const float* a, const float* b, const float* w, float eps, const
 void hc_init(const float* x, int hc, int n, float* R, cudaStream_t s);
 /// Engram's rows [cols][dim] (F32) RMS-normed (eps) times w [cols][dim] -> y [cols dim] and its int8 rows.
 void eg_rows(const float* rows, const float* w, int cols, int dim, float eps, float* y, int8_t* q, float* d,
-             cudaStream_t s);
+             cudaStream_t s, int wcols = 0);   // (wcols > 0: w's rows repeat every wcols rows - several tokens'; q may be
+                                               //  null)
 /// Engram's update of the hc streams R [hc][n] from the projected rows kv [hc + 1][n] and its bias kb (keys, then the
 /// value): gw [hc][n] the gate's weights, hs [hc][n] the per-stream offsets, gamma [n] the value's.
 void eg_update(const float* kv, const float* kb, const float* gw, const float* hs, const float* gamma, int hc, int n,
@@ -171,6 +172,42 @@ void idx_score(const float* q, const float* w, const float* pooled, const int* d
 /// The cells the token attends to: all of them up to *dpos while there are no more than top_pools complete groups
 /// before its own, else the top top_pools groups' cells and its own group's; *ncell their count.
 void idx_select(const float* score, const int* dpos, int kpool, int top_pools, int* cells, int* ncell, cudaStream_t s);
+
+// ------------------------------------------------------------------------------------------------ Hy4's prompt path
+/// hc_read for T rows: R [T][hc][n], mix [T][nmix] (scratch), x [T][n], post [T][hc] (or null).
+void hc_read_rows(const float* R, const float* fn, int nmix, const float* scale, const float* base, int hc, int n,
+                  float eps, float hc_eps, float mag, float* mix, float* x, float* post, int T, cudaStream_t s);
+/// norm_write for T rows: a, b [T][n] (b may be null), post [T][hc], R [T][hc][n].
+void norm_write_rows(const float* a, const float* b, const float* w, float eps, const float* post, int hc, int n,
+                     float* R, int T, cudaStream_t s);
+/// R[t][i] = x[t] for each of the hc streams, T rows.
+void hc_init_rows(const float* x, int hc, int n, float* R, int T, cudaStream_t s);
+/// eg_update for T rows: kv [T][(hc + 1) n], R [T][hc][n].
+void eg_update_rows(const float* kv, const float* kb, const float* gw, const float* hs, const float* gamma, int hc, int n,
+                    float eps, float* R, int T, cudaStream_t s);
+/// Qcat [T][H][576]'s rope part, F16(rope(q [T][H][qk]'s 64 values from nope on)) at [512:576], pos = pos0 + t.
+void qpe_f16(const float* q, __half* qcat, int T, int H, int qk, int nope, int pos0, float theta_scale, cudaStream_t s);
+/// n rows of 576 for positions p0 .. p0 + n out of a ring (row p % ring) into dst, or from src into the ring.
+void ring_get(const __half* ring_kv, int ring, int p0, int n, __half* dst, cudaStream_t s);
+void ring_put(const __half* src, int ring, int p0, int n, __half* ring_kv, cudaStream_t s);
+/// The prompt path's scores softmax: rows of M = tokens x H (token ta + r / H at qpos0 + r / H), columns the nk keys at
+/// kpos0 + c - visible at or before the token's position, within win (> 0) of it, and for a token with sel_on set in its
+/// own group or a group its bits (nwords a token) mark; the sinks a logit a head in the sum; P (F16, ldp) the result.
+void attn_softmax(float* S, int lds, __half* P, int ldp, int M, int nk, int H, int qpos0, int kpos0, int win,
+                  const unsigned* bits, int nwords, const int* sel_on, int kpool, const float* sinks, cudaStream_t s);
+/// The indexer's pooled keys of the groups g0 .. g0 + n_groups that end in the rows (iv, ig [T][dim] at positions p0 ..),
+/// members before p0 from the ring; into pooled[g].
+void idx_pool_rows(const float* iv, const float* ig, const float* ring, const float* ape, const float* w, int p0, int g0,
+                   int n_groups, int kpool, int dim, float eps, float theta_scale, float* pooled, cudaStream_t s);
+/// rows r0 .. r0 + n of (iv, ig) at positions p0 + r into the ring's slots.
+void idx_ring_put(const float* iv, const float* ig, int p0, int r0, int n, int kpool, int dim, float* ring,
+                  cudaStream_t s);
+/// S [tq][npool] = sum_h relu(A [tq nh][npool]) w [tq][nh] scale, -inf from the token's own group on.
+void idx_score_rows(const float* A, const float* w, int nh, int npool, int tq, int qpos0, int kpool, float scale, float* S,
+                    cudaStream_t s);
+/// Each of tq tokens' selection: sel_on 0 (every key) or the bits of its top top_pools groups (cells: scratch).
+void idx_select_rows(const float* S, int npool, int tq, int qpos0, int kpool, int top_pools, int* cells, unsigned* bits,
+                     int nwords, int* sel_on, cudaStream_t s);
 
 /// (--selftest) nothing yet; true.
 bool selftest();

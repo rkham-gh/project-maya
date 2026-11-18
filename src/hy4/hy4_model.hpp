@@ -43,8 +43,8 @@ struct Options {
     int max_ctx = 131072;
     int threads = 0;      // CPU lane threads in all (0: the physical cores)
     int gpu = 0;
-    int chunk = 8192;     // (the prompt path's tokens a chunk: not used yet - prompts go through the token path)
-    int sub = 2048;
+    int chunk = 4096;     // the prompt path's tokens a chunk (prefill): every expert a chunk routes to crosses PCIe once
+    int sub = 1024;       // ... its attention's and Engram's tokens at a time
     int stage = 32;
     double cache_gb = -1; // VRAM for the most-used routed experts (-1: what is free, less HY4_VRAM_RESERVE_MIB)
     // A second card that only holds routed experts (the next most used after the main card's): a token's experts found

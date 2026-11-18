@@ -398,11 +398,11 @@ __global__ void mla_rope_q_kernel(float* __restrict__ q, int H, int qk, int nope
 // grid T, block 256
 __global__ void mla_kv_store_kernel(const float* __restrict__ kva, const float* __restrict__ w, float eps,
                                     __half* __restrict__ cache, int pos0, const int* __restrict__ dpos,
-                                    float theta_scale, int ring) {
+                                    float theta_scale, int ring, int base) {
     const int t = blockIdx.x, tid = threadIdx.x;
     const int pos = (dpos ? *dpos : pos0) + t;
     const float* r = kva + (size_t) t * 576;
-    __half* dst = cache + (size_t) (ring > 0 ? pos % ring : pos) * 576;
+    __half* dst = cache + (size_t) (ring > 0 ? pos % ring : pos - base) * 576;
     const float a0 = r[tid], a1 = r[tid + 256];
     const float ss = block_sum(a0 * a0 + a1 * a1);
     const float sc = rsqrtf(ss / 512.0f + eps);
@@ -840,8 +840,8 @@ void mla_rope_q(float* q, int T, int H, int qk, int nope, int pos0, const int* d
     if (T > 0) mla_rope_q_kernel<<<T * H, 32, 0, s>>>(q, H, qk, nope, pos0, dpos, theta_scale);
 }
 void mla_kv_store(const float* kva, const float* w, float eps, __half* cache, int T, int pos0, const int* dpos,
-                  float theta_scale, cudaStream_t s, int ring) {
-    if (T > 0) mla_kv_store_kernel<<<T, 256, 0, s>>>(kva, w, eps, cache, pos0, dpos, theta_scale, ring);
+                  float theta_scale, cudaStream_t s, int ring, int base) {
+    if (T > 0) mla_kv_store_kernel<<<T, 256, 0, s>>>(kva, w, eps, cache, pos0, dpos, theta_scale, ring, base);
 }
 int mla_nsp(int rows) { return std::max(128, (rows + 1023) / 1024); }
 size_t mla_scratch_floats(int H, int nsp) { return (size_t) H * nsp * (kMlaV + 2); }
@@ -948,14 +948,14 @@ __global__ void hc_init_kernel(const float* __restrict__ x, int hc, int n, float
 // ------------------------------------------------------------------------------------------------ Hy4: Engram
 // grid cols, block dim (a multiple of 32): row r of rows [cols][dim] RMS-normed (eps) times w [cols][dim] -> y (flat) and
 // its int8 rows (q8's 32-value blocks over the flat row)
-__global__ void eg_rows_kernel(const float* __restrict__ rows, const float* __restrict__ w, int dim, float eps,
-                               float* __restrict__ y, int8_t* __restrict__ q, float* __restrict__ d) {
+__global__ void eg_rows_kernel(const float* __restrict__ rows, const float* __restrict__ w, int dim, int wcols,
+                               float eps, float* __restrict__ y, int8_t* __restrict__ q, float* __restrict__ d) {
     const size_t at = (size_t) blockIdx.x * dim + threadIdx.x;
     const float v = rows[at];
     const float ss = block_sum(v * v);
-    const float o = v * rsqrtf(ss / (float) dim + eps) * w[at];
+    const float o = v * rsqrtf(ss / (float) dim + eps) * w[(size_t) (blockIdx.x % wcols) * dim + threadIdx.x];
     y[at] = o;
-    warp_q8(o, q + at, d + at / 32);
+    if (q) warp_q8(o, q + at, d + at / 32);
 }
 // grid hc, block 1024: stream s of R updated with the projected rows kv [(hc + 1)][n] (+ bias kb, same shape): key =
 // kv[s], value = kv[hc]; dot = <rms(R_s), rms(key)> . gw[s] / sqrt(n); g = sigmoid(sign(dot) sqrt(max(|dot|, 1e-6)));
@@ -1020,8 +1020,8 @@ void hc_init(const float* x, int hc, int n, float* R, cudaStream_t s) {
     hc_init_kernel<<<blocks(n, 256), 256, 0, s>>>(x, hc, n, R);
 }
 void eg_rows(const float* rows, const float* w, int cols, int dim, float eps, float* y, int8_t* q, float* d,
-             cudaStream_t s) {
-    eg_rows_kernel<<<cols, dim, 0, s>>>(rows, w, dim, eps, y, q, d);
+             cudaStream_t s, int wcols) {
+    eg_rows_kernel<<<cols, dim, 0, s>>>(rows, w, dim, wcols > 0 ? wcols : cols, eps, y, q, d);
 }
 void eg_update(const float* kv, const float* kb, const float* gw, const float* hs, const float* gamma, int hc, int n,
                float eps, float* R, cudaStream_t s) {
@@ -1133,6 +1133,297 @@ void idx_score(const float* q, const float* w, const float* pooled, const int* d
 }
 void idx_select(const float* score, const int* dpos, int kpool, int top_pools, int* cells, int* ncell, cudaStream_t s) {
     idx_select_kernel<<<1, 1024, 0, s>>>(score, dpos, kpool, top_pools, cells, ncell);
+}
+
+namespace {
+// ------------------------------------------------------------------------------------------------ Hy4: the prompt path
+// grid (nmix, T), block 256: hc_mix_kernel a row: R [T][hc n], mix [T][nmix]
+__global__ void hc_mix_rows_kernel(const float* __restrict__ R, const float* __restrict__ fn, int m, int nmix, float eps,
+                                   float* __restrict__ mix) {
+    const float* r = R + (size_t) blockIdx.y * m;
+    const float* w = fn + (size_t) blockIdx.x * m;
+    float dot = 0.0f, ss = 0.0f;
+    for (int c = threadIdx.x; c < m; c += blockDim.x) {
+        const float v = r[c];
+        dot = fmaf(w[c], v, dot);
+        ss = fmaf(v, v, ss);
+    }
+    dot = block_sum(dot);
+    ss = block_sum(ss);
+    if (threadIdx.x == 0) mix[(size_t) blockIdx.y * nmix + blockIdx.x] = dot * rsqrtf(ss / (float) m + eps);
+}
+// grid (n / 256, T): hc_read_kernel a row (post [T][hc] when set)
+__global__ void hc_read_rows_kernel(const float* __restrict__ R, const float* __restrict__ mix, int nmix,
+                                    const float* __restrict__ scale, const float* __restrict__ base, int hc, int n,
+                                    float hc_eps, float mag, float* __restrict__ x, float* __restrict__ post) {
+    const int t = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    const float* mx = mix + (size_t) t * nmix;
+    const float* Rt = R + (size_t) t * hc * n;
+    float pre[8];
+    for (int i = 0; i < hc; ++i) pre[i] = sigmoidf_(mx[i] * scale[0] + base[i]) + hc_eps;
+    if (post && blockIdx.x == 0 && threadIdx.x < hc) {
+        const int i = threadIdx.x;
+        post[(size_t) t * hc + i] = sigmoidf_(mx[hc + i] * scale[1] + base[hc + i]) * mag + hc_eps;
+    }
+    if (c >= n) return;
+    float v = 0.0f;
+    for (int i = 0; i < hc; ++i) v = fmaf(pre[i], Rt[(size_t) i * n + c], v);
+    x[(size_t) t * n + c] = v;
+}
+// grid T, block 1024: norm_write_kernel a row (a, b [T][n], post [T][hc], R [T][hc][n])
+__global__ void __launch_bounds__(1024) norm_write_rows_kernel(const float* __restrict__ a, const float* __restrict__ b,
+                                                               const float* __restrict__ w, float eps,
+                                                               const float* __restrict__ post, int hc, int n,
+                                                               float* __restrict__ R) {
+    const size_t t = blockIdx.x;
+    const float* at = a + t * n;
+    const float* bt = b ? b + t * n : nullptr;
+    float* Rt = R + t * hc * n;
+    float ss = 0.0f;
+    for (int c = threadIdx.x; c < n; c += blockDim.x) {
+        const float v = at[c] + (bt ? bt[c] : 0.0f);
+        ss = fmaf(v, v, ss);
+    }
+    ss = block_sum(ss);
+    const float sc = rsqrtf(ss / (float) n + eps);
+    float p[8];
+    for (int i = 0; i < hc; ++i) p[i] = post[t * hc + i];
+    for (int c = threadIdx.x; c < n; c += blockDim.x) {
+        const float y = (at[c] + (bt ? bt[c] : 0.0f)) * sc * w[c];
+        for (int i = 0; i < hc; ++i) Rt[(size_t) i * n + c] = fmaf(p[i], y, Rt[(size_t) i * n + c]);
+    }
+}
+// grid (n / 256, T): R[t][i] = x[t] for each stream
+__global__ void hc_init_rows_kernel(const float* __restrict__ x, int hc, int n, float* __restrict__ R) {
+    const int t = blockIdx.y, c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const float v = x[(size_t) t * n + c];
+    for (int i = 0; i < hc; ++i) R[((size_t) t * hc + i) * n + c] = v;
+}
+// grid (hc, T), block 1024: eg_update_kernel a row (kv [T][(hc + 1) n], R [T][hc][n])
+__global__ void __launch_bounds__(1024) eg_update_rows_kernel(const float* __restrict__ kv, const float* __restrict__ kb,
+                                                              const float* __restrict__ gw, const float* __restrict__ hs,
+                                                              const float* __restrict__ gamma, int hc, int n, float eps,
+                                                              float* __restrict__ R) {
+    const int st = blockIdx.x;
+    const size_t t = blockIdx.y;
+    float* Rs = R + (t * hc + st) * n;
+    const float* K = kv + t * (hc + 1) * n + (size_t) st * n;
+    const float* Kb = kb + (size_t) st * n;
+    const float* V = kv + t * (hc + 1) * n + (size_t) hc * n;
+    const float* Vb = kb + (size_t) hc * n;
+    float sr = 0.0f, sk = 0.0f, sv = 0.0f, dt = 0.0f;
+    for (int c = threadIdx.x; c < n; c += blockDim.x) {
+        const float r = Rs[c], kk = K[c] + Kb[c], v = V[c] + Vb[c];
+        sr = fmaf(r, r, sr);
+        sk = fmaf(kk, kk, sk);
+        sv = fmaf(v, v, sv);
+        dt = fmaf(r * kk, gw[(size_t) st * n + c], dt);
+    }
+    sr = block_sum(sr);
+    sk = block_sum(sk);
+    sv = block_sum(sv);
+    dt = block_sum(dt);
+    const float ir = rsqrtf(sr / (float) n + eps), ik = rsqrtf(sk / (float) n + eps), iv = rsqrtf(sv / (float) n + eps);
+    const float dot = dt * ir * ik / sqrtf((float) n);
+    const float mg = sqrtf(fmaxf(fabsf(dot), 1e-6f));
+    const float gt = sigmoidf_(dot < 0.0f ? -mg : mg);
+    for (int c = threadIdx.x; c < n; c += blockDim.x) {
+        const float v = (V[c] + Vb[c]) * iv * gamma[c];
+        Rs[c] = fmaf(v, gt + hs[(size_t) st * n + c], Rs[c]);
+    }
+}
+// grid T H, block 32: Qcat [T][H][576]'s rope part from q [T][H][qk] (its rope values from nope on), pos = pos0 + t
+__global__ void qpe_f16_kernel(const float* __restrict__ q, __half* __restrict__ qcat, int H, int qk, int nope, int pos0,
+                               float theta_scale) {
+    const int t = blockIdx.x / H, h = blockIdx.x % H, i = threadIdx.x;
+    const float* p = q + ((size_t) t * H + h) * qk + nope + 2 * i;
+    float y0, y1;
+    rope_pair(p[0], p[1], pos0 + t, i, theta_scale, y0, y1);
+    __half* dst = qcat + ((size_t) t * H + h) * 576 + 512 + 2 * i;
+    dst[0] = __float2half(y0);
+    dst[1] = __float2half(y1);
+}
+// grid n, block 576 / 2: rows of a ring (position p in row p % ring) into dst rows [n][576] for positions p0 .. p0 + n
+__global__ void ring_get_kernel(const __half* __restrict__ ring_kv, int ring, int p0, __half* __restrict__ dst) {
+    const int r = blockIdx.x;
+    const __half* src = ring_kv + (size_t) ((p0 + r) % ring) * 576;
+    for (int i = threadIdx.x; i < 576; i += blockDim.x) dst[(size_t) r * 576 + i] = src[i];
+}
+// grid n, block 288: rows [n][576] for positions p0 .. p0 + n into a ring
+__global__ void ring_put_kernel(const __half* __restrict__ src, int ring, int p0, __half* __restrict__ ring_kv) {
+    const int r = blockIdx.x;
+    __half* dst = ring_kv + (size_t) ((p0 + r) % ring) * 576;
+    for (int i = threadIdx.x; i < 576; i += blockDim.x) dst[i] = src[(size_t) r * 576 + i];
+}
+// The scores' softmax (rows r of a tile: token ta + r / H at qpos0 + r / H, head r % H; columns c < nk: the keys at
+// positions kpos0 + c): visible when the key's position is at most the token's, within the window (win > 0: more than
+// qpos - win), and - for a token whose sel_on is set - in its own group or in a group bits marks (nwords 32-bit words a
+// token); S (already scaled) in place -> P (F16, ldp >= nk; the columns from nk to ldp zero); the head's sink (sinks
+// set) one more logit in the sum.  grid M, block 256.
+__global__ void attn_softmax_kernel(float* __restrict__ S, int lds, __half* __restrict__ P, int ldp, int nk, int H,
+                                    int qpos0, int kpos0, int win, const unsigned* __restrict__ bits, int nwords,
+                                    const int* __restrict__ sel_on, int kpool, const float* __restrict__ sinks) {
+    const int r = blockIdx.x, tl = r / H, h = r % H, qp = qpos0 + tl;
+    float* row = S + (size_t) r * lds;
+    __half* prow = P + (size_t) r * ldp;
+    const bool sel = bits && sel_on[tl];
+    const unsigned* bt = sel ? bits + (size_t) tl * nwords : nullptr;
+    const int own = sel ? qp / kpool * kpool : 0;
+    auto vis = [&](int c) {
+        const int kp = kpos0 + c;
+        if (kp > qp) return false;
+        if (win > 0 && kp <= qp - win) return false;
+        if (sel && kp < own) {
+            const int gq = kp / kpool;
+            return ((bt[gq >> 5] >> (gq & 31)) & 1u) != 0;
+        }
+        return true;
+    };
+    float mx = sinks ? sinks[h] : -INFINITY;
+    for (int c = threadIdx.x; c < nk; c += blockDim.x)
+        if (vis(c)) mx = fmaxf(mx, row[c]);
+    mx = block_max(mx);
+    float sum = 0.0f;
+    for (int c = threadIdx.x; c < nk; c += blockDim.x) {
+        const float e = vis(c) ? __expf(row[c] - mx) : 0.0f;
+        row[c] = e;
+        sum += e;
+    }
+    sum = block_sum(sum);
+    if (sinks) sum += __expf(sinks[h] - mx);
+    const float inv = 1.0f / sum;
+    for (int c = threadIdx.x; c < ldp; c += blockDim.x) prow[c] = __float2half(c < nk ? row[c] * inv : 0.0f);
+}
+// The indexer's pooled keys for the groups that end in the rows [T] at positions p0 .. p0 + T (g from g0): each member
+// from the rows (iv, ig [T][dim]) or, before p0, the ring (slot pos % kpool); pooled as idx_pool_kernel.  grid n_groups,
+// block dim.
+__global__ void idx_pool_rows_kernel(const float* __restrict__ iv, const float* __restrict__ ig,
+                                     const float* __restrict__ ring, const float* __restrict__ ape,
+                                     const float* __restrict__ w, int p0, int g0, int kpool, int dim, float eps,
+                                     float theta_scale, float* __restrict__ pooled) {
+    const int gi = g0 + blockIdx.x, e = threadIdx.x;
+    float gv[16], vv[16];
+    float mx = -INFINITY;
+    for (int m = 0; m < kpool; ++m) {
+        const int p = gi * kpool + m;
+        const float a = p >= p0 ? ig[(size_t) (p - p0) * dim + e] : ring[(size_t) (p % kpool) * 2 * dim + dim + e];
+        const float v = p >= p0 ? iv[(size_t) (p - p0) * dim + e] : ring[(size_t) (p % kpool) * 2 * dim + e];
+        gv[m] = a + ape[(size_t) m * dim + e];
+        vv[m] = v;
+        mx = fmaxf(mx, gv[m]);
+    }
+    float den = 0.0f, num = 0.0f;
+    for (int m = 0; m < kpool; ++m) {
+        const float q = expf(gv[m] - mx);
+        den += q;
+        num += q * vv[m];
+    }
+    const float v = num / den;
+    const float ss = block_sum(v * v);
+    __shared__ float sv[1024];
+    sv[e] = v * rsqrtf(ss / (float) dim + eps) * w[e];
+    __syncthreads();
+    float* dst = pooled + (size_t) gi * dim;
+    const int nope = dim - 64;
+    if (e < nope) dst[e] = sv[e];
+    else if (((e - nope) & 1) == 0) {
+        float y0, y1;
+        rope_pair(sv[e], sv[e + 1], gi * kpool, (e - nope) >> 1, theta_scale, y0, y1);
+        dst[e] = y0;
+        dst[e + 1] = y1;
+    }
+}
+// grid n, block 2 dim: the rows for positions p0 + r0 .. into the ring's slots (the open group's members)
+__global__ void idx_ring_put_kernel(const float* __restrict__ iv, const float* __restrict__ ig, int p0, int r0, int kpool,
+                                    int dim, float* __restrict__ ring) {
+    const int r = r0 + blockIdx.x, t = threadIdx.x, slot = (p0 + r) % kpool;
+    ring[(size_t) slot * 2 * dim + t] = t < dim ? iv[(size_t) r * dim + t] : ig[(size_t) r * dim + t - dim];
+}
+// grid (ceil(npool / 256), tq), block 256: S [tq][npool] = sum_h relu(A [tq nh][npool]) w [tq][nh] scale, -inf for the
+// groups at or after the token's own (g >= pos / kpool)
+__global__ void idx_score_rows_kernel(const float* __restrict__ A, const float* __restrict__ w, int nh, int npool,
+                                      int qpos0, int kpool, float scale, float* __restrict__ S) {
+    const int t = blockIdx.y, gi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gi >= npool) return;
+    const int ncand = (qpos0 + t) / kpool;
+    float acc = 0.0f;
+    for (int h = 0; h < nh; ++h) acc = fmaf(fmaxf(A[((size_t) t * nh + h) * npool + gi], 0.0f), w[(size_t) t * nh + h], acc);
+    S[(size_t) t * npool + gi] = gi < ncand ? acc * scale : -INFINITY;
+}
+// grid tq, block 1024: a token's selection - sel_on 0 when its complete groups before its own are no more than
+// top_pools (every key visible), else the bits of its top top_pools groups (cells: a scratch row of top_pools kpool ints)
+__global__ void __launch_bounds__(1024) idx_select_rows_kernel(const float* __restrict__ S, int npool, int qpos0,
+                                                               int kpool, int top_pools, int* __restrict__ cells,
+                                                               unsigned* __restrict__ bits, int nwords,
+                                                               int* __restrict__ sel_on) {
+    const int t = blockIdx.x, ncand = (qpos0 + t) / kpool;
+    unsigned* bt = bits + (size_t) t * nwords;
+    for (int i = threadIdx.x; i < nwords; i += blockDim.x) bt[i] = 0u;
+    if (ncand <= top_pools) {
+        if (threadIdx.x == 0) sel_on[t] = 0;
+        return;
+    }
+    int* ct = cells + (size_t) t * top_pools * kpool;
+    strata::kernels::dsa::select_top_pools(S + (size_t) t * npool, ncand, top_pools, kpool, ct);
+    __syncthreads();
+    for (int i = threadIdx.x; i < top_pools; i += blockDim.x) {
+        const int gq = ct[i * kpool] / kpool;
+        atomicOr(&bt[gq >> 5], 1u << (gq & 31));
+    }
+    if (threadIdx.x == 0) sel_on[t] = 1;
+}
+}  // namespace
+
+void hc_read_rows(const float* R, const float* fn, int nmix, const float* scale, const float* base, int hc, int n,
+                  float eps, float hc_eps, float mag, float* mix, float* x, float* post, int T, cudaStream_t s) {
+    if (T <= 0) return;
+    hc_mix_rows_kernel<<<dim3(nmix, T), 256, 0, s>>>(R, fn, hc * n, nmix, eps, mix);
+    hc_read_rows_kernel<<<dim3(blocks(n, 256), T), 256, 0, s>>>(R, mix, nmix, scale, base, hc, n, hc_eps, mag, x, post);
+}
+void norm_write_rows(const float* a, const float* b, const float* w, float eps, const float* post, int hc, int n,
+                     float* R, int T, cudaStream_t s) {
+    if (T > 0) norm_write_rows_kernel<<<T, 1024, 0, s>>>(a, b, w, eps, post, hc, n, R);
+}
+void hc_init_rows(const float* x, int hc, int n, float* R, int T, cudaStream_t s) {
+    if (T > 0) hc_init_rows_kernel<<<dim3(blocks(n, 256), T), 256, 0, s>>>(x, hc, n, R);
+}
+void eg_update_rows(const float* kv, const float* kb, const float* gw, const float* hs, const float* gamma, int hc, int n,
+                    float eps, float* R, int T, cudaStream_t s) {
+    if (T > 0) eg_update_rows_kernel<<<dim3(hc, T), 1024, 0, s>>>(kv, kb, gw, hs, gamma, hc, n, eps, R);
+}
+void qpe_f16(const float* q, __half* qcat, int T, int H, int qk, int nope, int pos0, float theta_scale, cudaStream_t s) {
+    if (T > 0) qpe_f16_kernel<<<T * H, 32, 0, s>>>(q, qcat, H, qk, nope, pos0, theta_scale);
+}
+void ring_get(const __half* ring_kv, int ring, int p0, int n, __half* dst, cudaStream_t s) {
+    if (n > 0) ring_get_kernel<<<n, 288, 0, s>>>(ring_kv, ring, p0, dst);
+}
+void ring_put(const __half* src, int ring, int p0, int n, __half* ring_kv, cudaStream_t s) {
+    if (n > 0) ring_put_kernel<<<n, 288, 0, s>>>(src, ring, p0, ring_kv);
+}
+void attn_softmax(float* S, int lds, __half* P, int ldp, int M, int nk, int H, int qpos0, int kpos0, int win,
+                  const unsigned* bits, int nwords, const int* sel_on, int kpool, const float* sinks, cudaStream_t s) {
+    if (M > 0)
+        attn_softmax_kernel<<<M, 256, 0, s>>>(S, lds, P, ldp, nk, H, qpos0, kpos0, win, bits, nwords, sel_on, kpool, sinks);
+}
+void idx_pool_rows(const float* iv, const float* ig, const float* ring, const float* ape, const float* w, int p0, int g0,
+                   int n_groups, int kpool, int dim, float eps, float theta_scale, float* pooled, cudaStream_t s) {
+    if (n_groups > 0)
+        idx_pool_rows_kernel<<<n_groups, dim, 0, s>>>(iv, ig, ring, ape, w, p0, g0, kpool, dim, eps, theta_scale, pooled);
+}
+void idx_ring_put(const float* iv, const float* ig, int p0, int r0, int n, int kpool, int dim, float* ring,
+                  cudaStream_t s) {
+    if (n > 0) idx_ring_put_kernel<<<n, 2 * dim, 0, s>>>(iv, ig, p0, r0, kpool, dim, ring);
+}
+void idx_score_rows(const float* A, const float* w, int nh, int npool, int tq, int qpos0, int kpool, float scale, float* S,
+                    cudaStream_t s) {
+    if (tq > 0 && npool > 0)
+        idx_score_rows_kernel<<<dim3(blocks(npool, 256), tq), 256, 0, s>>>(A, w, nh, npool, qpos0, kpool, scale, S);
+}
+void idx_select_rows(const float* S, int npool, int tq, int qpos0, int kpool, int top_pools, int* cells, unsigned* bits,
+                     int nwords, int* sel_on, cudaStream_t s) {
+    if (tq > 0)
+        idx_select_rows_kernel<<<tq, 1024, 0, s>>>(S, npool, qpos0, kpool, top_pools, cells, bits, nwords, sel_on);
 }
 
 bool selftest() {
