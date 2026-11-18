@@ -649,6 +649,8 @@ struct Engine::Impl {
     void ec_falloc();
     void ec_fworker();
     void ec_fcollect(bool wait, bool drop);
+    bool verify_slot(int key, const uint8_t* ptr) const;
+    long verified_main = 0, verified_helper = 0;   // (HY4_VERIFY_FILLS) the workers' copies read back so far
     void ec_drop_pending();
     void ec_adapt();
     void ec_reclaim();
@@ -698,7 +700,11 @@ struct Engine::Impl {
         int pk = 0;
         bool stage = false;
         long hits = 0, copies = 0, tok = 0;
-        int every = 1, per = 32, fill_cap = 4096;  // (see docs/LING.md, "Two cards")
+        // fill_cap (HY4_HELPER_FILL): the most copies of a fill after a prompt.  1024, not maya-ling's 4096: Hy4 keeps no
+        // lasting hot set and the scores after a long prompt are its last chunk's average, so a big fill buys little and
+        // its copies compete with the CPU lane for RAM (test-results/2026-11-18-hy4/item3: 160 tokens after 32K / 110K,
+        // 4096 41.8 / 43.7 tok/s, 1024 43.1 / 45.0, 0 43.3 / 45.4)
+        int every = 1, per = 32, fill_cap = 1024;  // (see docs/LING.md, "Two cards")
         // A background fill after a prompt (HY4_BG_REFILL): fill_left copies still to release, at most fill_batch on
         // their way at a time (HY4_HELPER_FILL_BATCH, 64) - each batch's victims evicted only when it is released, at a
         // token's end, so the rest keep serving; issued: the last hc_update's copies
@@ -1626,6 +1632,27 @@ void Engine::Impl::ec_fworker() {
     }
 }
 
+// (HY4_VERIFY_FILLS=1, a check) an expert's bytes in a slot (ptr, on the current device) read back against the
+// mapping's; false: they differ
+bool Engine::Impl::verify_slot(int key, const uint8_t* ptr) const {
+    const size_t eb = expert_bytes(key / ec.ne);
+    std::vector<uint8_t> back(eb);
+    CK(cudaMemcpy(back.data(), ptr, eb, cudaMemcpyDeviceToHost));
+    std::vector<std::pair<const uint8_t*, size_t>> parts;
+    ec_src_parts(key, 0, eb, parts);
+    size_t at = 0;
+    for (const auto& pr : parts) {
+        if (std::memcmp(back.data() + at, pr.first, pr.second) != 0) return false;
+        at += pr.second;
+    }
+    return true;
+}
+
+static bool verify_fills() {
+    static const bool v = std::getenv("HY4_VERIFY_FILLS") && std::atoi(std::getenv("HY4_VERIFY_FILLS")) != 0;
+    return v;
+}
+
 // The fill's copied experts usable (from the next token: called between tokens).  drop: its jobs not started given up
 // (their slots empty again); wait: those on their way finished first (before their slots are reclaimed or reused).
 void Engine::Impl::ec_fcollect(bool wait, bool drop) {
@@ -1646,6 +1673,14 @@ void Engine::Impl::ec_fcollect(bool wait, bool drop) {
     }
     if (wait) ec.fcv_done.wait(lk, [&] { return (int) ec.fdone.size() == ec.finflight; });
     for (const auto& kv : ec.fdone) {
+        if (verify_fills()) {
+            if (!verify_slot(kv.first, ec.ptr[(size_t) kv.second])) {
+                std::fprintf(stderr, "maya-hy4: HY4_VERIFY_FILLS: expert %d of layer %d differs in main slot %d\n",
+                             kv.first % ec.ne, kv.first / ec.ne, kv.second);
+                std::abort();
+            }
+            ++verified_main;
+        }
         if (ec.owner[(size_t) kv.second] == kv.first && ec.where[(size_t) kv.first] == -2)
             ec.where[(size_t) kv.first] = kv.second;
         ++ec.copies;
@@ -1951,7 +1986,9 @@ void Engine::Impl::ec_arrive() {
     }
 }
 
-// Every pending copy finished now (whole experts again, through ec_copy_many), before the slots are refilled or lent back
+// Every pending swap finished now (whole experts again, through ec_copy_many), before the slots are refilled or lent
+// back.  The fill's worker: what it has not started is dropped (its slots empty), what is on its way waited for - only
+// at a prompt, a refill or a reservation of cache rows (once in 4,096 tokens), so a refill is not cut short in practice
 void Engine::Impl::ec_flush() {
     ec_fcollect(true, true);   // (the fill's: the rest dropped, those on their way in)
     if (!ec.arrived.empty() || !ec.arrived_prev.empty()) {
@@ -2346,9 +2383,11 @@ void Engine::Impl::hc_drop_queued() {
         if (hc.where[(size_t) kv.first] == -2) hc.where[(size_t) kv.first] = -1;
     }
     hc.inflight -= (int) jobs.size();
+    const int left = hc.fill_left;
     hc.fill_left = 0;
-    if (o.verbose && !jobs.empty())
-        std::fprintf(stderr, "maya-hy4: a new prompt: %zu of the helper's copies still to come dropped\n", jobs.size());
+    if (o.verbose && (!jobs.empty() || left > 0))
+        std::fprintf(stderr, "maya-hy4: a new prompt: %zu of the helper's queued copies and %d of its fill still to "
+                     "release dropped\n", jobs.size(), left);
 }
 
 // The copied experts become usable (wait: all of those on their way first)
@@ -2356,6 +2395,17 @@ void Engine::Impl::hc_collect(bool wait) {
     if (hc.inflight == 0) return;
     std::unique_lock<std::mutex> lk(hc.mu);
     if (wait) hc.cv_done.wait(lk, [&] { return (int) hc.done.size() == hc.inflight; });
+    if (verify_fills() && !hc.done.empty()) {   // (the worker's copies read back, on the helper)
+        OnDev od(hc.dev);
+        for (const auto& kv : hc.done) {
+            if (!verify_slot(kv.first, hc.ptr[(size_t) kv.second])) {
+                std::fprintf(stderr, "maya-hy4: HY4_VERIFY_FILLS: expert %d of layer %d differs in helper slot %d\n",
+                             kv.first % ec.ne, kv.first / ec.ne, kv.second);
+                std::abort();
+            }
+            ++verified_helper;
+        }
+    }
     for (const auto& kv : hc.done) {
         hc.busy[(size_t) kv.second] = 0;
         hc.where[(size_t) kv.first] = kv.second;
@@ -3806,16 +3856,19 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         trace("plan", il, pl[1], 0, 0);
-        if (graphs > 0 && lazy) {   // (the next segment behind this layer's wait)
-            CK(cudaGraphLaunch(gx[(size_t) (il + 1)], s));
-            (void) cudaStreamQuery(s);
-        }
-        if (hd && il + 1 < g.n_layer) hd_launch(il + 1);   // (the helper's next layer, waiting for its plan)
-        if (staging) {
-            ec_stage_end();
-            staging = false;
-            trace("staged", il, 0, 0, 0);
-        }
+        // The next segment behind this layer's wait and the helper's next layer (waiting for its plan): launched once
+        // the CPU lane has its experts (a launch, a stream query and the helper's device switch are ~0.4-0.9 ms a token
+        // the lane would otherwise start late by), or at once when it has none
+        bool launched = false;
+        auto launch_next = [&] {
+            if (launched) return;
+            launched = true;
+            if (graphs > 0 && lazy) {
+                CK(cudaGraphLaunch(gx[(size_t) (il + 1)], s));
+                (void) cudaStreamQuery(s);
+            }
+            if (hd && il + 1 < g.n_layer) hd_launch(il + 1);
+        };
         phase(pt.att);
         const int nmain = pl[1];
         int csel[16], hslot[16];
@@ -3841,6 +3894,12 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
         ec.lookups += nu;
         ec.hits += nmain;
         hc.hits += nh;
+        if (nc == 0) launch_next();   // (no CPU lane this layer: the launches before the staging's join)
+        if (staging) {   // (the pool free again for the lane)
+            ec_stage_end();
+            staging = false;
+            trace("staged", il, 0, 0, 0);
+        }
         phase(pt.route);
         const int nh_host = hd ? 0 : nh;   // (hd: the helper card takes its own)
         if (nc || nh_host) {
@@ -3849,6 +3908,7 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
             int* ans = m_ans + (size_t) il * ans_ints;
             float* part = (float*) (ans + k::kAnsHead);
             if (nc) lane.begin(*pool, l.cl, NL, ff, csel, cw, nc, xin, part);
+            launch_next();
             if (nh_host) hc_experts(l, hslot, hw, nh, xin);
             phase(pt.glaunch);
             if (nc) lane.end();
@@ -3888,6 +3948,7 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
             cpu_ms += now_ms() - c0;
             phase(pt.cpu);
         }
+        launch_next();   // (no CPU lane this layer: now)
         pt.cpu_experts += nc;
         st.lane_layers += nc > 0;
         st.helper_layers += nh > 0;
@@ -4128,6 +4189,9 @@ const float* Engine::Impl::step(int token) {
             std::fprintf(stderr,
                          "maya-hy4: the refill after the prompt (%ld main, %d helper copies) was up after %d tokens, "
                          "%.1f s\n", refill_main, refill_helper, refill_tok, (now_ms() - refill_ms) / 1000.0);
+            if (verify_fills())
+                std::fprintf(stderr, "maya-hy4: HY4_VERIFY_FILLS: %ld main and %ld helper copies read back so far, all "
+                             "as the mapping's\n", verified_main, verified_helper);
             refill_tok = -1;
         }
     }
