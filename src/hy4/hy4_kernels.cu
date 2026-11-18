@@ -1424,22 +1424,23 @@ void lat_sum_q8(const float* cpu, const float* gpu, const int* flags, int n, flo
 
 namespace {
 // ------------------------------------------------------------------------------------------------ Hy4: the indexer
-// grid 1, block 2 dim: the token's value and gate rows (iv, ig [dim]) into the open group's slot pos % kpool of ring
-// [kpool][2 dim] (value | gate)
+// grid 1, block 2 dim: the token's value and gate rows (iv, ig [dim]) into slot pos % nring of ring [nring][2 dim]
+// (value | gate; nring a multiple of kpool - a group's members in kpool slots in a row)
 __global__ void idx_store_kernel(const float* __restrict__ iv, const float* __restrict__ ig, const int* __restrict__ dpos,
-                                 int kpool, int dim, float* __restrict__ ring) {
-    const int t = threadIdx.x, slot = *dpos % kpool;
+                                 int nring, int dim, float* __restrict__ ring) {
+    const int t = threadIdx.x, slot = *dpos % nring;
     ring[(size_t) slot * 2 * dim + t] = t < dim ? iv[t] : ig[t - dim];
 }
 // grid 1, block dim: when pos ends a group, its pooled key into pooled[pos / kpool]: per element e, the softmax over the
 // group's members m of (gate[m][e] + ape[m][e]) weighting value[m][e]; then RMS-normed (eps) times w; then RoPE (NORM
 // pairs) on its last 64 values at the group's first position
 __global__ void idx_pool_kernel(const float* __restrict__ ring, const float* __restrict__ ape, const float* __restrict__ w,
-                                const int* __restrict__ dpos, int kpool, int dim, float eps, float theta_scale,
-                                float* __restrict__ pooled) {
+                                const int* __restrict__ dpos, int kpool, int nring, int dim, float eps,
+                                float theta_scale, float* __restrict__ pooled) {
     const int pos = *dpos;
     if ((pos + 1) % kpool != 0) return;
     const int e = threadIdx.x;
+    ring += (size_t) ((pos + 1 - kpool) % nring) * 2 * dim;   // (the group's first member's slot)
     float mx = -INFINITY;
     for (int m = 0; m < kpool; ++m) mx = fmaxf(mx, ring[(size_t) m * 2 * dim + dim + e] + ape[(size_t) m * dim + e]);
     float den = 0.0f, num = 0.0f;
@@ -1509,12 +1510,13 @@ __global__ void __launch_bounds__(1024) idx_select_kernel(const float* __restric
 }
 }  // namespace
 
-void idx_store(const float* iv, const float* ig, const int* dpos, int kpool, int dim, float* ring, cudaStream_t s) {
-    idx_store_kernel<<<1, 2 * dim, 0, s>>>(iv, ig, dpos, kpool, dim, ring);
+void idx_store(const float* iv, const float* ig, const int* dpos, int nring, int dim, float* ring, cudaStream_t s) {
+    idx_store_kernel<<<1, 2 * dim, 0, s>>>(iv, ig, dpos, nring, dim, ring);
 }
-void idx_pool(const float* ring, const float* ape, const float* w, const int* dpos, int kpool, int dim, float eps,
+void idx_pool(const float* ring, const float* ape, const float* w, const int* dpos, int kpool, int nring, int dim,
+              float eps,
               float theta_scale, float* pooled, cudaStream_t s) {
-    idx_pool_kernel<<<1, dim, 0, s>>>(ring, ape, w, dpos, kpool, dim, eps, theta_scale, pooled);
+    idx_pool_kernel<<<1, dim, 0, s>>>(ring, ape, w, dpos, kpool, nring, dim, eps, theta_scale, pooled);
 }
 void idx_score(const float* q, const float* w, const float* pooled, const int* dpos, int kpool, int nh, int dim,
                float scale, int max_pools, float* score, cudaStream_t s) {
@@ -1685,19 +1687,19 @@ __global__ void attn_softmax_kernel(float* __restrict__ S, int lds, __half* __re
     for (int c = threadIdx.x; c < ldp; c += blockDim.x) prow[c] = __float2half(c < nk ? row[c] * inv : 0.0f);
 }
 // The indexer's pooled keys for the groups that end in the rows [T] at positions p0 .. p0 + T (g from g0): each member
-// from the rows (iv, ig [T][dim]) or, before p0, the ring (slot pos % kpool); pooled as idx_pool_kernel.  grid n_groups,
-// block dim.
+// from the rows (iv, ig [T][dim]) or, before p0, the ring (slot pos % nring); pooled as idx_pool_kernel.  grid
+// n_groups, block dim.
 __global__ void idx_pool_rows_kernel(const float* __restrict__ iv, const float* __restrict__ ig,
                                      const float* __restrict__ ring, const float* __restrict__ ape,
-                                     const float* __restrict__ w, int p0, int g0, int kpool, int dim, float eps,
-                                     float theta_scale, float* __restrict__ pooled) {
+                                     const float* __restrict__ w, int p0, int g0, int kpool, int nring, int dim,
+                                     float eps, float theta_scale, float* __restrict__ pooled) {
     const int gi = g0 + blockIdx.x, e = threadIdx.x;
     float gv[16], vv[16];
     float mx = -INFINITY;
     for (int m = 0; m < kpool; ++m) {
         const int p = gi * kpool + m;
-        const float a = p >= p0 ? ig[(size_t) (p - p0) * dim + e] : ring[(size_t) (p % kpool) * 2 * dim + dim + e];
-        const float v = p >= p0 ? iv[(size_t) (p - p0) * dim + e] : ring[(size_t) (p % kpool) * 2 * dim + e];
+        const float a = p >= p0 ? ig[(size_t) (p - p0) * dim + e] : ring[(size_t) (p % nring) * 2 * dim + dim + e];
+        const float v = p >= p0 ? iv[(size_t) (p - p0) * dim + e] : ring[(size_t) (p % nring) * 2 * dim + e];
         gv[m] = a + ape[(size_t) m * dim + e];
         vv[m] = v;
         mx = fmaxf(mx, gv[m]);
@@ -1724,9 +1726,9 @@ __global__ void idx_pool_rows_kernel(const float* __restrict__ iv, const float* 
     }
 }
 // grid n, block 2 dim: the rows for positions p0 + r0 .. into the ring's slots (the open group's members)
-__global__ void idx_ring_put_kernel(const float* __restrict__ iv, const float* __restrict__ ig, int p0, int r0, int kpool,
-                                    int dim, float* __restrict__ ring) {
-    const int r = r0 + blockIdx.x, t = threadIdx.x, slot = (p0 + r) % kpool;
+__global__ void idx_ring_put_kernel(const float* __restrict__ iv, const float* __restrict__ ig, int p0, int r0,
+                                    int nring, int dim, float* __restrict__ ring) {
+    const int r = r0 + blockIdx.x, t = threadIdx.x, slot = (p0 + r) % nring;
     ring[(size_t) slot * 2 * dim + t] = t < dim ? iv[(size_t) r * dim + t] : ig[(size_t) r * dim + t - dim];
 }
 // grid (ceil(npool / 256), tq), block 256: S [tq][npool] = sum_h relu(A [tq nh][npool]) w [tq][nh] scale, -inf for the
@@ -1796,13 +1798,15 @@ void attn_softmax(float* S, int lds, __half* P, int ldp, int M, int nk, int H, i
         attn_softmax_kernel<<<M, 256, 0, s>>>(S, lds, P, ldp, nk, H, qpos0, kpos0, win, bits, nwords, sel_on, kpool, sinks);
 }
 void idx_pool_rows(const float* iv, const float* ig, const float* ring, const float* ape, const float* w, int p0, int g0,
-                   int n_groups, int kpool, int dim, float eps, float theta_scale, float* pooled, cudaStream_t s) {
+                   int n_groups, int kpool, int nring, int dim, float eps, float theta_scale, float* pooled,
+                   cudaStream_t s) {
     if (n_groups > 0)
-        idx_pool_rows_kernel<<<n_groups, dim, 0, s>>>(iv, ig, ring, ape, w, p0, g0, kpool, dim, eps, theta_scale, pooled);
+        idx_pool_rows_kernel<<<n_groups, dim, 0, s>>>(iv, ig, ring, ape, w, p0, g0, kpool, nring, dim, eps, theta_scale,
+                                                       pooled);
 }
-void idx_ring_put(const float* iv, const float* ig, int p0, int r0, int n, int kpool, int dim, float* ring,
+void idx_ring_put(const float* iv, const float* ig, int p0, int r0, int n, int nring, int dim, float* ring,
                   cudaStream_t s) {
-    if (n > 0) idx_ring_put_kernel<<<n, 2 * dim, 0, s>>>(iv, ig, p0, r0, kpool, dim, ring);
+    if (n > 0) idx_ring_put_kernel<<<n, 2 * dim, 0, s>>>(iv, ig, p0, r0, nring, dim, ring);
 }
 void idx_score_rows(const float* A, const float* w, int nh, int npool, int tq, int qpos0, int kpool, float scale, float* S,
                     cudaStream_t s) {

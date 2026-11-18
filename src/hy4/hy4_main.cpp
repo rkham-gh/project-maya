@@ -5,9 +5,17 @@
 // --serve speaks Maya's engine protocol (serve/server.py's StrataEngine): INFO lines, then `READY <context> stop`; per
 // request `GEN <max_new> [key=value ...] <id,id,...>` answered by `PP <read> <total> <ms> <tok/s> <reused>` while the
 // prompt is read, a `T <id>` line a token, and `DONE <generated> <prompt> <prompt ms> <decode ms> <stop|length|cancel>
-// 0 0 <reused>`; `STOP` ends a request early, `QUIT` the engine.  A prompt that continues the last conversation (its
-// tokens so far, the generated ones included) reads only the rest: the KDA layers' state cannot go back, so anything
-// else starts over.  Keys: temperature, top_p, top_k, min_p, seed.  A request ends at the GGUF's eos (<|role_end|>).
+// <accepted> <offered> <reused>`; `STOP` ends a request early, `QUIT` the engine.  A prompt that continues the last
+// conversation (its tokens so far, the generated ones included) reads only the rest: the KDA layers' state cannot go
+// back, so anything else starts over.  Keys: temperature, top_p, top_k, min_p, seed; lookup=0|1 (the prompt lookup's
+// drafts, below; suffix_draft=0|1 too, server.py's strata_tune key), window=N (their window's cap).  A request ends at
+// the GGUF's eos (<|role_end|>).
+//
+// Prompt lookup (maya-ds4's): the conversation's tokens so far suffix-matched (strata::spec::SuffixDrafter, a match of
+// HY4_LOOKUP_MIN tokens or more, 3; 0: off) propose what followed them; DraftPolicy weighs a window of them against a
+// plain step by this PC's measured round times and the matches' acceptance, and a chosen window is verified in one pass
+// (Engine::step_window): each row sampled as a plain step's would be, kept while it equals the draft, the first that
+// differs (or the bonus row after the last draft) the round's last token - the same tokens a plain decode samples.
 //
 //   maya-hy4 --gguf <...> --ids @prompt.txt [--gen N | --follow @tokens.txt] [--top N] [--dump-logits out.bin]
 //
@@ -45,6 +53,8 @@
 
 #include "hy4_kernels.cuh"
 #include "hy4_model.hpp"
+#include "strata/spec/draft_policy.hpp"
+#include "strata/spec/suffix_drafter.hpp"
 
 namespace {
 
@@ -316,6 +326,12 @@ int main(int argc, char** argv) {
         static FILE* ldump = std::getenv("HY4_LOGITS_DUMP") ? std::fopen(std::getenv("HY4_LOGITS_DUMP"), "wb") : nullptr;
         // (HY4_RUNS_WINDOW=<T>, a check of windowed decode: a follow fed T tokens a pass - the same lines as one by one)
         static const int rwin = std::getenv("HY4_RUNS_WINDOW") ? std::atoi(std::getenv("HY4_RUNS_WINDOW")) : 0;
+        // (HY4_RUNS_REJECT=1, a check of a draft's rollback: each window's tokens past a kept count of 1 .. T (in turn)
+        //  wrong ones, window_keep(kept) - the lines still the follow's own; 2: one kept a window; 3 / 4: as 1 / 2
+        //  with the follow's own tokens past the kept ones - a rollback that leaves nothing behind gives 1 / 2's bits)
+        static const int rrej = std::getenv("HY4_RUNS_REJECT") ? std::atoi(std::getenv("HY4_RUNS_REJECT")) : 0;
+        std::vector<int> wt;
+        long nwin = 0;
         std::vector<float> wbuf;
         int wleft = 0;   // (positions of the window's logits still to print)
         for (int n = 0; n < steps && lg; ++n) {
@@ -342,14 +358,23 @@ int main(int argc, char** argv) {
             }
             const int W = !follow.empty() && rwin >= 2 ? std::min(rwin, steps - n) : 1;
             if (W >= 2 && W <= eng.window_max()) {
-                const float* lw = eng.step_window(follow.data() + n, W);
+                int kept = W;
+                wt.assign(follow.begin() + n, follow.begin() + n + W);
+                if (rrej) {
+                    kept = rrej % 2 == 0 ? 1 : 1 + (int) (nwin % W);
+                    if (rrej <= 2)
+                        for (int j = kept; j < W; ++j) wt[(size_t) j] = (wt[(size_t) j] + 7919 * (j + 1)) % V;
+                }
+                ++nwin;
+                const float* lw = eng.step_window(wt.data(), W);
                 if (!lw) {
                     lg = nullptr;
                     break;
                 }
-                wbuf.assign(lw, lw + (size_t) W * V);
+                eng.window_keep(kept);
+                wbuf.assign(lw, lw + (size_t) kept * V);
                 lg = wbuf.data();
-                wleft = W - 1;
+                wleft = kept - 1;
                 continue;
             }
             lg = eng.step(pick);
@@ -429,6 +454,13 @@ int main(int argc, char** argv) {
     std::vector<float> snap_last;
     bool have_snap = false;
     std::mt19937_64 rng(std::random_device{}());
+    // the prompt lookup (above): its drafter a request, its policy over the engine's life (the round times: this PC's)
+    const int wmax = eng.window_max();
+    const int lk_min = std::getenv("HY4_LOOKUP_MIN") ? std::atoi(std::getenv("HY4_LOOKUP_MIN")) : 3;
+    strata::spec::SuffixDrafter sfx(std::max(1, lk_min), 64, (size_t) eng.max_ctx());
+    strata::spec::DraftPolicy policy(std::max(1, wmax));
+    std::vector<int32_t> dbuf((size_t) std::max(1, wmax));
+    std::vector<int> wtoks((size_t) std::max(1, wmax));
     std::string line;
     while (in.next(line)) {
         if (line == "QUIT") break;
@@ -441,6 +473,7 @@ int main(int argc, char** argv) {
         ss >> max_new;
         Sampling sp;
         int think_budget = 0, think_end = -1;   // (the server's thinking budget: </think> forced after that many)
+        int lk_on = lk_min > 0 && wmax >= 2 ? 1 : 0, wcap = wmax;
         std::vector<std::string> fields;
         while (ss >> w) fields.push_back(w);
         if (fields.empty()) continue;
@@ -457,6 +490,9 @@ int main(int argc, char** argv) {
             else if (k == "seed") sp.seed = std::atoll(v.c_str());
             else if (k == "think_budget") think_budget = std::atoi(v.c_str());
             else if (k == "think_end") think_end = std::atoi(v.c_str());
+            else if (k == "lookup" || k == "suffix_draft")   // (suffix_draft: server.py's strata_tune key)
+                lk_on = lk_min > 0 && wmax >= 2 && std::atoi(v.c_str()) != 0 ? 1 : 0;
+            else if (k == "window") wcap = std::max(1, std::min(wmax, std::atoi(v.c_str())));
         }
         bool in_think = think_budget > 0 && think_end >= 0 && think_end < V;
         if (sp.seed >= 0) rng.seed((uint64_t) sp.seed);
@@ -511,8 +547,14 @@ int main(int argc, char** argv) {
         int generated = 0;
         std::string finish = "length";
         if (in.stop.load()) finish = "cancel";
-        while (finish != "cancel" && generated < max_new && lg) {
-            int t = sample(lg, V, sp, rng);
+        // the tokens: each sampled from the logits after the ones before it (lg: after hist), printed, then fed - a
+        // round feeds the last one and, where the policy takes them, the lookup's drafts after it in one window, and
+        // keeps the drafts while the rows sampled equal them
+        long long offered = 0, accepted = 0;
+        long long rounds = 0, wins[17] = {};   // (the rounds, the windows by their size: the policy's choices)
+        // a token sampled: the thinking budget's forcing, printed, counted; then whether the request ends at it - 1
+        // unfed (its end token, STOP, the context full), 2 fed (max_new: fed as the plain loop did), 0 goes on
+        auto emit = [&](int t, int& end) -> int {
             if (in_think) {   // (the reasoning closed by the model, or at the budget by the engine)
                 if (t != think_end && generated >= think_budget) t = think_end;
                 if (t == think_end) in_think = false;
@@ -520,15 +562,75 @@ int main(int argc, char** argv) {
             std::printf("T %d\n", t);
             std::fflush(stdout);
             ++generated;
+            if (lk_on) sfx.append((int32_t) t);   // (the drafter's history: every printed token, fed or about to be)
+            end = 0;
             if (t == eos) {
                 finish = "stop";
-                break;
-            }
-            if (in.stop.load()) {
+                end = 1;
+            } else if (in.stop.load()) {
                 finish = "cancel";
-                break;
+                end = 1;
+            } else if ((int) hist.size() + 1 >= eng.max_ctx()) {   // (hist: the fed tokens, pos() but in a window)
+                end = 1;
+            } else if (generated >= max_new) {
+                end = 2;
             }
-            if (eng.pos() + 1 >= eng.max_ctx()) break;
+            return t;
+        };
+        if (lk_on) sfx.reset(), sfx.append(hist.data(), hist.size());
+        int end = finish == "cancel" || max_new <= 0 || !lg ? 1 : 0;
+        int t = end ? -1 : emit(sample(lg, V, sp, rng), end);
+        while (end == 0) {
+            // tokens this round may feed: t and the drafts after it - a window's T rows print up to T tokens (max_new's
+            // last then the bonus row's, fed after the loop) and take positions before the context's last
+            const int room = std::min({wcap, max_new - generated, eng.max_ctx() - 1 - (int) hist.size()});
+            const double r0 = now_ms();
+            int match = 0;
+            strata::spec::DraftPolicy::Pick pk;
+            if (lk_on && room >= 2) {
+                const int kd = sfx.propose(room - 1, dbuf.data());
+                match = sfx.last_match();
+                if (kd > 0) pk = policy.choose(1, kd, match);
+            }
+            ++rounds;
+            if (pk.lookup && pk.t >= 2) {
+                const int T = pk.t;
+                wtoks[0] = t;
+                for (int i = 1; i < T; ++i) wtoks[(size_t) i] = dbuf[(size_t) (i - 1)];
+                const float* lw = eng.step_window(wtoks.data(), T);
+                if (!lw && !eng.failed()) {   // (no window after all: plain steps for the request)
+                    lk_on = 0;
+                    continue;
+                }
+                if (!lw) break;   // (a card gave up: failed(), below)
+                hist.push_back(t);
+                int kept = 1;
+                for (int i = 0; i < T; ++i) {
+                    const int s = emit(sample(lw + (size_t) i * V, V, sp, rng), end);
+                    lg = lw + (size_t) i * V;   // (the logits after hist: row kept - 1)
+                    if (i < T - 1 && s == wtoks[(size_t) i + 1] && end == 0) {
+                        ++kept;
+                        hist.push_back(s);
+                        continue;
+                    }
+                    t = s;   // (the round's last: fed by the next round)
+                    break;
+                }
+                eng.window_keep(kept);
+                offered += T - 1;
+                accepted += kept - 1;
+                ++wins[T];
+                policy.observe(true, T, kept - 1, match, now_ms() - r0);
+                continue;
+            }
+            lg = eng.step(t);
+            hist.push_back(t);
+            if (!lg) break;
+            ++wins[1];
+            if (lk_on) policy.observe(false, 1, 0, match, now_ms() - r0);
+            t = emit(sample(lg, V, sp, rng), end);
+        }
+        if (end == 2 && !eng.failed()) {   // (max_new's token fed, as the plain loop did: the logits after it kept)
             lg = eng.step(t);
             hist.push_back(t);
         }
@@ -536,7 +638,8 @@ int main(int argc, char** argv) {
             // (serve/server.py keys on "the conversation was dropped" - DROPPED, dropped_state(): keep the phrase)
             std::printf("ERR maya-hy4: a card gave up waiting for the other (the device's routing); the conversation "
                         "was dropped\n");
-            std::printf("DONE %d %zu %.1f %.1f length 0 0 %zu\n", generated, ids.size(), p1 - p0, now_ms() - p1, reuse);
+            std::printf("DONE %d %zu %.1f %.1f length %lld %lld %zu\n", generated, ids.size(), p1 - p0, now_ms() - p1,
+                        accepted, offered, reuse);
             std::fflush(stdout);
             eng.reset();
             hist.clear();
@@ -554,8 +657,16 @@ int main(int argc, char** argv) {
                     st.lookups ? (double) st.hits / st.lookups : 0.0, st.cache_slots, st.cache_copies,
                     st.lookups ? (double) st.hits_helper / st.lookups : 0.0, st.helper_slots, st.helper_copies,
                     st.ms_total > 0 ? st.tokens * 1000.0 / st.ms_total : 0.0);
-        std::printf("DONE %d %zu %.1f %.1f %s 0 0 %zu\n", generated, ids.size(), p1 - p0, now_ms() - p1, finish.c_str(),
-                    reuse);
+        if (lk_on) {   // (the lookup's rounds: the windows by size, the drafts kept of those verified)
+            std::string ws;
+            for (int i = 1; i <= 16; ++i)
+                if (wins[i]) ws += " " + std::to_string(i) + ":" + std::to_string(wins[i]);
+            std::fprintf(stderr,
+                         "maya-hy4: lookup %lld of %lld drafts kept (%.1f%%), %lld rounds for %d tokens, windows%s\n",
+                         accepted, offered, offered ? 100.0 * accepted / offered : 0.0, rounds, generated, ws.c_str());
+        }
+        std::printf("DONE %d %zu %.1f %.1f %s %lld %lld %zu\n", generated, ids.size(), p1 - p0, now_ms() - p1,
+                    finish.c_str(), accepted, offered, reuse);
         std::fflush(stdout);
         eng.clear_stats();
         eng.save_profile();   // (the scores for the next start)

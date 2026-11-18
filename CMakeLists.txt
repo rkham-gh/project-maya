@@ -992,7 +992,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(maya-hy4 src/hy4/hy4_main.cpp src/hy4/hy4_model.cu src/hy4/hy4_kernels.cu src/hy4/hy4_cpu.cpp
                             src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_gguf_cpu.cpp)
     target_include_directories(maya-hy4 PRIVATE ${_strata_gpu_include_directories} include src/hy4 third_party/ggml)
-    target_link_libraries(maya-hy4 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    target_link_libraries(maya-hy4 PRIVATE strata_kernels_cpu strata_spec ${_strata_gpu_runtime_target}
+                                           ${_strata_gpu_blas_target})
     target_compile_definitions(maya-hy4 PRIVATE MAYA_DS4_IQ_ONLY)
   endif()
 

@@ -162,12 +162,14 @@ void eg_update(const float* kv, const float* kb, const float* gw, const float* h
 void lat_sum_q8(const float* cpu, const float* gpu, const int* flags, int n, float* y, int8_t* q, float* d,
                 cudaStream_t s);
 
-/// The indexer (sparse layers): the token's value and gate rows (dim each) into the open group's slot of ring
-/// [kpool][2 dim].
-void idx_store(const float* iv, const float* ig, const int* dpos, int kpool, int dim, float* ring, cudaStream_t s);
+/// The indexer (sparse layers): the token's value and gate rows (dim each) into slot *dpos % nring of ring
+/// [nring][2 dim] (nring a multiple of kpool: the open group and the next ones a draft's rejected tokens may write -
+/// Geo::idx_nring).
+void idx_store(const float* iv, const float* ig, const int* dpos, int nring, int dim, float* ring, cudaStream_t s);
 /// When *dpos ends a group: its pooled key (softmax over the members of gate + ape, per element, weighting value; then
 /// RMS-normed times w; RoPE on its last 64 values at the group's first position) into pooled[*dpos / kpool].
-void idx_pool(const float* ring, const float* ape, const float* w, const int* dpos, int kpool, int dim, float eps,
+void idx_pool(const float* ring, const float* ape, const float* w, const int* dpos, int kpool, int nring, int dim,
+              float eps,
               float theta_scale, float* pooled, cudaStream_t s);
 /// score[g] = sum_h relu(q_h . pooled_g) w_h scale for the complete groups before the token's own (q [nh][dim]).
 void idx_score(const float* q, const float* w, const float* pooled, const int* dpos, int kpool, int nh, int dim,
@@ -201,9 +203,10 @@ void attn_softmax(float* S, int lds, __half* P, int ldp, int M, int nk, int H, i
 /// The indexer's pooled keys of the groups g0 .. g0 + n_groups that end in the rows (iv, ig [T][dim] at positions p0 ..),
 /// members before p0 from the ring; into pooled[g].
 void idx_pool_rows(const float* iv, const float* ig, const float* ring, const float* ape, const float* w, int p0, int g0,
-                   int n_groups, int kpool, int dim, float eps, float theta_scale, float* pooled, cudaStream_t s);
+                   int n_groups, int kpool, int nring, int dim, float eps, float theta_scale, float* pooled,
+                   cudaStream_t s);
 /// rows r0 .. r0 + n of (iv, ig) at positions p0 + r into the ring's slots.
-void idx_ring_put(const float* iv, const float* ig, int p0, int r0, int n, int kpool, int dim, float* ring,
+void idx_ring_put(const float* iv, const float* ig, int p0, int r0, int n, int nring, int dim, float* ring,
                   cudaStream_t s);
 /// S [tq][npool] = sum_h relu(A [tq nh][npool]) w [tq][nh] scale, -inf from the token's own group on.
 void idx_score_rows(const float* A, const float* w, int nh, int npool, int tq, int qpos0, int kpool, float scale, float* S,

@@ -25,6 +25,9 @@ struct Geo {
     int swa_window = 0;
     // the indexer (sparse layers)
     int idx_heads = 0, idx_dim = 0, idx_top_k = 0, idx_kpool = 0, idx_tail = 0;
+    // the indexer's ring of members: the open group and enough after it for a window's rejected tokens (up to 7, past
+    // the kept ones) never to write the open group's slots - idx_kpool (1 + ceil(7 / idx_kpool))
+    int idx_nring = 0;
     // hyper-connections
     int hc = 0;
     float hc_eps = 1e-6f, hc_mag = 2.0f;
@@ -78,6 +81,9 @@ public:
     /// token t's at t vocab), pos + T.  nullptr: windows off, T out of range, not fitting (step them), or failed().
     const float* step_window(const int* toks, int T);
     int window_max() const;   // (HY4_WINDOW_MAX, 6; 0: no windows)
+    /// The last window's first `kept` tokens kept (0 .. T; a verified draft's), pos() after them.  Until it is called the
+    /// window is pending; step() / step_window() / prefill keep a pending one whole first.
+    void window_keep(int kept);
     /// n tokens at pos() as one prompt: the logits after the last one (as step()), pos + n.  nullptr when they do not
     /// fit before max_ctx().  progress (when set) is called as they go, with the tokens read so far.
     const float* prefill(const int* ids, int n, void (*progress)(void*, int) = nullptr, void* ctx = nullptr);

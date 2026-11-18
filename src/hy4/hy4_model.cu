@@ -337,6 +337,11 @@ struct Engine::Impl {
     void win_graphs();
     void pre_step(int rows);
     const float* step_window(const int* toks, int T);
+    // a window not yet kept (window_keep): its start, size and each token's choices a layer ([n_layer][wTm][16]) - its
+    // scores count only for the tokens kept
+    int wp_T = 0, wp_pos0 = 0;
+    std::vector<int> wp_sel;
+    void window_keep(int kept);
 
     // Engram's tables and the token history its n-grams read (hist[p]: the token at position p)
     const uint8_t* eg_table = nullptr;
@@ -921,14 +926,16 @@ bool Engine::load(const Options& o, std::string& err) { return p->load(o, err); 
 const float* Engine::step(int token) { return p->step(token); }
 const float* Engine::step_window(const int* toks, int T) { return p->step_window(toks, T); }
 int Engine::window_max() const { return p->wTm; }
+void Engine::window_keep(int kept) { p->window_keep(kept); }
 const float* Engine::prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx) {
     return p->prefill(ids, n, progress, ctx);
 }
 
 bool Engine::snapshot() {
     Impl& m = *p;
+    if (m.wp_T > 0) m.window_keep(m.wp_T);
     // (the indexer's open groups: their slots are written again by the tokens after the snapshot)
-    const size_t ring = (size_t) m.g.idx_kpool * 2 * m.g.idx_dim * sizeof(float);
+    const size_t ring = (size_t) m.g.idx_nring * 2 * m.g.idx_dim * sizeof(float);
     uint8_t* at = (uint8_t*) m.snap_ring;
     for (const Layer& l : m.L)
         if (l.idx) {
@@ -949,8 +956,9 @@ bool Engine::snapshot() {
 
 bool Engine::restore() {
     Impl& m = *p;
+    m.wp_T = 0;
     if (m.snap_pos < 0) return false;
-    const size_t ring = (size_t) m.g.idx_kpool * 2 * m.g.idx_dim * sizeof(float);
+    const size_t ring = (size_t) m.g.idx_nring * 2 * m.g.idx_dim * sizeof(float);
     const uint8_t* at = (const uint8_t*) m.snap_ring;
     for (Layer& l : m.L)
         if (l.idx) {
@@ -971,6 +979,7 @@ bool Engine::restore() {
 bool Engine::failed() const { return p->fault; }
 
 void Engine::reset() {
+    p->wp_T = 0;   // (a pending window dropped: its scores never counted)
     p->fault = false;
     p->pos = 0;
     p->snap_pos = -1;
@@ -1070,6 +1079,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     g.idx_dim = meta_int(f0, A + "attention.indexer.key_length", 0);
     g.idx_top_k = meta_int(f0, A + "attention.indexer.top_k", 0);
     g.idx_kpool = meta_int(f0, A + "attention.indexer.kpool", 0);
+    g.idx_nring = g.idx_kpool > 0 ? g.idx_kpool * (1 + (7 + g.idx_kpool - 1) / g.idx_kpool) : 0;
     g.idx_tail = meta_int(f0, A + "attention.indexer.kpool_select_tail", 0);
     g.hc = meta_int(f0, A + "hyper_connection.count", 0);
     g.hc_eps = meta_f(f0, A + "hyper_connection.epsilon", 1e-6f);
@@ -1267,7 +1277,8 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
                 !(l.idx_ape = f32(b + "indexer_compressor_ape.weight", (size_t) KP * D, err)) ||
                 !(l.idx_pnorm = f32(b + "indexer_compressor_norm.weight", (size_t) D, err)))
                 return false;
-            l.idx_ring = dalloc<float>((size_t) KP * 2 * D);
+            l.idx_ring = dalloc<float>((size_t) g.idx_nring * 2 * D);
+            (void) KP;
             l.idx_pooled = dalloc<float>((size_t) (max_ctx / KP + 1) * D);
         }
         for (size_t e = 0; e < g.eg_layers.size(); ++e)
@@ -1423,7 +1434,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
             ncell = dalloc<int>(1);
             xq_i = dalloc<int8_t>(D);
             xd_i = dalloc<float>(D / 32);
-            snap_ring = dalloc<float>((size_t) n_idx * KP * 2 * D);
+            snap_ring = dalloc<float>((size_t) n_idx * g.idx_nring * 2 * D);
         }
     }
 
@@ -3108,10 +3119,10 @@ void Engine::Impl::pf_index(Layer& l, const float* A_, const __half* Ah_, int T,
     lin(l.idx_v, pf.IKNh, pf.IKN, T, pf.IV);
     lin(l.idx_g, pf.IKNh, pf.IKN, T, pf.IG);
     const int g0 = p0 / KP, g1 = (p0 + T) / KP;   // (the groups that end in the piece: g0 .. g1)
-    k::idx_pool_rows(pf.IV, pf.IG, l.idx_ring, l.idx_ape, l.idx_pnorm, p0, g0, g1 - g0, KP, D, g.eps, l.theta_scale,
-                     l.idx_pooled, s);
+    k::idx_pool_rows(pf.IV, pf.IG, l.idx_ring, l.idx_ape, l.idx_pnorm, p0, g0, g1 - g0, KP, g.idx_nring, D, g.eps,
+                     l.theta_scale, l.idx_pooled, s);
     const int open0 = std::max(p0, g1 * KP);      // (the open group's members in the piece)
-    k::idx_ring_put(pf.IV, pf.IG, p0, open0 - p0, p0 + T - open0, KP, D, l.idx_ring, s);
+    k::idx_ring_put(pf.IV, pf.IG, p0, open0 - p0, p0 + T - open0, g.idx_nring, D, l.idx_ring, s);
     lin(l.idx_qb, pf.QAh, nullptr, T, pf.IQ);
     k::mla_rope_q(pf.IQ, T, NH, D, D - g.rope_dim, p0, nullptr, l.theta_scale, s);
     const int npool = (p0 + T - 1) / KP;          // (the most groups a token of the piece can choose from)
@@ -3464,6 +3475,7 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
 }
 
 const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx) {
+    if (wp_T > 0) window_keep(wp_T);   // (the last window, all of it, when the caller did not say)
     if (fault || n <= 0 || pos + n > max_ctx) return nullptr;   // (fault: failed() until reset())
     for (int i = 0; i < n; ++i)
         if (ids[i] < 0 || ids[i] >= g.vocab) return nullptr;
@@ -3568,8 +3580,9 @@ void Engine::Impl::tok_attn(Layer& l) {
             float* ys[2] = {iv, ig};
             mv_many(ms, ys, 2, ikn, xq_i, xd_i);
         }
-        k::idx_store(iv, ig, dpos, KP, D, l.idx_ring, s);
-        k::idx_pool(l.idx_ring, l.idx_ape, l.idx_pnorm, dpos, KP, D, g.eps, l.theta_scale, l.idx_pooled, s);
+        k::idx_store(iv, ig, dpos, g.idx_nring, D, l.idx_ring, s);
+        k::idx_pool(l.idx_ring, l.idx_ape, l.idx_pnorm, dpos, KP, g.idx_nring, D, g.eps, l.theta_scale, l.idx_pooled,
+                    s);
         k::mla_rope_q(iq, 1, NH, D, D - g.rope_dim, 0, dpos, l.theta_scale, s);
         k::idx_score(iq, iw, l.idx_pooled, dpos, KP, NH, D, 1.0f / std::sqrt((float) (D * NH)), max_pools, iscore, s);
         k::idx_select(iscore, dpos, KP, g.idx_top_k / KP - g.idx_tail, cells, ncell, s);
@@ -4264,6 +4277,9 @@ void Engine::Impl::win_alloc() {
     const char* v = std::getenv("HY4_WINDOW_MAX");
     wTm = v ? std::max(0, std::min(8, std::atoi(v))) : 6;
     if (!dr || !hd) wTm = 0;   // (the device's routing and the helper's own work: its answer each layer)
+    // (a draft's rejected tokens write ring rows a position past the kept ones - those of positions T - 1 back in the
+    // sliding window's past at most: the ring holds swa_window + wTm - 1 rows, so the next token still reads its own)
+    if (g.swa_window > 0) wTm = std::min(wTm, kSwaRing - g.swa_window + 1);
     if (wTm < 2) {
         wTm = 0;
         return;
@@ -4515,8 +4531,9 @@ void Engine::Impl::tokw_attn(Layer& l, int T) {
         int* nc = wncell ? wncell + t : nullptr;
         if (l.idx) {
             float* iqt = wiq + (size_t) t * NH * D;
-            k::idx_store(wiv + (size_t) t * D, wig + (size_t) t * D, dp, KP, D, l.idx_ring, s);
-            k::idx_pool(l.idx_ring, l.idx_ape, l.idx_pnorm, dp, KP, D, g.eps, l.theta_scale, l.idx_pooled, s);
+            k::idx_store(wiv + (size_t) t * D, wig + (size_t) t * D, dp, g.idx_nring, D, l.idx_ring, s);
+            k::idx_pool(l.idx_ring, l.idx_ape, l.idx_pnorm, dp, KP, g.idx_nring, D, g.eps, l.theta_scale,
+                        l.idx_pooled, s);
             k::mla_rope_q(iqt, 1, NH, D, D - g.rope_dim, 0, dp, l.theta_scale, s);
             k::idx_score(iqt, wiw + (size_t) t * NH, l.idx_pooled, dp, KP, NH, D, 1.0f / std::sqrt((float) (D * NH)),
                          max_pools, iscore, s);
@@ -4752,7 +4769,9 @@ void Engine::Impl::win_graphs() {
 // A window of T tokens at pos (each fed and kept: 7a-i) -> their T x vocab logits (host), pos + T; nullptr when
 // windows are off, T is out of range or they do not fit (the caller steps), or a card gave up (failed())
 const float* Engine::Impl::step_window(const int* toks, int T) {
+    if (wp_T > 0) window_keep(wp_T);   // (the last window, all of it, when the caller did not say)
     if (fault || wTm < 2 || T < 2 || T > wTm || pos + T > max_ctx) return nullptr;
+    if (wp_sel.size() < (size_t) g.n_layer * wTm * 16) wp_sel.assign((size_t) g.n_layer * wTm * 16, -1);
     for (int t = 0; t < T; ++t)
         if (toks[t] < 0 || toks[t] >= g.vocab) return nullptr;
     const double t0 = now_ms();
@@ -4848,7 +4867,7 @@ const float* Engine::Impl::step_window(const int* toks, int T) {
                 const int j = t * nu + i;
                 const int e = pl[k::kWinHead + j], sl = pl[k::kWinHead + 32 * Tm + j], wb = pl[k::kWinHead + 16 * Tm + j];
                 const size_t key = (size_t) il * ne + e;
-                ec.score[key] += 1.0f;
+                wp_sel[((size_t) il * Tm + t) * 16 + i] = e;   // (its score counted if the token is kept)
                 if (sl >= 0) continue;
                 if (hc.slots && hc.where[key] >= 0) {
                     ++nh;
@@ -4901,26 +4920,12 @@ const float* Engine::Impl::step_window(const int* toks, int T) {
         fault = true;
         std::fprintf(stderr, "maya-hy4: the device gave up waiting for a window's answer (%u times so far)\n", diag_seen);
     }
+    wp_pos0 = pos;
+    wp_T = T;
     pos += T;
-    if (fault) return nullptr;
-    // the window's end: the scores decay T tokens' worth, the caches' swaps and the helper's update once
-    if (ec.slots) {
-        ec_arrive();
-        ec_fcollect(false, false);
-        const float dT = std::pow(ec.decay, (float) T);
-        for (float& v : ec.score) v *= dT;
-        const long before = ec.tok;
-        ec.tok += T;
-        if (ec.tok / ec.every != before / ec.every) ec_adapt();
-    }
-    if (hc.slots && hc.fill_left > 0) {
-        hc_update(std::min(hc.fill_left, hc.fill_batch), false, true);
-        if (hc.issued == 0 && hc.inflight == 0) hc.fill_left = 0;
-        else hc.fill_left -= hc.issued;
-    } else if (hc.slots) {
-        const long before = hc.tok;
-        hc.tok += T;
-        if (hc.tok / hc.every != before / hc.every) hc_update(hc.per, true, hc.bg);
+    if (fault) {
+        wp_T = 0;
+        return nullptr;
     }
     const double ms = now_ms() - t0;
     st.ms_total += ms;
@@ -4950,7 +4955,45 @@ const float* Engine::Impl::step_window(const int* toks, int T) {
     return wh_logits;
 }
 
+// The last window's first `kept` tokens kept (a verified draft's): pos back to after them - every cache row, ring slot,
+// indexer group and Engram history entry past it is rewritten when that position is decoded again, so nothing else
+// goes back - and only their choices counted in the experts' scores; then the window's end: the scores decay `kept`
+// tokens' worth, the caches' swaps and the helper's update once
+void Engine::Impl::window_keep(int kept) {
+    if (wp_T <= 0) return;
+    const int T = wp_T, Tm = wTm, ne = g.n_expert, nu = g.n_used;
+    kept = std::max(0, std::min(kept, T));
+    wp_T = 0;
+    pos = wp_pos0 + kept;
+    for (int il = g.n_dense; il < g.n_layer; ++il)
+        for (int t = 0; t < kept; ++t)
+            for (int i = 0; i < nu; ++i) {
+                const int e = wp_sel[((size_t) il * Tm + t) * 16 + i];
+                if (e >= 0) ec.score[(size_t) il * ne + e] += 1.0f;
+            }
+    if (kept == 0) return;
+    if (ec.slots) {
+        ec_arrive();
+        ec_fcollect(false, false);
+        const float dk = std::pow(ec.decay, (float) kept);
+        for (float& v : ec.score) v *= dk;
+        const long before = ec.tok;
+        ec.tok += kept;
+        if (ec.tok / ec.every != before / ec.every) ec_adapt();
+    }
+    if (hc.slots && hc.fill_left > 0) {
+        hc_update(std::min(hc.fill_left, hc.fill_batch), false, true);
+        if (hc.issued == 0 && hc.inflight == 0) hc.fill_left = 0;
+        else hc.fill_left -= hc.issued;
+    } else if (hc.slots) {
+        const long before = hc.tok;
+        hc.tok += kept;
+        if (hc.tok / hc.every != before / hc.every) hc_update(hc.per, true, hc.bg);
+    }
+}
+
 const float* Engine::Impl::step(int token) {
+    if (wp_T > 0) window_keep(wp_T);   // (the last window, all of it, when the caller did not say)
     if (fault || pos >= max_ctx || token < 0 || token >= g.vocab) return nullptr;   // (fault: failed() until reset())
     const double t0 = now_ms();
     double cpu_ms = 0.0;
