@@ -125,11 +125,23 @@ __device__ __forceinline__ float load_f(const void* w, int type, size_t off) {
 }
 // a block a row; F32 rows of a multiple of 4 values (16-byte aligned) as float4
 __global__ void gemv_f_kernel(const void* __restrict__ w, int type, size_t rb, const float* __restrict__ x,
-                              float* __restrict__ y, int k) {
+                              float* __restrict__ y, int k, int f32_order) {
     const int r = blockIdx.x;
     const char* row = (const char*) w + (size_t) r * rb;
     float s = 0.0f;
-    if (type == 0 && (k & 3) == 0 && (rb & 15) == 0 && ((uintptr_t) w & 15) == 0) {
+    if (f32_order && type == 30 && (k & 3) == 0 && (rb & 7) == 0 && ((uintptr_t) w & 7) == 0) {
+        // (BF16 rows of an F32 matrix whose values BF16 holds exactly: the F32 branch's loads and sums, the same bits)
+        const uint2* w2 = (const uint2*) row;
+        const float4* x4 = (const float4*) x;
+        for (int c = threadIdx.x; c < k / 4; c += blockDim.x) {
+            const uint2 u = w2[c];
+            const float4 b = x4[c];
+            s = fmaf(__uint_as_float(u.x << 16), b.x, s);
+            s = fmaf(__uint_as_float(u.x & 0xffff0000u), b.y, s);
+            s = fmaf(__uint_as_float(u.y << 16), b.z, s);
+            s = fmaf(__uint_as_float(u.y & 0xffff0000u), b.w, s);
+        }
+    } else if (type == 0 && (k & 3) == 0 && (rb & 15) == 0 && ((uintptr_t) w & 15) == 0) {
         const float4* w4 = (const float4*) row;
         const float4* x4 = (const float4*) x;
         for (int c = threadIdx.x; c < k / 4; c += blockDim.x) {
@@ -965,8 +977,16 @@ void q8(const float* x, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
     const int wpb = 8;
     if (rows > 0) q8_kernel<<<dim3(blocks(k / 32, wpb), rows), 32 * wpb, 0, s>>>(x, k, q, d);
 }
-void gemv_f(const void* w, int type, size_t row_bytes, const float* x, float* y, int n, int k, cudaStream_t s) {
-    gemv_f_kernel<<<n, 256, 0, s>>>(w, type, row_bytes, x, y, k);
+__global__ void bf16_to_f32_kernel(const uint16_t* __restrict__ src, size_t n, float* __restrict__ dst) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] = __uint_as_float((unsigned) src[i] << 16);
+}
+void bf16_to_f32(const void* src, size_t n, float* dst, cudaStream_t s) {
+    if (n) bf16_to_f32_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>((const uint16_t*) src, n, dst);
+}
+void gemv_f(const void* w, int type, size_t row_bytes, const float* x, float* y, int n, int k, cudaStream_t s,
+            bool f32_order) {
+    gemv_f_kernel<<<n, 256, 0, s>>>(w, type, row_bytes, x, y, k, f32_order ? 1 : 0);
 }
 void add(float* y, const float* x, int n, cudaStream_t s) { add_kernel<<<blocks(n, 256), 256, 0, s>>>(y, x, n); }
 bool embed_rows(const uint8_t* w, int type, size_t rb, const int* ids, int T, int n, float* x, cudaStream_t s) {

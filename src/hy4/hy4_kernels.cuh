@@ -37,7 +37,10 @@ void norm_q8(const float* x, const float* w, float eps, float* y, int8_t* q, flo
 /// int8 rows with an F32 scale per 32 values (ds4_iq.cuh's MvJob inputs): d = max|x| / 127, q = rint(x / d).
 void q8(const float* x, int rows, int k, int8_t* q, float* d, cudaStream_t s);
 /// y[r] = sum_c W[r][c] x[c] for W of n rows of k values in F32 (type 0), F16 (1) or BF16 (30), row_bytes apart.
-void gemv_f(const void* w, int type, size_t row_bytes, const float* x, float* y, int n, int k, cudaStream_t s);
+void gemv_f(const void* w, int type, size_t row_bytes, const float* x, float* y, int n, int k, cudaStream_t s,
+            bool f32_order = false);   // (f32_order: BF16 rows of a BF16-exact F32 matrix, summed as the F32 rows)
+/// dst[i] = src[i] (BF16 -> F32, exact), n values.
+void bf16_to_f32(const void* src, size_t n, float* dst, cudaStream_t s);
 /// y += x (n values).
 void add(float* y, const float* x, int n, cudaStream_t s);
 /// x[t] = the embedding row of ids[t] as F32 (w: rows of n values in Q8_0 (8), F32 (0), F16 (1) or BF16 (30), rb

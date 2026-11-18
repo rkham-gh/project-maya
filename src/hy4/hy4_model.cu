@@ -109,6 +109,8 @@ struct DMat {   // n rows of k values in VRAM, as the GGUF holds them
     int type = 0;
     size_t rb = 0;
     int n = 0, k = 0;
+    bool bf16_of_f32 = false;   // (BF16 rows of an F32 matrix whose every value BF16 holds: half the bytes, the same
+                                //  values - summed as the F32 rows, expanded back for the prompt path's Sgemm)
 };
 
 struct Tensor {
@@ -227,6 +229,9 @@ struct Engine::Impl {
     // changed; slotptr: the slots' pointers) and its shared expert in the segment's graph, and publishes its plan to
     // host-mapped memory; the host reads the plans in order (no syncs), runs the CPU lane's and the helper's experts
     // and answers there; the device waits for an answer only where the plan sent experts to the host.
+    // the BF16 routers' F32 values for the prompt path's Sgemm (the largest's, made at the first prompt)
+    size_t router_f32 = 0;
+    float* router_f32_buf = nullptr;
     bool dr = false;
     int *d_where = nullptr, *h_where = nullptr;
     std::vector<int> where_up;   // (the table as last uploaded)
@@ -303,6 +308,9 @@ struct Engine::Impl {
         void* p = nullptr;
         CK(cudaMalloc(&p, std::max<size_t>(1, n) * sizeof(T)));
         CK(cudaMemset(p, 0, std::max<size_t>(1, n) * sizeof(T)));
+        // (the memset is on the legacy stream, which nothing orders against the non-blocking s: done before the buffer
+        //  is handed out, so an allocation after the load cannot race the work queued on s)
+        CK(cudaDeviceSynchronize());
         dev_bytes += n * sizeof(T);
         return (T*) p;
     }
@@ -319,7 +327,7 @@ struct Engine::Impl {
     }
 
     // a matrix [k, n] (or a 3D bank [k, n, count] as n x count rows when count > 0) into VRAM
-    bool mat(const std::string& name, int k, int n, DMat& m, std::string& err, int count = 0) {
+    bool mat(const std::string& name, int k, int n, DMat& m, std::string& err, int count = 0, bool to_bf16 = false) {
         const Tensor* t = find(name);
         if (!t) {
             err = "the GGUF has no " + name;
@@ -348,6 +356,24 @@ struct Engine::Impl {
             return false;
         }
         const size_t bytes = m.rb * (size_t) m.n;
+        if (to_bf16 && type == 0) {   // (F32 whose values BF16 holds exactly - every low half zero: BF16, lossless)
+            const uint32_t* src = (const uint32_t*) t->data;
+            const size_t nv = (size_t) k * m.n;
+            bool exact = true;
+            for (size_t i = 0; i < nv && exact; ++i) exact = (src[i] & 0xffffu) == 0;
+            if (exact) {
+                std::vector<uint16_t> h(nv);
+                for (size_t i = 0; i < nv; ++i) h[i] = (uint16_t) (src[i] >> 16);
+                m.type = 30;
+                m.rb = (size_t) k * 2;
+                m.bf16_of_f32 = true;
+                uint8_t* d = dalloc<uint8_t>(nv * 2);
+                CK(cudaMemcpy(d, h.data(), nv * 2, cudaMemcpyHostToDevice));
+                m.w = d;
+                trim(t->data, bytes);
+                return true;
+            }
+        }
         uint8_t* d = dalloc<uint8_t>(bytes);
         CK(cudaMemcpy(d, t->data, bytes, cudaMemcpyHostToDevice));
         m.w = d;
@@ -437,7 +463,7 @@ struct Engine::Impl {
     // y = W x: x's int8 rows (xq, xd: q8 of x), or x itself (F32) for a float matrix
     void mv(const DMat& m, const float* xf, const int8_t* xq, const float* xd, float* y, float alpha = 1.0f) {
         if (is_float(m.type)) {
-            k::gemv_f(m.w, m.type, m.rb, xf, y, m.n, m.k, s);
+            k::gemv_f(m.w, m.type, m.rb, xf, y, m.n, m.k, s, m.bf16_of_f32);
             return;
         }
         const iq::MvJob j = job(m, 0, m.n, xq, xd, y, alpha);
@@ -448,7 +474,8 @@ struct Engine::Impl {
         iq::MvJob j[16];
         int nj = 0;
         for (int i = 0; i < n; ++i) {
-            if (is_float(m[i]->type)) k::gemv_f(m[i]->w, m[i]->type, m[i]->rb, xf, y[i], m[i]->n, m[i]->k, s);
+            if (is_float(m[i]->type))
+                k::gemv_f(m[i]->w, m[i]->type, m[i]->rb, xf, y[i], m[i]->n, m[i]->k, s, m[i]->bf16_of_f32);
             else j[nj++] = job(*m[i], 0, m[i]->n, xq, xd, y[i]);
         }
         run_jobs(j, nj);
@@ -1149,7 +1176,10 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
                 return false;
         } else {
             const int ne = g.n_expert, NL = g.n_lat;
-            if (!mat(b + "ffn_gate_inp.weight", E, ne, l.gate_inp, err)) return false;
+            // (the router F32 in the GGUF with every value BF16-exact: BF16 in VRAM, HY4_ROUTER_BF16=0 F32)
+            static const bool rbf = !(std::getenv("HY4_ROUTER_BF16") && std::atoi(std::getenv("HY4_ROUTER_BF16")) == 0);
+            if (!mat(b + "ffn_gate_inp.weight", E, ne, l.gate_inp, err, 0, rbf)) return false;
+            if (l.gate_inp.bf16_of_f32) router_f32 = std::max(router_f32, (size_t) l.gate_inp.n * l.gate_inp.k);
             if (!(l.exp_bias_d = f32(b + "exp_probs_b.bias", (size_t) ne, err, &l.exp_bias))) return false;
             if (!mat(b + "ffn_routed_down.weight", E, NL, l.lat_down, err) ||
                 !mat(b + "ffn_routed_up.weight", NL, E, l.lat_up, err))
@@ -2637,6 +2667,9 @@ bool Engine::Impl::load_profile(const std::string& path) {
 // decoded to F16 and multiplied for its tokens, its output added to theirs times their weights, expert by expert in id
 // order - then routed_up, the shared expert on the full width, the sum post-normed into the streams.
 bool Engine::Impl::pf_alloc(std::string& err) {
+    // (the BF16 routers' F32 values for the prompt path: allocated here, at the load - dalloc's memset is on the legacy
+    //  stream, which nothing orders against s mid-prompt)
+    if (router_f32 && !router_f32_buf) router_f32_buf = dalloc<float>(router_f32);
     const int Cn = pf.C = std::max(64, o.chunk);
     pf.Ca = std::max(16, std::min(o.sub, Cn));
     const int Ca = pf.Ca, E = g.n_embd, HC = g.hc, NL = g.n_lat, ne = g.n_expert, nu = g.n_used;
@@ -2919,9 +2952,14 @@ void Engine::Impl::gemm(const __half* X, int ldx, const __half* W, int ldw, floa
 // y [T][n] = x W^T: a float matrix in F32 (x the F32 rows: cublasSgemm, as llama.cpp's F32 weights), else W decoded to
 // F16 and x's F16 rows
 void Engine::Impl::lin(const DMat& m, const __half* xh, const float* xf, int T, float* y) {
-    if (m.type == 0) {
+    if (m.type == 0 || m.bf16_of_f32) {
         const float one = 1.0f, zero = 0.0f;
-        if (cublasSgemm(pf.cb, CUBLAS_OP_T, CUBLAS_OP_N, m.n, T, m.k, &one, (const float*) m.w, m.k, xf, m.k, &zero, y,
+        const float* wf = (const float*) m.w;
+        if (m.bf16_of_f32) {   // (back to its F32 values first: the same Sgemm as before)
+            k::bf16_to_f32(m.w, (size_t) m.n * m.k, router_f32_buf, s);
+            wf = router_f32_buf;
+        }
+        if (cublasSgemm(pf.cb, CUBLAS_OP_T, CUBLAS_OP_N, m.n, T, m.k, &one, wf, m.k, xf, m.k, &zero, y,
                         m.n) != CUBLAS_STATUS_SUCCESS) {
             std::fprintf(stderr, "maya-hy4: cuBLAS F32 GEMM failed\n");
             std::abort();
