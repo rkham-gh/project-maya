@@ -2952,7 +2952,7 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
 }
 
 const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx) {
-    if (n <= 0 || pos + n > max_ctx) return nullptr;
+    if (fault || n <= 0 || pos + n > max_ctx) return nullptr;   // (fault: failed() until reset())
     for (int i = 0; i < n; ++i)
         if (ids[i] < 0 || ids[i] >= g.vocab) return nullptr;
     const double t0 = now_ms();
@@ -3566,11 +3566,21 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
                 else std::memcpy(part, hc.h_out, (size_t) NL * sizeof(float));
                 st.ms_helper += now_ms() - c1;
             }
-            // (HY4_DR_STALL_AT=<n>, a test of the fault path: token n's first answer 40 s late - the main card gives up)
-            static const int stall_at = std::getenv("HY4_DR_STALL_AT") ? std::atoi(std::getenv("HY4_DR_STALL_AT")) : -1;
-            static bool stalled = false;
-            if (seq == stall_at && !stalled) {
-                stalled = true;
+            // (HY4_DR_STALL_AT=<n>[,<n>...], a test of the fault path: each such token's first answer 40 s late - the main
+            //  card gives up)
+            static std::vector<int> stall_at = [] {
+                std::vector<int> v;
+                if (const char* e = std::getenv("HY4_DR_STALL_AT"))
+                    for (const char* q = e; *q;) {
+                        v.push_back(std::atoi(q));
+                        while (*q && *q != ',') ++q;
+                        if (*q == ',') ++q;
+                    }
+                return v;
+            }();
+            auto st_it = std::find(stall_at.begin(), stall_at.end(), seq);
+            if (st_it != stall_at.end()) {
+                stall_at.erase(st_it);
                 std::fprintf(stderr, "maya-hy4: HY4_DR_STALL_AT: token %d, layer %d's answer 40 s late\n", seq, il);
                 std::this_thread::sleep_for(std::chrono::seconds(40));
             }
@@ -3610,7 +3620,7 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
 }
 
 const float* Engine::Impl::step(int token) {
-    if (pos >= max_ctx || token < 0 || token >= g.vocab) return nullptr;
+    if (fault || pos >= max_ctx || token < 0 || token >= g.vocab) return nullptr;   // (fault: failed() until reset())
     const double t0 = now_ms();
     double cpu_ms = 0.0;
     const int NL = g.n_lat;

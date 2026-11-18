@@ -504,6 +504,16 @@ def error_body(e: Exception, kind: str = "invalid_request_error") -> dict:
 
 # the engine's ERR when a route met a NaN or an infinity (Glm5Model::route_ok): it has dropped that conversation's state
 NONFINITE = "non-finite"
+# ... and maya-hy4's when a card gave up waiting for the other (the device's routing): it has dropped the state too
+DROPPED = "the conversation was dropped"
+
+
+def dropped_state(e) -> bool:
+    """An engine ERR after which the engine dropped that conversation's state (NONFINITE, DROPPED): before the first
+    token the request runs once more from token 0, mid-answer it is the engine's fault (EngineFault), not a bad
+    request."""
+    m = str(e)
+    return NONFINITE in m or DROPPED in m
 
 # what Service._sliced yields when the loop guard ends an answer (a loop that came back): run() ends it, "stop"
 LOOP_STOP = object()
@@ -4566,9 +4576,9 @@ class Service:
                                 yield t
                             return
                         except ValueError as e:
-                            if again or got or NONFINITE not in str(e):
+                            if again or got or not dropped_state(e):
                                 raise
-                            print(f"[maya] the engine's numbers went non-finite before the answer started ({e}): "
+                            print(f"[maya] the engine dropped the conversation before the answer started ({e}): "
                                   "running the request again from token 0", flush=True)
                         finally:
                             sliced.close()
@@ -4792,21 +4802,21 @@ class Service:
                           flush=True)
                     raise
                 except ValueError as e:                 # the engine's ERR line (it may have ended after it)
-                    if NONFINITE in str(e) and n > 0:
+                    if dropped_state(e) and n > 0:
                         # an answer already under way: it ends here (what was sent stands), and the engine has
                         # dropped the conversation's state, so the next turn reads it from token 0.  It is the
                         # engine's error, not the answer's length (#827): every API reports it as its error
                         finish = "error"
-                        print(f"[maya] the engine's numbers went non-finite after {n} tokens ({e}): the answer ends "
-                              "there, as an error", flush=True)
+                        print(f"[maya] the engine failed after {n} tokens and dropped the conversation ({e}): the "
+                              "answer ends there, as an error", flush=True)
                         yield from flush()
                         if held:
                             was = parser.state
                             for ev in with_lp(parser.feed(held), was):
                                 yield "event", ev
                             held = ""
-                        raise EngineFault(f"the engine's numbers went non-finite after {n} tokens ({e}); the answer "
-                                          "was cut there (not the token limit)") from e
+                        raise EngineFault(f"the engine failed after {n} tokens ({e}); the answer was cut there (not "
+                                          "the token limit)") from e
                     else:
                         finish = "error"
                         print(f"[maya] the engine reported an error: {e}", flush=True)

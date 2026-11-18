@@ -934,9 +934,12 @@ class DyingEngine(MockEngine):
 class NonFiniteEngine(MockEngine):
     """The engine's ERR when a route met a NaN: `fail` lists, per request, after how many tokens (None: no failure)."""
 
-    def __init__(self, tok, script, fail):
+    MESSAGE = "glm router: layer 7 decode invalid expert ID or non-finite score"
+
+    def __init__(self, tok, script, fail, message=None):
         super().__init__(tok, script, max_context=CTX)
         self.fail, self.calls = list(fail), 0
+        self.message = message or self.MESSAGE
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         at = self.fail[self.calls] if self.calls < len(self.fail) else None
@@ -944,8 +947,78 @@ class NonFiniteEngine(MockEngine):
         yield None                                          # prompt progress
         for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
             if at is not None and i == at:
-                raise ValueError("glm router: layer 7 decode invalid expert ID or non-finite score")
+                raise ValueError(self.message)
             yield t
+
+
+# maya-hy4's ERR when a card gave up waiting for the other: the engine has dropped the conversation too
+HY4_DROPPED = "maya-hy4: a card gave up waiting for the other (the device's routing); the conversation was dropped"
+
+
+class DroppedRetry(unittest.TestCase):
+    """maya-hy4's ERR after a spin timed out ("the conversation was dropped"): handled as the non-finite one is -
+    nothing sent yet: run once more; an answer under way: EngineFault, and a request not streamed gets 422 with the
+    text written before it (not a 400 invalid_request_error)."""
+
+    def run_svc(self, fail):
+        tok = ByteTokenizer()
+        eng = NonFiniteEngine(tok, "all good, and then some", fail, HY4_DROPPED)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        return tok, eng, svc
+
+    def test_retried_once_before_the_answer(self):
+        tok, eng, svc = self.run_svc([0])
+        out, done = "", None
+        for kind, v in svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()):
+            if kind == "event":
+                out += v.text
+            elif kind == "done":
+                done = v
+        self.assertEqual((out, done["finish"], eng.calls), ("all good, and then some", "stop", 2))
+
+    def test_twice_before_the_answer_is_an_error(self):
+        tok, eng, svc = self.run_svc([0, 0])
+        with self.assertRaises(ValueError) as cm:
+            list(svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()))
+        self.assertIn("the conversation was dropped", str(cm.exception))
+        self.assertEqual(eng.calls, 2)
+
+    def test_mid_answer_is_an_engine_fault(self):
+        tok, eng, svc = self.run_svc([8])
+        out = ""
+        with self.assertRaises(EngineFault) as cm:
+            for kind, v in svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()):
+                if kind == "event":
+                    out += v.text
+        self.assertEqual((out, eng.calls), ("all good", 1))
+        self.assertIn("the conversation was dropped", str(cm.exception))
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
+
+    def test_not_streamed_gets_422_with_the_partial_text(self):
+        tok = ByteTokenizer()
+        eng = NonFiniteEngine(tok, ANSWER, [300], HY4_DROPPED)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        body = {"model": "m", "max_tokens": 400, "messages": [{"role": "user", "content": "hi"}], "stream": False}
+        req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    code, text = r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                with e:
+                    code, text = e.code, e.read().decode()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual(code, 422, text)
+        err = json.loads(text)["error"]
+        self.assertEqual(err["type"], "engine_error")
+        self.assertIn("the conversation was dropped", err["message"])
+        got = err["partial_text"] + (err.get("partial_reasoning") or "")   # (this template starts in the reasoning)
+        self.assertTrue(len(got) > 100 and ANSWER[:300].startswith(got), got[:80])
 
 
 class NonFiniteRetry(unittest.TestCase):

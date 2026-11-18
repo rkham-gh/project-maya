@@ -288,9 +288,9 @@ int main(int argc, char** argv) {
         const double t0 = now_ms();
         const float* lg = nullptr;
         if (step_path)
-            for (int id : ids) lg = eng.step(id);
+            for (size_t i = 0; i < ids.size() && (i == 0 || lg); ++i) lg = eng.step(ids[i]);
         else
-            for (size_t i = 0; i < ids.size(); i += (size_t) opt.chunk)
+            for (size_t i = 0; i < ids.size() && (i == 0 || lg); i += (size_t) opt.chunk)
                 lg = eng.prefill(ids.data() + i, (int) std::min(ids.size() - i, (size_t) opt.chunk));
         const double t1 = now_ms();
         const auto ps = eng.stats();
@@ -298,7 +298,12 @@ int main(int argc, char** argv) {
                      ids.size(), (t1 - t0) / 1000.0, ids.size() * 1000.0 / (t1 - t0),
                      step_path || (int) ids.size() < 256 ? "the token path" : "the prompt path", ps.pf_copy_gb);
         if (!lg) {
-            std::fprintf(stderr, "maya-hy4: the prompt did not fit\n");
+            if (eng.failed()) {
+                std::fprintf(stderr, "maya-hy4: FAILED - a card gave up waiting for the other; reset\n");
+                eng.reset();
+            } else {
+                std::fprintf(stderr, "maya-hy4: the prompt did not fit\n");
+            }
             return false;
         }
         if (!dump_to.empty()) {

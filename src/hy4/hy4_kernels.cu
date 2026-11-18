@@ -1443,6 +1443,8 @@ void keepalive(unsigned long long ns, cudaStream_t s) { keepalive_kernel<<<1, 32
 
 // ------------------------------------------------------------------------------------------------ the device's routing
 namespace {
+constexpr unsigned long long kSpinNs = 30ull * 1000000000ull;   // (a spin's bound: %globaltimer's ns, the same on both
+                                                                //  cards whatever their clocks)
 __global__ void moe_plan_kernel(const int* __restrict__ sel, const float* __restrict__ w, int nu,
                                 const float* __restrict__ lat, int nl, const int* __restrict__ where,
                                 const uint8_t* const* __restrict__ slotptr, const uint8_t** gptr, int* need, int* plan,
@@ -1482,9 +1484,9 @@ __global__ void moe_wait_kernel(const int* ans, const int* __restrict__ need, co
         if (go) {
             const int want = dpos[2];
             volatile const int* va = ans;
-            const long long t0 = clock64();
+            const unsigned long long t0 = global_ns();
             while (va[0] != want)
-                if (clock64() - t0 > (1ll << 36)) {   // (a dead host must not hang the GPU: ~30 s)
+                if (global_ns() - t0 > kSpinNs) {   // (a dead host must not hang the GPU: 30 s)
                     if (diag) atomicAdd(diag, 1u);
                     break;
                 }
@@ -1502,9 +1504,9 @@ __global__ void moe_wait_kernel(const int* ans, const int* __restrict__ need, co
 
 __device__ __forceinline__ bool spin_for(const int* p, int want, unsigned* diag) {
     volatile const int* v = p;
-    const long long t0 = clock64();
+    const unsigned long long t0 = global_ns();
     while (v[0] != want)
-        if (clock64() - t0 > (1ll << 36)) {   // (~30 s: a dead peer must not hang the card)
+        if (global_ns() - t0 > kSpinNs) {   // (30 s: a dead peer must not hang the card)
             if (diag) atomicAdd(diag, 1u);
             return false;
         }
