@@ -157,9 +157,9 @@ void CpuLane::begin(Pool& pool, const CpuLayer& L, int n_embd, int n_ff, const i
         done_gu_[i].store(0, std::memory_order_relaxed);
     }
     ready_.store(0, std::memory_order_relaxed);
-    // one pass for gate and up (iq_cpu_gate_up, DeepSeek's clamp form) only where there is no clamp; Ling's clamp
-    // (on silu(g), not on g) takes the two matrices' rows and its own epilogue
-    same_ = L.tg == L.tu && L.act_g == L.act_u && L.limit <= 0.0f;
+    // one pass for gate and up (iq_cpu_gate_up, DeepSeek's clamp form, which is Hy4's: silu(min(g, L)) clamp(u, -L, L))
+    // where the two share a type; otherwise the two matrices' rows and the same epilogue below
+    same_ = L.tg == L.tu && L.act_g == L.act_u;
     one_act_ = L.act_g == L.act_u;
     ag_.resize(L.ab_g);
     au_.resize(L.ab_u);
@@ -184,7 +184,7 @@ void CpuLane::job(int j) {
         float* hi = h_.data() + (size_t) i * n_ff;
         const void* act = ag_.data();
         if (same_) {
-            dg::iq_cpu_gate_up(L.fmt, L.gate + e * n_ff * L.rg, L.up + e * n_ff * L.ru, &act, 1, &hi, r0, r1, 0.0f);
+            dg::iq_cpu_gate_up(L.fmt, L.gate + e * n_ff * L.rg, L.up + e * n_ff * L.ru, &act, 1, &hi, r0, r1, L.limit);
         } else {
             float* ui = h_.data() + (size_t) (kMax + i) * n_ff;
             const void* actu = one_act_ ? ag_.data() : au_.data();
@@ -192,13 +192,12 @@ void CpuLane::job(int j) {
             dg::iq_cpu_rows(L.tu, L.up + e * n_ff * L.ru, L.ru, n_embd, &actu, 1, &ui, r0, r1);
             const float lim = L.limit;
             for (int r = r0; r < r1; ++r) {
-                const float g = hi[r];
-                float a = g / (1.0f + std::exp(-g)), u = ui[r];
-                if (lim > 0.0f) {
-                    a = std::fmin(a, lim);
+                float g = hi[r], u = ui[r];
+                if (lim > 0.0f) {   // (Hy4's clamp: silu(min(g, L)) clamp(u, -L, L), llama.cpp's ggml_swiglu_clamp)
+                    g = std::fmin(g, lim);
                     u = std::fmin(std::fmax(u, -lim), lim);
                 }
-                hi[r] = a * u;
+                hi[r] = g / (1.0f + std::exp(-g)) * u;
             }
         }
         // the expert's last band: its h as the down rows' activation

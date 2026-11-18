@@ -50,14 +50,13 @@ __device__ float block_max(float v) {
 }
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float silu_(float x) { return x / (1.0f + expf(-x)); }
-// llama.cpp's clamped SwiGLU for Ling (build_moe_ffn / build_ffn, swiglu_clamp_*): min(silu(g), L) clamp(u, -L, L)
+// Hy4's clamped SwiGLU (llama.cpp's ggml_swiglu_clamp, as for DeepSeek 4): silu(min(g, L)) clamp(u, -L, L)
 __device__ __forceinline__ float swiglu_l(float g, float u, float limit) {
-    float a = silu_(g);
     if (limit > 0.0f) {
-        a = fminf(a, limit);
+        g = fminf(g, limit);
         u = fminf(fmaxf(u, -limit), limit);
     }
-    return a * u;
+    return silu_(g) * u;
 }
 // q8_kernel's rounding of a warp's 32 values (lane's v): the block's scale to d (lane 0), q to q
 __device__ __forceinline__ void warp_q8(float v, int8_t* q, float* d) {

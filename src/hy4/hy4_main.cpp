@@ -1,4 +1,4 @@
-// src/hy4/hy4_main.cpp - maya-hy4: inclusionAI's Ling-3.1-flash from a GGUF on one NVIDIA GPU and the CPU.
+// src/hy4/hy4_main.cpp - maya-hy4: Tencent's Hy4 Flash from a GGUF on one NVIDIA GPU (and a helper card) and the CPU.
 //
 //   maya-hy4 --gguf <...-00001-of-0000N.gguf> --serve [--max-context N] [--threads N] [--gpu N] [--profile FILE]
 //
@@ -380,7 +380,7 @@ int main(int argc, char** argv) {
     }
 
     // --serve
-    std::printf("INFO engine=maya-hy4-%s model=Ling-3.1-flash layers=%d experts=%d vocab=%d\n", kVersion, g.n_layer,
+    std::printf("INFO engine=maya-hy4-%s model=Hy4-flash layers=%d experts=%d vocab=%d\n", kVersion, g.n_layer,
                 g.n_expert, V);
     std::printf("READY %d stop\n", eng.max_ctx());
     std::fflush(stdout);
@@ -501,7 +501,7 @@ int main(int argc, char** argv) {
         else last.clear();
         // (a generated end token is not fed: the next prompt carries the turn's end itself)
         const auto st = eng.stats();
-        std::printf("STAT ling cache_hit=%.3f cache_slots=%ld cache_copies=%ld helper_hit=%.3f helper_slots=%ld "
+        std::printf("STAT hy4 cache_hit=%.3f cache_slots=%ld cache_copies=%ld helper_hit=%.3f helper_slots=%ld "
                     "helper_copies=%ld tok_s=%.2f\n",
                     st.lookups ? (double) st.hits / st.lookups : 0.0, st.cache_slots, st.cache_copies,
                     st.lookups ? (double) st.hits_helper / st.lookups : 0.0, st.helper_slots, st.helper_copies,
