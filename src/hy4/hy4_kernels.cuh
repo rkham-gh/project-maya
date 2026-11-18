@@ -218,8 +218,13 @@ constexpr int kPlanHead = 64, kAnsHead = 16;
 /// After the router's top nu (sel, w on the device): each choice's slot from where (the layer's [n_expert]) and its
 /// matrices' pointer from slotptr (null: not on the main card) into gptr [nu], the experts the host must add into *need,
 /// the plan into plan (the latent lat [nl] in it); its sequence number dpos[2] last.
-void moe_plan(const int* sel, const float* w, int nu, const float* lat, int nl, const int* where,
-              const uint8_t* const* slotptr, const uint8_t** gptr, int* need, int* plan, const int* dpos, cudaStream_t s);
+/// The latent's int8 rows (xq [nl], scales xd [nl / 32]: the main card's experts' input) go in it too, after the latent:
+/// at plan_q(plan, nl), plan_d(plan, nl) - the helper reads them in 16-byte pieces.
+void moe_plan(const int* sel, const float* w, int nu, const float* lat, const int8_t* xq, const float* xd, int nl,
+              const int* where, const uint8_t* const* slotptr, const uint8_t** gptr, int* need, int* plan,
+              const int* dpos, cudaStream_t s);
+/// A plan's ints: the head, the latent, its int8 rows and scales (16-byte pieces)
+inline size_t plan_ints(int nl) { return ((size_t) kPlanHead + nl + nl / 4 + nl / 32 + 63) & ~(size_t) 63; }
 /// With *need > 0: waits for the answer's sequence number dpos[2] (bounded: ~30 s, then diag[0] + 1), its sum into
 /// tail + 4; tail's flags [0] (the host's sum to add) and [1] (the main card's, always) for lat_sum_q8.
 void moe_wait(const int* ans, const int* need, const int* dpos, int nl, float* tail, unsigned* diag, cudaStream_t s);
@@ -232,9 +237,10 @@ void moe_wait2(const int* ans, const int* hans, const int* need, const int* dpos
 /// not on the main card that this card holds (where: the layer's [n_expert] slots here) its pointer from slotptr into
 /// gptr (else null), the weights into w, the latent into lat [nl], their count into *nh.
 void hd_plan(const int* plan, int nu, int nl, const int* where, const uint8_t* const* slotptr, const uint8_t** gptr,
-             float* w, float* lat, int* nh, const int* dpos, unsigned* diag, cudaStream_t s);
-/// (the helper card) Its sum (routed [nl]) and count *nh into its answer hans, the sequence number dpos[2] last.
-void hd_answer(const float* routed, const int* nh, int nl, int* hans, const int* dpos, cudaStream_t s);
+             float* w, int8_t* xq, float* xd, int* nh, const int* dpos, unsigned* diag, cudaStream_t s);
+/// (the helper card) Its experts' rows y [nu][nl] summed in order (sum_rows') and its count *nh into its answer hans,
+/// the sequence number dpos[2] last.
+void hd_answer(const float* y, int nu, const int* nh, int nl, int* hans, const int* dpos, cudaStream_t s);
 
 /// (--selftest) nothing yet; true.
 bool selftest();

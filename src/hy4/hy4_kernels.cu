@@ -740,6 +740,7 @@ __global__ void route1_kernel(const float* __restrict__ rl, const float* __restr
     if (e < ne) {
         p = 1.0f / (1.0f + expf(-rl[e]));
         sc = p + bias[e];
+        if (!(sc == sc)) sc = -INFINITY;   // (a NaN last: it would rank 0 beside the top one and leave a choice unwritten)
         s_sc[e] = sc;
     }
     __syncthreads();
@@ -1493,7 +1494,8 @@ namespace {
 constexpr unsigned long long kSpinNs = 30ull * 1000000000ull;   // (a spin's bound: %globaltimer's ns, the same on both
                                                                 //  cards whatever their clocks)
 __global__ void moe_plan_kernel(const int* __restrict__ sel, const float* __restrict__ w, int nu,
-                                const float* __restrict__ lat, int nl, const int* __restrict__ where,
+                                const float* __restrict__ lat, const int8_t* __restrict__ xq,
+                                const float* __restrict__ xd, int nl, const int* __restrict__ where,
                                 const uint8_t* const* __restrict__ slotptr, const uint8_t** gptr, int* need, int* plan,
                                 const int* __restrict__ dpos) {
     const int t = threadIdx.x;
@@ -1507,8 +1509,19 @@ __global__ void moe_plan_kernel(const int* __restrict__ sel, const float* __rest
         vp[18 + t] = __float_as_int(w[t]);
         vp[34 + t] = sl;
     }
-    volatile float* vl = (volatile float*) (plan + kPlanHead);
-    for (int i = t; i < nl; i += blockDim.x) vl[i] = lat[i];
+    // the latent (F32: the CPU lane's), its int8 rows and scales (the helper's), in 16-byte stores (the fence below
+    // orders them before the sequence number)
+    {
+        int4* dl = (int4*) (plan + kPlanHead);
+        const int4* sl = (const int4*) lat;
+        for (int i = t; i < nl / 4; i += blockDim.x) dl[i] = sl[i];
+        int4* dq = (int4*) (plan + kPlanHead + nl);
+        const int4* sq = (const int4*) xq;
+        for (int i = t; i < nl / 16; i += blockDim.x) dq[i] = sq[i];
+        int4* dd = (int4*) (plan + kPlanHead + nl + nl / 4);
+        const int4* sd = (const int4*) xd;
+        for (int i = t; i < nl / 128; i += blockDim.x) dd[i] = sd[i];
+    }
     __threadfence_system();
     __syncthreads();
     if (t == 0) {
@@ -1593,7 +1606,8 @@ __global__ void moe_wait2_kernel(const int* ans, const int* hans, const int* __r
 
 __global__ void hd_plan_kernel(const int* plan, int nu, int nl, const int* __restrict__ where,
                                const uint8_t* const* __restrict__ slotptr, const uint8_t** gptr, float* __restrict__ w,
-                               float* __restrict__ lat, int* nh, const int* __restrict__ dpos, unsigned* diag) {
+                               int8_t* __restrict__ xq, float* __restrict__ xd, int* nh, const int* __restrict__ dpos,
+                               unsigned* diag) {
     __shared__ int s_here[16];
     const int t = threadIdx.x;
     if (t == 0) spin_for(plan, dpos[2], diag);
@@ -1606,8 +1620,14 @@ __global__ void hd_plan_kernel(const int* plan, int nu, int nl, const int* __res
         w[t] = __int_as_float(vp[18 + t]);
         s_here[t] = hs >= 0;
     }
-    volatile const float* vl = (volatile const float*) (plan + kPlanHead);
-    for (int i = t; i < nl; i += blockDim.x) lat[i] = vl[i];
+    {   // (__ldcv: fetched again over PCIe, never a cached line of the last token's)
+        const int4* sq = (const int4*) (plan + kPlanHead + nl);
+        int4* dq = (int4*) xq;
+        for (int i = t; i < nl / 16; i += blockDim.x) dq[i] = __ldcv(sq + i);
+        const int4* sd = (const int4*) (plan + kPlanHead + nl + nl / 4);
+        int4* dd = (int4*) xd;
+        for (int i = t; i < nl / 128; i += blockDim.x) dd[i] = __ldcv(sd + i);
+    }
     __syncthreads();
     if (t == 0) {
         int n = 0;
@@ -1616,11 +1636,15 @@ __global__ void hd_plan_kernel(const int* plan, int nu, int nl, const int* __res
     }
 }
 
-__global__ void hd_answer_kernel(const float* __restrict__ routed, const int* __restrict__ nh, int nl, int* hans,
+__global__ void hd_answer_kernel(const float* __restrict__ y, int nu, const int* __restrict__ nh, int nl, int* hans,
                                  const int* __restrict__ dpos) {
     const int t = threadIdx.x;
     volatile float* vs = (volatile float*) (hans + kAnsHead);
-    for (int i = t; i < nl; i += blockDim.x) vs[i] = routed[i];
+    for (int c = t; c < nl; c += blockDim.x) {   // (sum_rows' order: row 0 first)
+        float acc = 0.0f;
+        for (int i = 0; i < nu; ++i) acc += y[(size_t) i * nl + c];
+        vs[c] = acc;
+    }
     if (t == 0) ((volatile int*) hans)[1] = *nh;
     __threadfence_system();
     __syncthreads();
@@ -1631,9 +1655,10 @@ __global__ void hd_answer_kernel(const float* __restrict__ routed, const int* __
 }
 }  // namespace
 
-void moe_plan(const int* sel, const float* w, int nu, const float* lat, int nl, const int* where,
-              const uint8_t* const* slotptr, const uint8_t** gptr, int* need, int* plan, const int* dpos, cudaStream_t s) {
-    moe_plan_kernel<<<1, 256, 0, s>>>(sel, w, nu, lat, nl, where, slotptr, gptr, need, plan, dpos);
+void moe_plan(const int* sel, const float* w, int nu, const float* lat, const int8_t* xq, const float* xd, int nl,
+              const int* where, const uint8_t* const* slotptr, const uint8_t** gptr, int* need, int* plan,
+              const int* dpos, cudaStream_t s) {
+    moe_plan_kernel<<<1, 256, 0, s>>>(sel, w, nu, lat, xq, xd, nl, where, slotptr, gptr, need, plan, dpos);
 }
 void moe_wait(const int* ans, const int* need, const int* dpos, int nl, float* tail, unsigned* diag, cudaStream_t s) {
     moe_wait_kernel<<<1, 256, 0, s>>>(ans, need, dpos, nl, tail, diag);
@@ -1643,11 +1668,11 @@ void moe_wait2(const int* ans, const int* hans, const int* need, const int* dpos
     moe_wait2_kernel<<<1, 256, 0, s>>>(ans, hans, need, dpos, nl, tail, diag);
 }
 void hd_plan(const int* plan, int nu, int nl, const int* where, const uint8_t* const* slotptr, const uint8_t** gptr,
-             float* w, float* lat, int* nh, const int* dpos, unsigned* diag, cudaStream_t s) {
-    hd_plan_kernel<<<1, 256, 0, s>>>(plan, nu, nl, where, slotptr, gptr, w, lat, nh, dpos, diag);
+             float* w, int8_t* xq, float* xd, int* nh, const int* dpos, unsigned* diag, cudaStream_t s) {
+    hd_plan_kernel<<<1, 256, 0, s>>>(plan, nu, nl, where, slotptr, gptr, w, xq, xd, nh, dpos, diag);
 }
-void hd_answer(const float* routed, const int* nh, int nl, int* hans, const int* dpos, cudaStream_t s) {
-    hd_answer_kernel<<<1, 256, 0, s>>>(routed, nh, nl, hans, dpos);
+void hd_answer(const float* y, int nu, const int* nh, int nl, int* hans, const int* dpos, cudaStream_t s) {
+    hd_answer_kernel<<<1, 512, 0, s>>>(y, nu, nh, nl, hans, dpos);
 }
 
 }  // namespace hy4::k

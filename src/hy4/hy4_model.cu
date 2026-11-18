@@ -3637,9 +3637,8 @@ void Engine::Impl::hd_layer(const Layer& l, int il) {
     const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used, ne = g.n_expert;
     const CpuLayer& c = l.cl;
     const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru;
-    k::hd_plan(mdh_plan + (size_t) il * plan_ints, nu, NL, hd_where + (size_t) il * ne, hd_slotptr, hd_gptr, hd_w, hd_lat,
-               hd_nh, hd_dpos, mdh_diag + 1, hc.s);
-    k::q8(hd_lat, 1, NL, hc.qq, hc.qd, hc.s);
+    k::hd_plan(mdh_plan + (size_t) il * plan_ints, nu, NL, hd_where + (size_t) il * ne, hd_slotptr, hd_gptr, hd_w, hc.qq,
+               hc.qd, hd_nh, hd_dpos, mdh_diag + 1, hc.s);   // (the main card's int8 rows of the latent: no q8 here)
     auto tab = [&](int type, size_t off, size_t ld, int kk, int n, const int8_t* xq, const float* xd, size_t xs,
                    float* y, size_t ys, const float* alpha) {
         if (!iq::mv_table(type, hd_gptr, off, ld, kk, n, nu, xq, xd, xs, y, ys, alpha, hc.s)) {
@@ -3647,13 +3646,20 @@ void Engine::Impl::hd_layer(const Layer& l, int il) {
             std::abort();
         }
     };
-    tab(c.tg, 0, c.rg, NL, ff, hc.qq, hc.qd, 0, hc.gu, (size_t) 2 * ff, nullptr);
-    tab(c.tu, gb, c.ru, NL, ff, hc.qq, hc.qd, 0, hc.gu + ff, (size_t) 2 * ff, nullptr);
+    if (c.tg == c.tu && c.rg == c.ru) {
+        if (!iq::mv_table(c.tg, hd_gptr, 0, c.rg, NL, ff, nu, hc.qq, hc.qd, 0, hc.gu, (size_t) 2 * ff, nullptr, hc.s, 2,
+                          gb, (size_t) ff)) {
+            std::fprintf(stderr, "maya-hy4: no table GEMV for the experts' type %d (k %d) on the helper\n", c.tg, NL);
+            std::abort();
+        }
+    } else {
+        tab(c.tg, 0, c.rg, NL, ff, hc.qq, hc.qd, 0, hc.gu, (size_t) 2 * ff, nullptr);
+        tab(c.tu, gb, c.ru, NL, ff, hc.qq, hc.qd, 0, hc.gu + ff, (size_t) 2 * ff, nullptr);
+    }
     k::swiglu_f32_rows(hc.gu, nu, ff, l.clamp_exp, hc.h, hc.s);
     k::q8(hc.h, nu, ff, hc.hq, hc.hd, hc.s);
     tab(c.td, gb + ub, c.rd, ff, NL, hc.hq, hc.hd, (size_t) ff, hc.y, (size_t) NL, hd_w);
-    k::sum_rows(hc.y, nu, NL, hc.routed, hc.s);
-    k::hd_answer(hc.routed, hd_nh, NL, mdh_hans + (size_t) il * ans_ints, hd_dpos, hc.s);
+    k::hd_answer(hc.y, nu, hd_nh, NL, mdh_hans + (size_t) il * ans_ints, hd_dpos, hc.s);   // (sum_rows' sum in it)
 }
 
 void Engine::Impl::hd_graphs() {
@@ -3717,7 +3723,7 @@ void Engine::Impl::dr_alloc() {
     if (!dr) return;
     const int NL = g.n_lat;
     const size_t nk = (size_t) g.n_layer * g.n_expert;
-    plan_ints = ((size_t) k::kPlanHead + NL + 63) & ~(size_t) 63;
+    plan_ints = k::plan_ints(NL);
     ans_ints = ((size_t) k::kAnsHead + NL + 63) & ~(size_t) 63;
     const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
     void *hp = nullptr, *ha = nullptr, *hd = nullptr;
@@ -3772,7 +3778,7 @@ void Engine::Impl::tok_moe(const Layer& l, int il) {
     const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used, ne = g.n_expert;
     const CpuLayer& c = l.cl;
     k::route(rlog, ne, l.exp_bias_d, 1, ne, 1, 1, nu, g.exp_scale, d_sel, d_wsel, s);
-    k::moe_plan(d_sel, d_wsel, nu, lat, NL, d_where + (size_t) il * ne, d_slotptr, d_gptr, d_need,
+    k::moe_plan(d_sel, d_wsel, nu, lat, xq_l, xd_l, NL, d_where + (size_t) il * ne, d_slotptr, d_gptr, d_need,
                 md_plan + (size_t) il * plan_ints, dpos, s);
     const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru;
     auto tab = [&](int type, size_t off, size_t ld, int kk, int n, const int8_t* xq, const float* xd, size_t xs,
@@ -3782,8 +3788,16 @@ void Engine::Impl::tok_moe(const Layer& l, int il) {
             std::abort();
         }
     };
-    tab(c.tg, 0, c.rg, NL, ff, xq_l, xd_l, 0, ec.gu, (size_t) 2 * ff, nullptr);
-    tab(c.tu, gb, c.ru, NL, ff, xq_l, xd_l, 0, ec.gu + ff, (size_t) 2 * ff, nullptr);
+    if (c.tg == c.tu && c.rg == c.ru) {   // (gate and up alike: one launch, the up at gb in the slot, ff on in gu)
+        if (!iq::mv_table(c.tg, d_gptr, 0, c.rg, NL, ff, nu, xq_l, xd_l, 0, ec.gu, (size_t) 2 * ff, nullptr, s, 2, gb,
+                          (size_t) ff)) {
+            std::fprintf(stderr, "maya-hy4: no table GEMV for the experts' type %d (k %d)\n", c.tg, NL);
+            std::abort();
+        }
+    } else {
+        tab(c.tg, 0, c.rg, NL, ff, xq_l, xd_l, 0, ec.gu, (size_t) 2 * ff, nullptr);
+        tab(c.tu, gb, c.ru, NL, ff, xq_l, xd_l, 0, ec.gu + ff, (size_t) 2 * ff, nullptr);
+    }
     k::swiglu_f32_rows(ec.gu, nu, ff, l.clamp_exp, ec.h, s);
     k::q8(ec.h, nu, ff, ec.hq, ec.hd, s);
     tab(c.td, gb + ub, c.rd, ff, NL, ec.hq, ec.hd, (size_t) ff, ec.y, (size_t) NL, d_wsel);
