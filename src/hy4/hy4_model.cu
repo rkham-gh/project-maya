@@ -54,6 +54,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <deque>
 #include <type_traits>
 
 #ifdef _WIN32
@@ -966,6 +967,57 @@ struct Engine::Impl {
             th.join();
         }
     } hc;
+    // (8b) The prompt path's experts the helper card holds (and the main card's cache does not), computed there: a MoE
+    // layer's latent rows, expert lists and weights go across (pinned, two sets by the layer's parity), the helper's
+    // worker thread runs each such expert's GEMMs on its own stream (F16 in, F32 sums, as the main card's), and the
+    // helper's partial sum of the routed experts comes back to be added to the main card's before routed_up.  The main
+    // card neither copies nor computes those experts.  HY4_PF_HELPER=0: off.
+    struct HPF {
+        bool on = false;
+        cublasHandle_t cb = nullptr;
+        cudaStream_t s = nullptr;
+        int RT = 2048, Cmax = 0;   // (an expert's rows a pass; the most rows of a chunk)
+        __half *lat = nullptr, *W1 = nullptr, *W2 = nullptr, *Xe = nullptr, *He = nullptr;
+        float *GU = nullptr, *Ye = nullptr, *YL = nullptr, *wl = nullptr;
+        int* list = nullptr;
+        __half* lat_h[2] = {nullptr, nullptr};
+        int* list_h[2] = {nullptr, nullptr};
+        float* wl_h[2] = {nullptr, nullptr};
+        float* yl_h[2] = {nullptr, nullptr};
+        // in_ready / out_used: the main card's (its copies out done / its copy of the sum in done); in_used / out_ready:
+        // the helper's (its copies in done / its sum out done)
+        cudaEvent_t in_ready[2] = {}, out_used[2] = {}, in_used[2] = {}, out_ready[2] = {};
+        struct Job {
+            int il = 0, T = 0, b = 0;
+            long seq = 0;
+            std::vector<int> e, cnt, off;
+            std::vector<const uint8_t*> blob;
+        };
+        std::thread th;
+        std::mutex mu;
+        std::condition_variable cv, cv_done;
+        std::deque<Job> q;
+        long seq = 0, issued = 0;   // (jobs submitted by the main thread / enqueued on the helper by the worker)
+        bool quit = false;
+        long experts = 0;           // (a read's: the experts computed there, their bytes not copied, the rows across)
+        double saved = 0, xfer = 0;
+        ~HPF() {
+            if (!th.joinable()) return;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                quit = true;
+            }
+            cv.notify_all();
+            th.join();
+        }
+    } hp;
+    void hp_alloc();
+    void hp_worker();
+    bool hp_has(int il, int e) const {   // (an expert the helper computes: settled there, not in the main card's cache)
+        if (!hp.on || ec_blob(il, e)) return false;
+        const int sl = hc.where[(size_t) il * ec.ne + e];
+        return sl >= 0 && !hc.busy[(size_t) sl];
+    }
     bool hc_steal = false;
     long pf_tokens_open = 0;
     int refill_tok = -1, refill_helper = 0;   // (verbose) a background refill's tokens so far (-1: none), its copies
@@ -2660,6 +2712,133 @@ struct OnDev {
 };
 }  // namespace
 
+// (8b) The helper's prompt-path buffers, on its device (current here): a chunk's latent rows and its partial sum, the
+// expert lists, an expert's F16 weights and RT of its rows' intermediates; the pinned sets; the events; its cuBLAS; the
+// worker
+void Engine::Impl::hp_alloc() {
+    // (HY4_PF_HELPER: 1, on; 0: off; 2: off with its buffers allocated all the same - an A/B against 1 with the
+    //  helper's slots the same)
+    const int hpv = std::getenv("HY4_PF_HELPER") ? std::atoi(std::getenv("HY4_PF_HELPER")) : 1;
+    if (hpv == 0) return;
+    const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used;
+    hp.Cmax = std::max(64, o.chunk);
+    const size_t C = (size_t) hp.Cmax, RT = (size_t) hp.RT;
+    if (cublasCreate(&hp.cb) != CUBLAS_STATUS_SUCCESS) {
+        std::fprintf(stderr, "maya-hy4: no cuBLAS on the helper card: its prompt-path share off\n");
+        return;
+    }
+    CK(cudaStreamCreateWithFlags(&hp.s, cudaStreamNonBlocking));
+    cublasSetStream(hp.cb, hp.s);
+    size_t dev = 0;
+    auto da = [&](size_t bytes) {
+        void* q = nullptr;
+        CK(cudaMalloc(&q, bytes));
+        dev += bytes;
+        return q;
+    };
+    hp.lat = (__half*) da(C * NL * sizeof(__half));
+    hp.YL = (float*) da(C * NL * sizeof(float));
+    hp.list = (int*) da(C * nu * sizeof(int));
+    hp.wl = (float*) da(C * nu * sizeof(float));
+    hp.W1 = (__half*) da((size_t) 2 * ff * NL * sizeof(__half));
+    hp.W2 = (__half*) da((size_t) ff * NL * sizeof(__half));
+    hp.Xe = (__half*) da(RT * NL * sizeof(__half));
+    hp.GU = (float*) da(RT * 2 * ff * sizeof(float));
+    hp.He = (__half*) da(RT * ff * sizeof(__half));
+    hp.Ye = (float*) da(RT * NL * sizeof(float));
+    hc.bytes += dev;
+    bool ok = true;
+    for (int b = 0; b < 2 && ok; ++b)
+        ok = cudaHostAlloc((void**) &hp.lat_h[b], C * NL * sizeof(__half), cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &hp.list_h[b], C * nu * sizeof(int), cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &hp.wl_h[b], C * nu * sizeof(float), cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &hp.yl_h[b], C * NL * sizeof(float), cudaHostAllocPortable) == cudaSuccess;
+    if (!ok) {
+        cudaGetLastError();
+        std::fprintf(stderr, "maya-hy4: no pinned buffers for the helper card's prompt-path share (off)\n");
+        return;
+    }
+    for (int b = 0; b < 2; ++b) {
+        CK(cudaEventCreateWithFlags(&hp.in_used[b], cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&hp.out_ready[b], cudaEventDisableTiming));
+    }
+    {
+        OnDev om(o.gpu);
+        for (int b = 0; b < 2; ++b) {
+            CK(cudaEventCreateWithFlags(&hp.in_ready[b], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&hp.out_used[b], cudaEventDisableTiming));
+        }
+    }
+    hp.on = hpv != 2;
+    hp.th = std::thread([this] { hp_worker(); });
+    std::fprintf(stderr, "maya-hy4: %sthe helper card computes the prompt path's experts it holds (%.0f MiB of its "
+                 "VRAM, %.0f MiB pinned)\n", hp.on ? "" : "(HY4_PF_HELPER=2: not used) ", dev / 1048576.0, 2.0 * C * (NL * 6 + nu * 8) / 1048576.0);
+}
+
+// (8b) The helper's worker: each job's inputs in once the main card's copies are out, each of its experts' GEMMs (an
+// expert's rows RT at a time, in id order), the partial sum out; `issued` once all of it is on the helper's stream
+void Engine::Impl::hp_worker() {
+    CK(cudaSetDevice(hc.dev));
+    const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used;
+    auto gemm_h = [&](const __half* X, int ldx, const __half* W, int ldw, float* Y, int ldy, int T, int n, int k) {
+        const float one = 1.0f, zero = 0.0f;
+        const cublasStatus_t r = cublasGemmEx(hp.cb, CUBLAS_OP_T, CUBLAS_OP_N, n, T, k, &one, W, CUDA_R_16F, ldw, X,
+                                              CUDA_R_16F, ldx, &zero, Y, CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F,
+                                              CUBLAS_GEMM_DEFAULT);
+        if (r != CUBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "maya-hy4: the helper's cuBLAS GEMM %dx%dx%d failed (%d)\n", T, n, k, (int) r);
+            std::abort();
+        }
+    };
+    for (;;) {
+        HPF::Job j;
+        {
+            std::unique_lock<std::mutex> lk(hp.mu);
+            hp.cv.wait(lk, [&] { return hp.quit || !hp.q.empty(); });
+            if (hp.quit) return;
+            j = std::move(hp.q.front());
+            hp.q.pop_front();
+        }
+        const Layer& l = L[(size_t) j.il];
+        const CpuLayer& c = l.cl;
+        const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru;
+        const int b = j.b, T = j.T;
+        CK(cudaStreamWaitEvent(hp.s, hp.in_ready[b], 0));
+        if (j.seq >= 2) CK(cudaStreamWaitEvent(hp.s, hp.out_used[b], 0));   // (the main card's copy of that set's sum)
+        CK(cudaMemcpyAsync(hp.lat, hp.lat_h[b], (size_t) T * NL * sizeof(__half), cudaMemcpyHostToDevice, hp.s));
+        CK(cudaMemcpyAsync(hp.list, hp.list_h[b], (size_t) T * nu * sizeof(int), cudaMemcpyHostToDevice, hp.s));
+        CK(cudaMemcpyAsync(hp.wl, hp.wl_h[b], (size_t) T * nu * sizeof(float), cudaMemcpyHostToDevice, hp.s));
+        CK(cudaEventRecord(hp.in_used[b], hp.s));
+        CK(cudaMemsetAsync(hp.YL, 0, (size_t) T * NL * sizeof(float), hp.s));
+        for (size_t i = 0; i < j.e.size(); ++i) {
+            const uint8_t* w = j.blob[i];
+            if (!iq::f16_rows(c.tg, w, NL, ff, (uint16_t*) hp.W1, NL, hp.s) ||
+                !iq::f16_rows(c.tu, w + gb, NL, ff, (uint16_t*) (hp.W1 + (size_t) ff * NL), NL, hp.s) ||
+                !iq::f16_rows(c.td, w + gb + ub, ff, NL, (uint16_t*) hp.W2, ff, hp.s)) {
+                std::fprintf(stderr, "maya-hy4: no F16 rows for the experts' types %d / %d / %d\n", c.tg, c.tu, c.td);
+                std::abort();
+            }
+            const int m = j.cnt[i], o0 = j.off[i];
+            for (int r0 = 0; r0 < m; r0 += hp.RT) {
+                const int n = std::min(hp.RT, m - r0);
+                iq::gather_f16((const uint16_t*) hp.lat, NL, hp.list + o0 + r0, n, NL, (uint16_t*) hp.Xe, hp.s);
+                gemm_h(hp.Xe, NL, hp.W1, NL, hp.GU, 2 * ff, n, 2 * ff, NL);
+                k::swiglu_rows(hp.GU, n, ff, l.clamp_exp, hp.He, hp.s);
+                gemm_h(hp.He, ff, hp.W2, ff, hp.Ye, NL, n, NL, ff);
+                k::scatter_add(hp.Ye, hp.list + o0 + r0, hp.wl + o0 + r0, n, NL, hp.YL, hp.s);
+            }
+        }
+        CK(cudaMemcpyAsync(hp.yl_h[b], hp.YL, (size_t) T * NL * sizeof(float), cudaMemcpyDeviceToHost, hp.s));
+        CK(cudaEventRecord(hp.out_ready[b], hp.s));
+        (void) cudaStreamQuery(hp.s);   // (submitted now - WDDM holds a stream's work until something flushes it)
+        {
+            std::lock_guard<std::mutex> lk(hp.mu);
+            hp.issued = j.seq + 1;
+        }
+        hp.cv_done.notify_all();
+    }
+}
+
 void Engine::Impl::hc_alloc() {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || o.helper_gpu >= ndev || o.helper_gpu == o.gpu || ec.cls_bytes.empty()) {
@@ -2717,6 +2896,7 @@ void Engine::Impl::hc_alloc() {
             std::fprintf(stderr, "maya-hy4: no pinned staging for the helper card's fills (the driver's is used)\n");
         }
     }
+    hp_alloc();   // (8b: before the slots, which take what is left)
     // the slots: this card's free VRAM less a reserve, each class's share by its layers (as the main cache's)
     std::vector<int> nl((size_t) nc, 0);
     int nmoe = 0;
@@ -3512,12 +3692,12 @@ void Engine::Impl::pre_run() {
         const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru, db = (size_t) E * c.rd;
         uint8_t* B = pre.buf[b];
         for (int e = 0; e < ne;) {
-            if (ec_blob(il, e)) {
+            if (ec_blob(il, e) || hp_has(il, e)) {   // (in VRAM, or computed on the helper card: 8b)
                 ++e;
                 continue;
             }
             int r = e;
-            while (r < ne && !ec_blob(il, r)) ++r;
+            while (r < ne && !ec_blob(il, r) && !hp_has(il, r)) ++r;
             const size_t n = (size_t) (r - e);
             pre_stage(B + (size_t) e * gb, c.gate + (size_t) e * gb, n * gb);
             pre_stage(B + (size_t) ne * gb + (size_t) e * ub, c.up + (size_t) e * ub, n * ub);
@@ -3867,6 +4047,45 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
         std::fwrite(hdr, 1, 2, route_log);
         std::fwrite(c16.data(), 2, c16.size(), route_log);
     }
+    // (8b) the used experts the helper card holds: to its worker, and out of the main card's counts
+    bool hjob = false;
+    int hb = 0;
+    {
+        HPF::Job j;
+        if (hp.on)
+            for (int e = 0; e < ne; ++e)
+                if (pf.h_cnt[e] && hp_has(il, e)) {
+                    j.e.push_back(e);
+                    j.cnt.push_back(pf.h_cnt[e]);
+                    j.off.push_back(pf.h_off[e]);
+                    j.blob.push_back(hc.ptr[(size_t) hc.where[(size_t) il * ne + e]]);
+                }
+        if (!j.e.empty()) {
+            hjob = true;
+            hb = (int) (hp.seq & 1);
+            if (hp.seq >= 2) CK(cudaStreamWaitEvent(s, hp.in_used[hb], 0));   // (the helper's copy of that set in)
+            CK(cudaMemcpyAsync(hp.lat_h[hb], pf.LATh, (size_t) T * NL * sizeof(__half), cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(hp.list_h[hb], pf.list, (size_t) T * nu * sizeof(int), cudaMemcpyDeviceToHost, s));
+            CK(cudaMemcpyAsync(hp.wl_h[hb], pf.wl, (size_t) T * nu * sizeof(float), cudaMemcpyDeviceToHost, s));
+            CK(cudaEventRecord(hp.in_ready[hb], s));
+            (void) cudaStreamQuery(s);
+            j.il = il;
+            j.T = T;
+            j.b = hb;
+            j.seq = hp.seq++;
+            for (size_t i = 0; i < j.e.size(); ++i) {
+                pf.h_cnt[j.e[i]] = 0;
+                hp.saved += (double) (gb + ub + db);
+            }
+            hp.experts += (long) j.e.size();
+            hp.xfer += (double) T * NL * (sizeof(__half) + sizeof(float));
+            {
+                std::lock_guard<std::mutex> lk(hp.mu);
+                hp.q.push_back(std::move(j));
+            }
+            hp.cv.notify_one();
+        }
+    }
     // The prefetch's way (a copier running for this chunk): every expert not in VRAM already on its way into the
     // layer's buffer; once it is there, each used expert's GEMMs as below, in id order
     auto experts = [&](int e, const uint8_t* wg, const uint8_t* wu, const uint8_t* wd) {
@@ -3998,6 +4217,17 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
             k::scatter_add(pf.Ye, pf.list + o0, pf.wl + o0, rows, NL, pf.YL, s);
         }
         if (bi >= 0) CK(cudaEventRecord(pf.gfreed[bi], s));
+    }
+    if (hjob) {   // (8b) the helper's partial sum, added after the main card's experts
+        const long want = hp.seq;   // (this job's seq + 1: the last one submitted)
+        {
+            std::unique_lock<std::mutex> lk(hp.mu);
+            hp.cv_done.wait(lk, [&] { return hp.issued >= want; });
+        }
+        CK(cudaStreamWaitEvent(s, hp.out_ready[hb], 0));
+        CK(cudaMemcpyAsync(pf.Ye, hp.yl_h[hb], (size_t) T * NL * sizeof(float), cudaMemcpyHostToDevice, s));
+        CK(cudaEventRecord(hp.out_used[hb], s));
+        k::add(pf.YL, pf.Ye, T * NL, s);
     }
     // routed_up, and the shared expert on every token (no clamp)
     k::to_f16(pf.YL, pf.YLh, (size_t) T * NL, s);
@@ -4174,6 +4404,8 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     // the lent slots back to their buffers until the next token is written (a long prompt comes in pieces); the
     // background refill's copies still to come dropped (the prompt fills by its own scores)
     const double cb0 = pf.copy_bytes;
+    hp.experts = 0;
+    hp.saved = hp.xfer = 0;
     pf_layout(n);   // (8c: a read under the prefetch's min_T takes only the arena's start)
     {
         const int lf0 = ec.lent_from;
@@ -4211,6 +4443,10 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     st.pf_tokens += n;
     st.pf_copy_gb = pf.copy_bytes / 1e9;
     st.pf_copy_last_gb = (pf.copy_bytes - cb0) / 1e9;
+    if (o.verbose && hp.experts > 0)
+        std::fprintf(stderr, "maya-hy4: the read's %ld expert-layers on the helper card (%.2f GB of them not copied to the "
+                     "main card; %.2f GB of rows across); %.2f GB of experts copied to the main card\n", hp.experts,
+                     hp.saved / 1e9, hp.xfer / 1e9, (pf.copy_bytes - cb0) / 1e9);
     return h_logits;
 }
 
