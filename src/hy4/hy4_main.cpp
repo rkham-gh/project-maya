@@ -32,7 +32,7 @@
 //
 // The prompt goes through the prompt path (Engine::prefill: chunks of --chunk tokens, default 8192, on the GPU with the
 // routed experts streamed to it through --stage VRAM slots); --step reads it a token at a time instead (and prompts
-// under HY4_MIN_CHUNK tokens, 512, take the token path anyway - in windows).
+// under HY4_MIN_CHUNK tokens, 256, take the token path anyway - in windows).
 //
 // --ids: comma- or whitespace-separated token ids, or @FILE holding them.  --gen: greedy tokens after the prompt, each
 // printed with the top --top (default 5) as id:log-probability (for a comparison with llama.cpp's).  --follow: the

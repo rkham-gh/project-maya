@@ -4091,9 +4091,10 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     const double t0 = now_ms();
     const float* lg = nullptr;
     // a short prompt (a turn's few new tokens): the token path's experts on the CPU beat copying the ones it chooses
-    // (HY4_MIN_CHUNK, 512: in windows a turn - its first token and 100 answer tokens - beats the prompt path's up to
-    // ~550-600 new tokens fresh and after 32K alike: no refill after it, and the answer drafts from its first token)
-    int min_chunk = 512;
+    // (HY4_MIN_CHUNK, 256: in windows a turn - its first token and 100 answer tokens - beats the prompt path's up to
+    // ~250 new tokens, fresh and after 32K alike, since the prompt path's floor is ~2 s (8e); 512 against its ~5 s
+    // floor before, 8a)
+    int min_chunk = 256;
     if (const char* v = std::getenv("HY4_MIN_CHUNK")) min_chunk = std::max(1, std::atoi(v));
     if (n < min_chunk) {
         // in windows of wTm, every row kept (a prompt's tokens are known): the dense set read once a window, the CPU
