@@ -1046,6 +1046,12 @@ struct Engine::Impl {
         std::thread th;
         std::atomic<bool> quit{false};
         long launched = 0;
+        // (HY4_PF_KEEPALIVE_MAIN=1, with the linger: the main card held busy too, in the gaps only - not while a read
+        //  runs or tokens are written (the last token over 100 ms ago): its own stream, its own two kernels)
+        bool main = false;
+        cudaStream_t ms = nullptr;
+        cudaEvent_t mev[2] = {nullptr, nullptr};
+        std::atomic<double> last_tok{0.0};
         ~HKA() {
             if (!th.joinable()) return;
             quit = true;
@@ -2836,10 +2842,23 @@ void Engine::Impl::hp_alloc() {
             cudaStreamCreateWithPriority(&ka.s, cudaStreamNonBlocking, lo) == cudaSuccess) {
             CK(cudaEventCreateWithFlags(&ka.ev[0], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&ka.ev[1], cudaEventDisableTiming));
+            if (const char* w = std::getenv("HY4_PF_KEEPALIVE_MAIN"); w && std::atoi(w) != 0 && ka.linger_ms > 0) {
+                OnDev om(o.gpu);
+                int lo2 = 0, hi2 = 0;
+                if (cudaDeviceGetStreamPriorityRange(&lo2, &hi2) == cudaSuccess &&
+                    cudaStreamCreateWithPriority(&ka.ms, cudaStreamNonBlocking, lo2) == cudaSuccess) {
+                    CK(cudaEventCreateWithFlags(&ka.mev[0], cudaEventDisableTiming));
+                    CK(cudaEventCreateWithFlags(&ka.mev[1], cudaEventDisableTiming));
+                    ka.main = true;
+                } else {
+                    cudaGetLastError();
+                }
+            }
             ka.on = true;
             ka.th = std::thread([this] { ka_loop(); });
-            std::fprintf(stderr, "maya-hy4: HY4_PF_KEEPALIVE: the helper card held busy through prompt-path reads%s\n",
-                         ka.linger_ms > 0 ? " and a linger past each written token" : "");
+            std::fprintf(stderr, "maya-hy4: HY4_PF_KEEPALIVE: the helper card held busy through prompt-path reads%s%s\n",
+                         ka.linger_ms > 0 ? " and a linger past each written token" : "",
+                         ka.main ? "; the main card in the linger's gaps" : "");
         } else {
             cudaGetLastError();
         }
@@ -2942,10 +2961,23 @@ void Engine::Impl::hp_collect(int b) {
 void Engine::Impl::ka_loop() {
     CK(cudaSetDevice(hc.dev));
     const unsigned long long ns = 5000000ull;
-    bool rec[2] = {false, false};
+    bool rec[2] = {false, false}, mrec[2] = {false, false};
     int k = 0;
     while (!ka.quit) {
-        const bool want = ka.reading || (ka.linger_ms > 0 && now_ms() < ka.until.load());
+        const double t = now_ms();
+        const bool lingering = ka.linger_ms > 0 && t < ka.until.load();
+        const bool want = ka.reading || lingering;
+        if (ka.main && lingering && !ka.reading && t - ka.last_tok.load() > 100.0) {   // (the main card: the gaps)
+            CK(cudaSetDevice(o.gpu));
+            for (int b = 0; b < 2; ++b) {
+                if (mrec[b] && cudaEventQuery(ka.mev[b]) != cudaSuccess) continue;
+                k::keepalive(ns, ka.ms);
+                CK(cudaEventRecord(ka.mev[b], ka.ms));
+                mrec[b] = true;
+            }
+            (void) cudaStreamQuery(ka.ms);
+            CK(cudaSetDevice(hc.dev));
+        }
         if (!want) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
@@ -5337,7 +5369,11 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
 // The work before a token (rows 1) or a window (rows T): the cache rows they write reserved, the first one after a
 // prompt's refills, the token path's graphs, the helper's keep-alive
 void Engine::Impl::pre_step(int rows) {
-    if (ka.on && ka.linger_ms > 0) ka.until = now_ms() + ka.linger_ms;   // (HY4_PF_KEEPALIVE_LINGER_S)
+    if (ka.on && ka.linger_ms > 0) {   // (HY4_PF_KEEPALIVE_LINGER_S)
+        const double t = now_ms();
+        ka.until = t + ka.linger_ms;
+        ka.last_tok = t;
+    }
     ec_kv_reserve(pos + rows);   // (before the first token's fill: it takes no slot about to be reserved)
     if (pf_open) {   // the first token after a prompt: the prompt path's buffers lent to the cache again, and filled
         pf_open = false;
