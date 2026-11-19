@@ -1,13 +1,15 @@
 // src/hy4/hy4_main.cpp - maya-hy4: Tencent's Hy4 Flash from a GGUF on one NVIDIA GPU (and a helper card) and the CPU.
 //
 //   maya-hy4 --gguf <...-00001-of-0000N.gguf> --serve [--max-context N] [--threads N] [--gpu N] [--profile FILE]
+//            [--dfly model-00148-of-00148.safetensors]   (or HY4_DFLY=<file>: DFly2, Tencent's drafter, below)
 //
 // --serve speaks Maya's engine protocol (serve/server.py's StrataEngine): INFO lines, then `READY <context> stop`; per
 // request `GEN <max_new> [key=value ...] <id,id,...>` answered by `PP <read> <total> <ms> <tok/s> <reused>` while the
 // prompt is read, a `T <id>` line a token, and `DONE <generated> <prompt> <prompt ms> <decode ms> <stop|length|cancel>
 // <accepted> <offered> <reused>`; `STOP` ends a request early, `QUIT` the engine.  A prompt that continues the last
-// conversation (its tokens so far, the generated ones included) reads only the rest: the KDA layers' state cannot go
-// back, so anything else starts over.  Keys: temperature, top_p, top_k, min_p, seed; lookup=0|1 (the prompt lookup's
+// conversation (its tokens so far, the generated ones included) reads only the rest, one that continues the last
+// prompt's end goes on from its snapshot: the sliding-window and indexer rings hold only the last positions, so
+// anything else starts over.  Keys: temperature, top_p, top_k, min_p, seed; lookup=0|1 (the prompt lookup's
 // drafts, below; suffix_draft=0|1 too, server.py's strata_tune key), window=N (their window's cap).  A request ends at
 // the GGUF's eos (<|role_end|>).
 //
@@ -16,6 +18,15 @@
 // plain step by this PC's measured round times and the matches' acceptance, and a chosen window is verified in one pass
 // (Engine::step_window): each row sampled as a plain step's would be, kept while it equals the draft, the first that
 // differs (or the bonus row after the last draft) the round's last token - the same tokens a plain decode samples.
+//
+// DFly2 (--dfly; hy4_dfly.inc): each round drafts 5 tokens after the newest one from the target's state at the row
+// before it; DraftPolicy's cost-aware window (maya-ds4's DS4_DRAFT_COST) takes as many as pay by their probabilities -
+// calibrated online against what held - and the round times it measured at this depth (the drafting included); the
+// lookup's proposal competes as beside maya-ds4's drafter (choose(); a trusted long match is verified without
+// drafting).
+// Drafting rests for 48 rounds when its rounds commit fewer tokens a millisecond than plain ones (16 rounds judged; a
+// plain round every 32 keeps that rate). Keys: dfly=0|1; spec=1 (server.py's strata_tune: the plain token loop, no
+// drafting at all) or spec=N (windows of N rows at most).
 //
 //   maya-hy4 --gguf <...> --ids @prompt.txt [--gen N | --follow @tokens.txt] [--top N] [--dump-logits out.bin]
 //
@@ -261,6 +272,7 @@ int main(int argc, char** argv) {
             if (opt.helper_gpu < 0) opt.helper_gpu = 1;
         }
         else if (a == "--profile") opt.profile = val();
+        else if (a == "--dfly") opt.dfly = val();
         else if (a == "--dump-logits") dump = val();
         else if (a == "--quiet") opt.verbose = false;
         else if (a == "--selftest") selftest = true;
@@ -279,6 +291,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (const char* v = std::getenv("HY4_HELPER_GPU")) opt.helper_gpu = std::atoi(v);   // (-1: no helper card)
+    if (const char* v = std::getenv("HY4_DFLY")) opt.dfly = v;   // (DFly2's safetensors; "": none)
     hy4::Engine eng;
     std::string err;
     if (!eng.load(opt, err)) {
@@ -322,6 +335,131 @@ int main(int argc, char** argv) {
         }
         eng.clear_stats();
         const int steps = follow.empty() ? n_gen : (int) follow.size();
+        // (HY4_RUNS_DFLY=1, a check of DFly2: a greedy run decoded through its drafts - every draft verified in a
+        //  window, a line a token (" d" after one that was a kept draft), the drafts' acceptance by position at the
+        //  end)
+        static const bool rdfly = std::getenv("HY4_RUNS_DFLY") && std::atoi(std::getenv("HY4_RUNS_DFLY")) != 0;
+        if (rdfly && follow.empty() && eng.dfly() && eng.window_max() >= 2) {
+            int n = 1;
+            long rounds = 0, wins = 0, off[8] = {}, acc[8] = {};
+            long cb_n[10] = {}, cb_a[10] = {}, c2_n[10] = {}, c2_a[10] = {};   // (held by confidence tenths)
+            double dms = 0.0;
+            // (HY4_RUNS_DFLY_T=<T>: windows of T rows at most - the tokens a second at a fixed size; 1: plain steps,
+            //  the same accounting.  HY4_RUNS_SKIP=<n>: the counts and the clock from the n-th token on - past a
+            //  prompt's refill and the caches' first swaps)
+            static const int rT = std::getenv("HY4_RUNS_DFLY_T") ? std::atoi(std::getenv("HY4_RUNS_DFLY_T")) : 0;
+            static const int rskip = std::getenv("HY4_RUNS_SKIP") ? std::atoi(std::getenv("HY4_RUNS_SKIP")) : 0;
+            // (HY4_RUNS_NOEOS=1: the end token never picked - the next best instead, so a run goes its whole length)
+            static const bool noeos = std::getenv("HY4_RUNS_NOEOS") && std::atoi(std::getenv("HY4_RUNS_NOEOS")) != 0;
+            auto pick = [&](const float* l) {
+                if (!noeos) return argmax(l, V);
+                int b = eos == 0 ? 1 : 0;
+                for (int v = 0; v < V; ++v)
+                    if (v != eos && l[v] > l[b]) b = v;
+                return b;
+            };
+            const int wmx = rT >= 1 ? std::min(rT, eng.window_max()) : eng.window_max();
+            // (HY4_RUNS_DFLY_SHADOW=1: DFly2 drafts at every position - its block's rows written into the shared
+            //  layers' caches past the position - and is never verified: plain steps, whose logits
+            //  (HY4_LOGITS_DUMP) must be the plain run's to the bit with frozen caches)
+            static const bool shadow = std::getenv("HY4_RUNS_DFLY_SHADOW") &&
+                                       std::atoi(std::getenv("HY4_RUNS_DFLY_SHADOW")) != 0;
+            static FILE* sdump =
+                std::getenv("HY4_LOGITS_DUMP") ? std::fopen(std::getenv("HY4_LOGITS_DUMP"), "wb") : nullptr;
+            if (sdump) std::fwrite(lg, sizeof(float), (size_t) V, sdump);
+            int t = pick(lg);
+            std::printf("%d\n", t);
+            double g0 = now_ms();
+            int n0 = 0;
+            bool skipped = rskip <= 0;
+            while (n < steps && t != eos) {
+                if (!skipped && n >= rskip) {
+                    skipped = true;
+                    n0 = n;
+                    g0 = now_ms();
+                    rounds = wins = 0;
+                    dms = 0.0;
+                    for (int i = 0; i < 8; ++i) off[i] = acc[i] = 0;
+                    for (int i = 0; i < 10; ++i) cb_n[i] = cb_a[i] = c2_n[i] = c2_a[i] = 0;
+                }
+                int dr[8], wt[8];
+                float cf[8];
+                const int room = std::min(wmx, steps - n);
+                int nd = room >= 2 || shadow ? eng.dfly_draft(t, shadow ? 5 : room - 1, dr, cf) : -1;
+                ++rounds;
+                if (shadow) nd = 0;
+                if (nd <= 0) {
+                    lg = eng.step(t);
+                    if (!lg) break;
+                    if (sdump) std::fwrite(lg, sizeof(float), (size_t) V, sdump);
+                    t = pick(lg);
+                    std::printf("%d\n", t);
+                    ++n;
+                    continue;
+                }
+                dms += eng.dfly_ms();
+                ++wins;
+                wt[0] = t;
+                for (int i = 0; i < nd; ++i) wt[i + 1] = dr[i];
+                const float* lw = eng.step_window(wt, nd + 1);
+                if (!lw) break;
+                int kept = 1;
+                for (int i = 0; i <= nd; ++i) {
+                    const int sv = pick(lw + (size_t) i * V);
+                    const bool hit = i < nd && sv == dr[i];
+                    if (i < nd) {   // (draft i reached: its confidence's tenth, held or not)
+                        ++off[i];
+                        const int cb = std::min(9, std::max(0, (int) (cf[i] * 10.0f)));
+                        ++cb_n[cb];
+                        cb_a[cb] += hit;
+                        const int c2 = std::min(9, std::max(0, (int) (eng.dfly_conf2(i) * 10.0f)));
+                        ++c2_n[c2];
+                        c2_a[c2] += hit;
+                    }
+                    std::printf("%d%s\n", sv, hit ? " d" : "");
+                    ++n;
+                    t = sv;
+                    if (!hit || sv == eos) break;
+                    ++acc[i];
+                    ++kept;
+                }
+                eng.window_keep(kept);
+            }
+            std::fflush(stdout);
+            long a_all = 0;
+            std::string per;
+            for (int i = 0; i < 8; ++i) {
+                a_all += acc[i];
+                if (off[i]) {
+                    char b[48];
+                    std::snprintf(b, sizeof b, " %d:%.2f(%ld)", i + 1, (double) acc[i] / off[i], off[i]);
+                    per += b;
+                }
+            }
+            const double ms = now_ms() - g0;
+            std::string cbs;
+            for (int i = 0; i < 10; ++i)
+                if (cb_n[i]) {
+                    char b[48];
+                    std::snprintf(b, sizeof b, " %.1f:%.2f(%ld)", i / 10.0, (double) cb_a[i] / cb_n[i], cb_n[i]);
+                    cbs += b;
+                }
+            std::string c2s;
+            for (int i = 0; i < 10; ++i)
+                if (c2_n[i]) {
+                    char b[48];
+                    std::snprintf(b, sizeof b, " %.1f:%.2f(%ld)", i / 10.0, (double) c2_a[i] / c2_n[i], c2_n[i]);
+                    c2s += b;
+                }
+            std::fprintf(stderr, "maya-hy4: DFly2 run: drafts held by confidence:%s; by the other confidence:%s\n",
+                         cbs.c_str(), c2s.c_str());
+            std::fprintf(stderr,
+                         "maya-hy4: DFly2 run: %d tokens in %ld rounds (%ld windows), %.2f tokens a window, %ld drafts "
+                         "kept; draft k's acceptance after k - 1 held:%s; drafting %.2f ms a window; %.1f tok/s\n",
+                         n - n0, rounds, wins, wins ? (double) (a_all + wins) / wins : 0.0, a_all, per.c_str(),
+                         wins ? dms / wins : 0.0, (n - n0) * 1000.0 / ms);
+            return !eng.failed();
+        }
         // (HY4_LOGITS_DUMP=<file>: every position's logits appended, F32 [vocab] each - a KL check's input)
         static FILE* ldump = std::getenv("HY4_LOGITS_DUMP") ? std::fopen(std::getenv("HY4_LOGITS_DUMP"), "wb") : nullptr;
         // (HY4_RUNS_WINDOW=<T>, a check of windowed decode: a follow fed T tokens a pass - the same lines as one by one)
@@ -459,6 +597,19 @@ int main(int argc, char** argv) {
     const int lk_min = std::getenv("HY4_LOOKUP_MIN") ? std::atoi(std::getenv("HY4_LOOKUP_MIN")) : 3;
     strata::spec::SuffixDrafter sfx(std::max(1, lk_min), 64, (size_t) eng.max_ctx());
     strata::spec::DraftPolicy policy(std::max(1, wmax));
+    // DFly2 (--dfly): its drafts' window by DraftPolicy's cost-aware window (maya-ds4's DS4_DRAFT_COST: the drafts'
+    // chance to hold from their confidences, calibrated online, against the measured round times by depth)
+    const bool df_have = eng.dfly() && wmax >= 2;
+    strata::spec::DraftPolicy dcost(std::max(1, wmax));
+    int ddr[8];
+    float dconf[8];
+    // DFly2's rest: the tokens a millisecond of the rounds that drafted and of plain rounds (decayed sums, over the
+    // engine's life); when drafting does worse over kDfJudge rounds, kDfRest rounds without it, then it is tried again.
+    // Plain rounds come from the rest, the first token after a prompt, and a probe every kDfProbe rounds
+    constexpr int kDfJudge = 16, kDfRest = 48, kDfProbe = 32;
+    double df_tok = 0, df_ms = 0, pl_tok = 0, pl_ms = 0;
+    int df_n = 0, df_tlast = 1;
+    long long df_rests = 0;
     std::vector<int32_t> dbuf((size_t) std::max(1, wmax));
     std::vector<int> wtoks((size_t) std::max(1, wmax));
     std::string line;
@@ -474,6 +625,11 @@ int main(int argc, char** argv) {
         Sampling sp;
         int think_budget = 0, think_end = -1;   // (the server's thinking budget: </think> forced after that many)
         int lk_on = lk_min > 0 && wmax >= 2 ? 1 : 0, wcap = wmax;
+        int df_on = df_have ? 1 : 0;   // (dfly=0|1; spec=1: no drafting at all, spec=N: windows of N at most)
+        // (lookup_trust=0|1, server.py's strata_tune key: a long trusted lookup match verified without DFly2's draft;
+        //  HY4_LOOKUP_TRUST, 0: on code edits DFly2's own windows held as well and longer - 90.4 vs 83.9 tok/s)
+        static const int trust_env = std::getenv("HY4_LOOKUP_TRUST") ? std::atoi(std::getenv("HY4_LOOKUP_TRUST")) : 0;
+        int lk_trust = trust_env != 0;
         std::vector<std::string> fields;
         while (ss >> w) fields.push_back(w);
         if (fields.empty()) continue;
@@ -493,6 +649,13 @@ int main(int argc, char** argv) {
             else if (k == "lookup" || k == "suffix_draft")   // (suffix_draft: server.py's strata_tune key)
                 lk_on = lk_min > 0 && wmax >= 2 && std::atoi(v.c_str()) != 0 ? 1 : 0;
             else if (k == "window") wcap = std::max(1, std::min(wmax, std::atoi(v.c_str())));
+            else if (k == "dfly") df_on = df_have && std::atoi(v.c_str()) != 0 ? 1 : 0;
+            else if (k == "lookup_trust") lk_trust = std::atoi(v.c_str()) != 0;
+            else if (k == "spec") {   // (server.py's strata_tune spec: 1 the plain loop, N a window's rows at most)
+                const int n = std::atoi(v.c_str());
+                if (n == 1) df_on = lk_on = 0;
+                else if (n >= 2) wcap = std::min(wmax, n);
+            }
         }
         bool in_think = think_budget > 0 && think_end >= 0 && think_end < V;
         if (sp.seed >= 0) rng.seed((uint64_t) sp.seed);
@@ -552,6 +715,10 @@ int main(int argc, char** argv) {
         // keeps the drafts while the rows sampled equal them
         long long offered = 0, accepted = 0;
         long long rounds = 0, wins[17] = {};   // (the rounds, the windows by their size: the policy's choices)
+        long long df_off = 0, df_acc = 0, lk_off = 0, lk_acc = 0;   // (the drafts verified and kept, by their source)
+        long long df_rounds = 0, lk_trusted = 0, df_restr = 0;   // (rounds that drafted, trusted lookups, rested ones)
+        long long df_refill = 0;                                  // (... and rounds in a refill, no drafting)
+        int df_rest = 0;
         // a token sampled: the thinking budget's forcing, printed, counted; then whether the request ends at it - 1
         // unfed (its end token, STOP, the context full), 2 fed (max_new: fed as the plain loop did), 0 goes on
         auto emit = [&](int t, int& end) -> int {
@@ -578,6 +745,24 @@ int main(int argc, char** argv) {
             return t;
         };
         if (lk_on) sfx.reset(), sfx.append(hist.data(), hist.size());
+        // a round's tokens and time into DFly2's rest (above): a drafted round's or a plain one's (lookup windows
+        // count for neither); drafting worse over kDfJudge rounds - a rest
+        auto df_judge = [&](bool drafted, int tok_n, double ms) {
+            if (!df_on) return;
+            if (drafted) {
+                df_tok = 0.95 * df_tok + tok_n;
+                df_ms = 0.95 * df_ms + ms;
+                if (++df_n >= kDfJudge && pl_ms > 0 && df_tok / df_ms < pl_tok / pl_ms) {
+                    df_rest = kDfRest;
+                    df_n = 0;
+                    df_tok = df_ms = 0;
+                    ++df_rests;
+                }
+            } else if (tok_n == 1) {
+                pl_tok = 0.9 * pl_tok + 1;
+                pl_ms = 0.9 * pl_ms + ms;
+            }
+        };
         int end = finish == "cancel" || max_new <= 0 || !lg ? 1 : 0;
         int t = end ? -1 : emit(sample(lg, V, sp, rng), end);
         while (end == 0) {
@@ -585,21 +770,55 @@ int main(int argc, char** argv) {
             // last then the bonus row's, fed after the loop) and take positions before the context's last
             const int room = std::min({wcap, max_new - generated, eng.max_ctx() - 1 - (int) hist.size()});
             const double r0 = now_ms();
-            int match = 0;
-            strata::spec::DraftPolicy::Pick pk;
+            int match = 0, kd = 0;
             if (lk_on && room >= 2) {
-                const int kd = sfx.propose(room - 1, dbuf.data());
+                policy.set_context((long long) hist.size());   // (the round costs by depth: < 8K, < 64K, longer)
+                kd = sfx.propose(room - 1, dbuf.data());
                 match = sfx.last_match();
-                if (kd > 0) pk = policy.choose(1, kd, match);
+            }
+            // the window: DFly2's drafts by the cost-aware window, the lookup's where the policy expects more of it
+            // (maya-ds4's round: a lookup whose first token is the drafter's), or the lookup's alone without DFly2
+            int T = 1, nd = -1;
+            bool from_lk = false, trusted = false;
+            bool draft = df_on && room >= 2;
+            // (no drafting while the caches' refill after a prompt runs: every round is slow then, windows the most,
+            //  and its round times would stand for this depth's afterwards - nor do those rounds judge the rest)
+            const bool refill = df_on && eng.refilling();
+            if (refill) draft = false, ++df_refill;
+            if (draft && df_rest > 0) {   // (resting: drafting has paid less than plain rounds)
+                --df_rest;
+                ++df_restr;
+                draft = false;
+            } else if (draft && rounds % kDfProbe == kDfProbe - 1) {
+                draft = false;   // (a plain round now and then: the rate drafting is judged against)
+            }
+            if (draft && lk_trust && kd > 0 && policy.trust(df_tlast, kd, match)) {   // (a long trusted match: verified alone)
+                const strata::spec::DraftPolicy::Pick pk = policy.choose(df_tlast, kd, match);
+                if (pk.lookup && pk.t >= 2) T = pk.t, from_lk = trusted = true, draft = false, ++lk_trusted;
+            }
+            if (draft) nd = eng.dfly_draft(t, room - 1, ddr, dconf);
+            if (nd >= 0) ++df_rounds;
+            if (nd > 0) {
+                dcost.set_context((long long) hist.size());
+                double q[16];
+                dcost.chain(dconf, nd, q);
+                T = dcost.window(q, nd, room);
+                df_tlast = T;
+                if (kd > 0 && (int) dbuf[0] == ddr[0]) {
+                    const strata::spec::DraftPolicy::Pick pk = policy.choose(T, kd, match);
+                    if (pk.lookup) T = pk.t, from_lk = true;
+                }
+            } else if (kd > 0 && !trusted) {
+                const strata::spec::DraftPolicy::Pick pk = policy.choose(1, kd, match);
+                if (pk.lookup && pk.t >= 2) T = pk.t, from_lk = true;
             }
             ++rounds;
-            if (pk.lookup && pk.t >= 2) {
-                const int T = pk.t;
+            if (T >= 2) {
                 wtoks[0] = t;
-                for (int i = 1; i < T; ++i) wtoks[(size_t) i] = dbuf[(size_t) (i - 1)];
+                for (int i = 1; i < T; ++i) wtoks[(size_t) i] = from_lk ? (int) dbuf[(size_t) (i - 1)] : ddr[i - 1];
                 const float* lw = eng.step_window(wtoks.data(), T);
                 if (!lw && !eng.failed()) {   // (no window after all: plain steps for the request)
-                    lk_on = 0;
+                    lk_on = df_on = 0;
                     continue;
                 }
                 if (!lw) break;   // (a card gave up: failed(), below)
@@ -620,15 +839,25 @@ int main(int argc, char** argv) {
                 offered += T - 1;
                 accepted += kept - 1;
                 ++wins[T];
-                policy.observe(true, T, kept - 1, match, now_ms() - r0);
+                const double ms = now_ms() - r0;   // (the round's time: the drafting, the window, the sampling)
+                if (from_lk) lk_off += T - 1, lk_acc += kept - 1;
+                else df_off += T - 1, df_acc += kept - 1;
+                if (nd >= 0) dcost.observe_cost(T, ms);
+                if (nd > 0 && !from_lk) dcost.observe_drafts(dconf, T - 1, kept - 1);
+                // (a trusted round's time with a draft's added: the policy's costs stay those of drafted rounds)
+                if (lk_on) policy.observe(from_lk, T, kept - 1, match, trusted ? ms + eng.dfly_ms() : ms);
+                if (!refill) df_judge(nd >= 0, kept, ms);
                 continue;
             }
             lg = eng.step(t);
             hist.push_back(t);
             if (!lg) break;
             ++wins[1];
-            if (lk_on) policy.observe(false, 1, 0, match, now_ms() - r0);
             t = emit(sample(lg, V, sp, rng), end);
+            const double ms = now_ms() - r0;   // (after the sampling, as a window's)
+            if (nd >= 0) dcost.observe_cost(1, ms);   // (drafted, none verified)
+            if (lk_on) policy.observe(false, 1, 0, match, ms);
+            if (!refill) df_judge(nd >= 0, 1, ms);
         }
         if (end == 2 && !eng.failed()) {   // (max_new's token fed, as the plain loop did: the logits after it kept)
             lg = eng.step(t);
@@ -657,13 +886,17 @@ int main(int argc, char** argv) {
                     st.lookups ? (double) st.hits / st.lookups : 0.0, st.cache_slots, st.cache_copies,
                     st.lookups ? (double) st.hits_helper / st.lookups : 0.0, st.helper_slots, st.helper_copies,
                     st.ms_total > 0 ? st.tokens * 1000.0 / st.ms_total : 0.0);
-        if (lk_on) {   // (the lookup's rounds: the windows by size, the drafts kept of those verified)
+        if (lk_on || df_on) {   // (the rounds: the windows by size, the drafts kept of those verified, by source)
             std::string ws;
             for (int i = 1; i <= 16; ++i)
                 if (wins[i]) ws += " " + std::to_string(i) + ":" + std::to_string(wins[i]);
             std::fprintf(stderr,
-                         "maya-hy4: lookup %lld of %lld drafts kept (%.1f%%), %lld rounds for %d tokens, windows%s\n",
-                         accepted, offered, offered ? 100.0 * accepted / offered : 0.0, rounds, generated, ws.c_str());
+                         "maya-hy4: drafts %lld of %lld kept (DFly2 %lld of %lld, lookup %lld of %lld), %lld rounds for "
+                         "%d tokens, windows%s; DFly2 drafted in %lld rounds, rested %lld (%lld rests so far), "
+                         "%lld in a refill; %lld trusted lookups\n",
+                         accepted, offered, df_acc, df_off, lk_acc, lk_off, rounds, generated, ws.c_str(), df_rounds,
+                         df_restr, df_rests, df_refill, lk_trusted);
+            if (df_on) std::fprintf(stderr, "maya-hy4: DFly2's round costs: %s\n", dcost.cost_text().c_str());
         }
         std::printf("DONE %d %zu %.1f %.1f %s %lld %lld %zu\n", generated, ids.size(), p1 - p0, now_ms() - p1,
                     finish.c_str(), accepted, offered, reuse);

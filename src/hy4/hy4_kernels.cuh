@@ -34,6 +34,9 @@ void rmsnorm(const float* x, const float* w, float* y, int rows, int n, float ep
 bool norm_q8_ok(int n);
 /// y = rmsnorm(x) * w (y may be null) and its int8 rows (q, d: q8's) - one block, rmsnorm's then q8's arithmetic.
 void norm_q8(const float* x, const float* w, float eps, float* y, int8_t* q, float* d, int n, cudaStream_t s);
+/// norm_q8 for `rows` rows [rows][n] (x, y, q; d [rows][n / 32]) in one launch, a block a row.
+void norm_q8_rows(const float* x, const float* w, float eps, float* y, int8_t* q, float* d, int n, int rows,
+                  cudaStream_t s);
 /// int8 rows with an F32 scale per 32 values (ds4_iq.cuh's MvJob inputs): d = max|x| / 127, q = rint(x / d).
 void q8(const float* x, int rows, int k, int8_t* q, float* d, cudaStream_t s);
 /// y[r] = sum_c W[r][c] x[c] for W of n rows of k values in F32 (type 0), F16 (1) or BF16 (30), row_bytes apart.
@@ -295,5 +298,17 @@ bool selftest();
 
 /// One warp that sleeps for ns nanoseconds: a card's work kept "busy" for its driver's clocks.
 void keepalive(unsigned long long ns, cudaStream_t s);
+
+// ------------------------------------------------------------------------------------------------ DFly2 (the drafter)
+/// The draft block's cells: for each of nl layers d and rows t < T, out[d][t] = src[d][0 .. src_n[d]) (the source
+/// row's selection of the layer the drafter's layer d shares, src_ld ints apart) then P .. P + t (P = *dP); out_n[d][t]
+/// the count.
+void dfly_cells(const int* src, const int* src_n, size_t src_ld, int nl, const int* dP, int T, int* out, int* out_n,
+                size_t out_ld, cudaStream_t s);
+/// *tok = the first index of the largest of n logits, *prob its softmax probability; scratch: 3 x 128 floats (two
+/// stages; null: one block).
+void argmax_prob(const float* l, int n, int* tok, float* prob, float* scratch, cudaStream_t s);
+/// x += g y (elementwise, n values): mtp_fusion's gated add.
+void gate_add(float* x, const float* g, const float* y, int n, cudaStream_t s);
 
 }  // namespace hy4::k

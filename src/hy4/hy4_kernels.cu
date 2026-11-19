@@ -90,6 +90,11 @@ __global__ void __launch_bounds__(256) norm_q8_kernel(const float* __restrict__ 
                                                      float* __restrict__ y, int8_t* __restrict__ q, float* __restrict__ d,
                                                      int n) {
     const int t = threadIdx.x, per = n / 256;
+    // (a row a block: norm_q8_rows' grid; norm_q8's one block is row 0)
+    x += (size_t) blockIdx.x * n;
+    if (y) y += (size_t) blockIdx.x * n;
+    q += (size_t) blockIdx.x * n;
+    d += (size_t) blockIdx.x * (n / 32);
     float xv[kPerT];
     float ss = 0.0f;
 #pragma unroll
@@ -972,6 +977,10 @@ void rmsnorm(const float* x, const float* w, float* y, int rows, int n, float ep
 bool norm_q8_ok(int n) { return n % 256 == 0 && n / 256 <= kPerT; }
 void norm_q8(const float* x, const float* w, float eps, float* y, int8_t* q, float* d, int n, cudaStream_t s) {
     norm_q8_kernel<<<1, 256, 0, s>>>(x, w, eps, y, q, d, n);
+}
+void norm_q8_rows(const float* x, const float* w, float eps, float* y, int8_t* q, float* d, int n, int rows,
+                  cudaStream_t s) {
+    if (rows > 0) norm_q8_kernel<<<rows, 256, 0, s>>>(x, w, eps, y, q, d, n);
 }
 void q8(const float* x, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
     const int wpb = 8;
@@ -2164,6 +2173,151 @@ void hd_plan_w(const int* plan, int T, int Tm, int nu, int nl, const int* where,
 }
 void hd_answer_w(const float* y, int T, int nu, const int* nh, int nl, int* hans, const int* dpos, cudaStream_t s) {
     hd_answer_w_kernel<<<1, 512, 0, s>>>(y, T, nu, nh, nl, hans, dpos);
+}
+
+// ------------------------------------------------------------------------------------------------ DFly2 (the drafter)
+namespace {
+// grid (T, nl), block 256: draft row t of layer d's cells - the source row's selection (its ncell cells, every one
+// before the block) then the block's positions P .. P + t (causal); ncell_out[d][t] their count
+__global__ void dfly_cells_kernel(const int* __restrict__ src, const int* __restrict__ src_n, size_t src_ld,
+                                  const int* __restrict__ dP, int T, int* __restrict__ out, int* __restrict__ out_n,
+                                  size_t out_ld) {
+    const int t = blockIdx.x, d = blockIdx.y, n = src_n[d], P = *dP;
+    const int* sr = src + (size_t) d * src_ld;
+    int* o = out + ((size_t) d * T + t) * out_ld;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) o[j] = sr[j];
+    if (threadIdx.x <= t) o[n + threadIdx.x] = P + threadIdx.x;
+    if (threadIdx.x == 0) out_n[(size_t) d * T + t] = n + t + 1;
+}
+// the argmax in two stages: grid kAmB, block 256 - each block's largest logit (first index) and its sum of exp(l - max)
+// over its stretch; then one block of kAmB combines them (the sums rescaled to the overall max)
+constexpr int kAmB = 128;
+__global__ void __launch_bounds__(256) argmax_part_kernel(const float* __restrict__ l, int n, float* __restrict__ pm,
+                                                          int* __restrict__ pi, float* __restrict__ ps) {
+    __shared__ float sv[256];
+    __shared__ int si[256];
+    const int per = (n + kAmB - 1) / kAmB, a = blockIdx.x * per, b = min(n, a + per);
+    float bv = -INFINITY;
+    int bi = n;
+    for (int i = a + threadIdx.x; i < b; i += blockDim.x)
+        if (l[i] > bv) bv = l[i], bi = i;
+    sv[threadIdx.x] = bv;
+    si[threadIdx.x] = bi;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (threadIdx.x < st) {
+            const float ov = sv[threadIdx.x + st];
+            const int oi = si[threadIdx.x + st];
+            if (ov > sv[threadIdx.x] || (ov == sv[threadIdx.x] && oi < si[threadIdx.x]))
+                sv[threadIdx.x] = ov, si[threadIdx.x] = oi;
+        }
+        __syncthreads();
+    }
+    const float mx = sv[0];
+    const int am = si[0];
+    __syncthreads();
+    float se = 0.0f;
+    for (int i = a + threadIdx.x; i < b; i += blockDim.x) se += expf(l[i] - mx);
+    sv[threadIdx.x] = se;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (threadIdx.x < st) sv[threadIdx.x] += sv[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) pm[blockIdx.x] = mx, pi[blockIdx.x] = am, ps[blockIdx.x] = sv[0];
+}
+__global__ void __launch_bounds__(kAmB) argmax_join_kernel(const float* __restrict__ pm, const int* __restrict__ pi,
+                                                           const float* __restrict__ ps, int* __restrict__ tok,
+                                                           float* __restrict__ prob) {
+    __shared__ float sv[kAmB];
+    __shared__ int si[kAmB];
+    sv[threadIdx.x] = pm[threadIdx.x];
+    si[threadIdx.x] = pi[threadIdx.x];
+    __syncthreads();
+    for (int st = kAmB / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) {
+            const float ov = sv[threadIdx.x + st];
+            const int oi = si[threadIdx.x + st];
+            if (ov > sv[threadIdx.x] || (ov == sv[threadIdx.x] && oi < si[threadIdx.x]))
+                sv[threadIdx.x] = ov, si[threadIdx.x] = oi;
+        }
+        __syncthreads();
+    }
+    const float mx = sv[0];
+    const int am = si[0];
+    __syncthreads();
+    sv[threadIdx.x] = pm[threadIdx.x] > -INFINITY ? ps[threadIdx.x] * expf(pm[threadIdx.x] - mx) : 0.0f;
+    __syncthreads();
+    for (int st = kAmB / 2; st > 0; st >>= 1) {
+        if (threadIdx.x < st) sv[threadIdx.x] += sv[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *tok = am;
+        *prob = 1.0f / sv[0];
+    }
+}
+// (the one-block version, kept for a check: HY4_ARGMAX1=1)
+__global__ void __launch_bounds__(1024) argmax_prob_kernel(const float* __restrict__ l, int n, int* __restrict__ tok,
+                                                           float* __restrict__ prob) {
+    __shared__ float sv[1024];
+    __shared__ int si[1024];
+    float bv = -INFINITY;
+    int bi = n;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        if (l[i] > bv) bv = l[i], bi = i;
+    sv[threadIdx.x] = bv;
+    si[threadIdx.x] = bi;
+    __syncthreads();
+    for (int st = 512; st > 0; st >>= 1) {
+        if (threadIdx.x < st) {
+            const float ov = sv[threadIdx.x + st];
+            const int oi = si[threadIdx.x + st];
+            if (ov > sv[threadIdx.x] || (ov == sv[threadIdx.x] && oi < si[threadIdx.x]))
+                sv[threadIdx.x] = ov, si[threadIdx.x] = oi;
+        }
+        __syncthreads();
+    }
+    const float mx = sv[0];
+    const int am = si[0];
+    __syncthreads();
+    float se = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) se += expf(l[i] - mx);
+    sv[threadIdx.x] = se;
+    __syncthreads();
+    for (int st = 512; st > 0; st >>= 1) {
+        if (threadIdx.x < st) sv[threadIdx.x] += sv[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *tok = am;
+        *prob = 1.0f / sv[0];
+    }
+}
+__global__ void gate_add_kernel(float* __restrict__ x, const float* __restrict__ g, const float* __restrict__ y,
+                                int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += g[i] * y[i];
+}
+}  // namespace
+void dfly_cells(const int* src, const int* src_n, size_t src_ld, int nl, const int* dP, int T, int* out, int* out_n,
+                size_t out_ld, cudaStream_t s) {
+    dfly_cells_kernel<<<dim3(T, nl), 256, 0, s>>>(src, src_n, src_ld, dP, T, out, out_n, out_ld);
+}
+void argmax_prob(const float* l, int n, int* tok, float* prob, float* scratch, cudaStream_t s) {
+    static const bool one = std::getenv("HY4_ARGMAX1") && std::atoi(std::getenv("HY4_ARGMAX1")) != 0;
+    if (one || !scratch) {
+        argmax_prob_kernel<<<1, 1024, 0, s>>>(l, n, tok, prob);
+        return;
+    }
+    float* pm = scratch;
+    float* ps = scratch + kAmB;
+    int* pi = (int*) (scratch + 2 * kAmB);
+    argmax_part_kernel<<<kAmB, 256, 0, s>>>(l, n, pm, pi, ps);
+    argmax_join_kernel<<<1, kAmB, 0, s>>>(pm, pi, ps, tok, prob);
+}
+void gate_add(float* x, const float* g, const float* y, int n, cudaStream_t s) {
+    gate_add_kernel<<<blocks(n, 256), 256, 0, s>>>(x, g, y, n);
 }
 
 }  // namespace hy4::k

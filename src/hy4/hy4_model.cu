@@ -47,9 +47,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <type_traits>
 
@@ -171,6 +173,7 @@ struct Layer {
     DMat sh_gate, sh_up, sh_down;  // the shared expert, at the full width (no clamp)
     CpuLayer cl;
     float clamp_exp = 0.0f;
+    int dfl = -1;   // (DFly2: the draft layer that shares this one's cache and selection)
 };
 
 constexpr float kEgEps = 1.1920929e-07f;
@@ -333,6 +336,49 @@ struct Engine::Impl {
     void tokw_tail(const Layer& l, int T);
     void tokw_head(int T);
     void tokw_seg(int seg, int T);
+    // ---- DFly2, the drafter (hy4_dfly.inc): the checkpoint's config.json - 5 dense layers sharing target layers 25,
+    // 29, .. 41's caches and index selections, a block of 6 (mask token 120009), RMS eps 1e-5, MLP 9216
+    static constexpr int kDflL = 5, kDflT = 6, kDflN = 5, kDflH = 32, kDflFF = 9216, kDflTgt0 = 25, kDflTgtStep = 4,
+                         kDflMask = 120009;
+    static constexpr float kDflEps = 1e-5f;
+    struct DflLayer {
+        float *attn_norm = nullptr, *ffn_norm = nullptr, *post_proj = nullptr, *q_a_norm = nullptr, *kv_a_norm = nullptr,
+              *sinks = nullptr;
+        DMat q_a, q_b, kv_a, k_b, v_b, wgate, wo, gate, up, down;
+        int tgt = -1;   // the target layer whose cache and selection it shares
+    };
+    std::vector<DflLayer> dfl;   // (empty: no drafter)
+    float *dfl_final = nullptr, *dfl_enorm = nullptr, *dfl_hnorm = nullptr, *dfl_mgate = nullptr, *dfl_c_enorm = nullptr,
+          *dfl_c_hnorm = nullptr;
+    DMat dfl_eh, dfl_cg, dfl_cu, dfl_cd;
+    // the source row: each decoded row's final hidden [8][E] and, at the shared layers, its selection [8][5][dfl_cn]
+    // and count [8][5] (the token path's row 0, a window's row t); dfl_row / dfl_P: the row before position dfl_P, the
+    // last the target decoded and kept (-1: none - after a prompt, a reset)
+    float* dfl_hid = nullptr;
+    int *dfl_scells = nullptr, *dfl_sncell = nullptr;
+    size_t dfl_cn = 0, dfl_ccap = 0;
+    int dfl_row = 0, dfl_P = -1;
+    double dfl_ms = 0.0;
+    // the block's buffers (dd_s*: the source row's state copied where the graph reads it; in / seq / out: below)
+    float *dd_x = nullptr, *dd_n = nullptr, *dd_h = nullptr, *dd_qa = nullptr, *dd_qn = nullptr, *dd_kva = nullptr,
+          *dd_gh = nullptr, *dd_qf = nullptr, *dd_qabs = nullptr, *dd_mo = nullptr, *dd_mob = nullptr, *dd_ao = nullptr,
+          *dd_fg = nullptr, *dd_fu = nullptr, *dd_fh = nullptr, *dd_fo = nullptr, *dd_cat = nullptr, *dd_hp = nullptr,
+          *dd_e = nullptr, *dd_logits = nullptr, *dd_xd = nullptr, *dd_xd2 = nullptr, *dd_shid = nullptr,
+          *dd_out = nullptr, *dh_out = nullptr;
+    int8_t *dd_xq = nullptr, *dd_xq2 = nullptr;
+    int *dd_cells = nullptr, *dd_ncell = nullptr, *dd_scells = nullptr, *dd_sncell = nullptr, *dd_in = nullptr,
+        *dh_in = nullptr, *dd_seq = nullptr;
+    const uint8_t* dfl_embd = nullptr;   // (the embedding table the device gathers rows from)
+    DMat dfl_ch;                          // the confidence head (BF16) and its bias
+    DMat dfl_head;                        // (the drafts' head: the target's output, or its first HY4_DFLY_VOCAB rows)
+    float* dd_amx = nullptr;              // (the argmax's two stages' scratch)
+    float dfl_ch_b = 0.0f;
+    float dfl_conf2[8] = {};              // (the other confidence of the last drafts: the head's, or the probability)
+    cudaGraphExec_t dfl_graph = nullptr;
+    void dfl_pass(bool dump);
+    template <class F> void q8_upload(F value, int k, int n, DMat& m);
+    bool dfly_load(const std::string& path, std::string& err);
+    int dfly_draft(int tok, int max_n, int* out, float* conf);
     void hdw_layer(const Layer& l, int il, int T);
     void win_graphs();
     void pre_step(int rows);
@@ -926,6 +972,11 @@ bool Engine::load(const Options& o, std::string& err) { return p->load(o, err); 
 const float* Engine::step(int token) { return p->step(token); }
 const float* Engine::step_window(const int* toks, int T) { return p->step_window(toks, T); }
 int Engine::window_max() const { return p->wTm; }
+bool Engine::dfly() const { return !p->dfl.empty(); }
+bool Engine::refilling() const { return p->ec.finflight > 0 || p->hc.fill_left > 0; }
+int Engine::dfly_draft(int tok, int max_n, int* out, float* conf) { return p->dfly_draft(tok, max_n, out, conf); }
+double Engine::dfly_ms() const { return p->dfl_ms; }
+float Engine::dfly_conf2(int i) const { return i >= 0 && i < 8 ? p->dfl_conf2[i] : 0.0f; }
 void Engine::window_keep(int kept) { p->window_keep(kept); }
 const float* Engine::prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx) {
     return p->prefill(ids, n, progress, ctx);
@@ -957,6 +1008,7 @@ bool Engine::snapshot() {
 bool Engine::restore() {
     Impl& m = *p;
     m.wp_T = 0;
+    m.dfl_P = -1;
     if (m.snap_pos < 0) return false;
     const size_t ring = (size_t) m.g.idx_nring * 2 * m.g.idx_dim * sizeof(float);
     const uint8_t* at = (const uint8_t*) m.snap_ring;
@@ -980,6 +1032,7 @@ bool Engine::failed() const { return p->fault; }
 
 void Engine::reset() {
     p->wp_T = 0;   // (a pending window dropped: its scores never counted)
+    p->dfl_P = -1;
     p->fault = false;
     p->pos = 0;
     p->snap_pos = -1;
@@ -1471,6 +1524,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
                          (now_ms() - tp) / 1000.0, working_set_gb());
     }
     if (const char* rl = std::getenv("HY4_ROUTE_LOG")) route_log = std::fopen(rl, "ab");
+    if (!o.dfly.empty() && !dfly_load(o.dfly, err)) return false;   // (before the caches take what is free)
     const size_t before_pf = dev_bytes;
     if (!pf_alloc(err)) return false;
     const size_t before_ec = dev_bytes;
@@ -3476,6 +3530,7 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
 
 const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx) {
     if (wp_T > 0) window_keep(wp_T);   // (the last window, all of it, when the caller did not say)
+    dfl_P = -1;   // (the prompt path keeps no source row for DFly2: the first token after it steps)
     if (fault || n <= 0 || pos + n > max_ctx) return nullptr;   // (fault: failed() until reset())
     for (int i = 0; i < n; ++i)
         if (ids[i] < 0 || ids[i] >= g.vocab) return nullptr;
@@ -3586,6 +3641,11 @@ void Engine::Impl::tok_attn(Layer& l) {
         k::mla_rope_q(iq, 1, NH, D, D - g.rope_dim, 0, dpos, l.theta_scale, s);
         k::idx_score(iq, iw, l.idx_pooled, dpos, KP, NH, D, 1.0f / std::sqrt((float) (D * NH)), max_pools, iscore, s);
         k::idx_select(iscore, dpos, KP, g.idx_top_k / KP - g.idx_tail, cells, ncell, s);
+        if (l.dfl >= 0) {   // (DFly2: the shared layer's selection at the row)
+            CK(cudaMemcpyAsync(dfl_scells + (size_t) l.dfl * dfl_cn, cells, dfl_cn * sizeof(int),
+                               cudaMemcpyDeviceToDevice, s));
+            CK(cudaMemcpyAsync(dfl_sncell + l.dfl, ncell, sizeof(int), cudaMemcpyDeviceToDevice, s));
+        }
     }
     k::q8(qf, 1, H * g.qk_head, xq_m, xd_m, s);   // (q_nope's int8 rows: head h's at qk_head h, 32-value blocks)
     // k_b a head (q_nope -> the cache's 512): every head in one launch (HY4_HEADS_ONE=0: 8 heads a launch, as before)
@@ -3704,6 +3764,8 @@ void Engine::Impl::tok_tail(const Layer& l) {
 void Engine::Impl::tok_head() {
     const int HC = g.hc;
     read_norm(head_fn, HC, head_scale, head_base, nullptr, out_norm, a, xq_a, xd_a);
+    if (dfl_hid)   // (DFly2: the row's final hidden)
+        CK(cudaMemcpyAsync(dfl_hid, a, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, s));
     mv(output, a, xq_a, xd_a, logits);
     CK(cudaMemcpyAsync(h_logits, logits, (size_t) g.vocab * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
@@ -4269,6 +4331,8 @@ void Engine::Impl::pre_step(int rows) {
 
 }
 
+#include "hy4_dfly.inc"
+
 // ------------------------------------------------------------------------------------------------ windowed decode
 // A window of T tokens a pass (step_window): the token path's work with T columns (the dense set read once), T rows
 // (per token), the attention and the indexer token by token (causal; a group a token closes pooled before the next
@@ -4538,6 +4602,12 @@ void Engine::Impl::tokw_attn(Layer& l, int T) {
             k::idx_score(iqt, wiw + (size_t) t * NH, l.idx_pooled, dp, KP, NH, D, 1.0f / std::sqrt((float) (D * NH)),
                          max_pools, iscore, s);
             k::idx_select(iscore, dp, KP, g.idx_top_k / KP - g.idx_tail, cl, nc, s);
+            if (l.dfl >= 0) {   // (DFly2: the shared layer's selection at row t)
+                CK(cudaMemcpyAsync(dfl_scells + ((size_t) t * kDflL + l.dfl) * dfl_cn, cl, dfl_cn * sizeof(int),
+                                   cudaMemcpyDeviceToDevice, s));
+                CK(cudaMemcpyAsync(dfl_sncell + (size_t) t * kDflL + l.dfl, nc, sizeof(int), cudaMemcpyDeviceToDevice,
+                                   s));
+            }
         }
         float* qft = wqf + (size_t) t * H * g.qk_head;
         k::mla_rope_q(qft, 1, H, g.qk_head, nope, 0, dp, l.theta_scale, s);
@@ -4629,6 +4699,8 @@ void Engine::Impl::tokw_tail(const Layer& l, int T) {
 void Engine::Impl::tokw_head(int T) {
     const int HC = g.hc;
     read_norm_w(head_fn, HC, head_scale, head_base, nullptr, out_norm, wa, wxq_a, wxd_a, T);
+    if (dfl_hid)   // (DFly2: the rows' final hidden)
+        CK(cudaMemcpyAsync(dfl_hid, wa, (size_t) T * g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, s));
     mvw(output, wa, wxq_a, wxd_a, wlogits, T);
     CK(cudaMemcpyAsync(wh_logits, wlogits, (size_t) T * g.vocab * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
@@ -4766,7 +4838,7 @@ void Engine::Impl::win_graphs() {
                      wTm, (now_ms() - t0) / 1000.0, f0 / 1048576.0, f1 / 1048576.0, hf0 / 1048576.0, hf1 / 1048576.0);
 }
 
-// A window of T tokens at pos (each fed and kept: 7a-i) -> their T x vocab logits (host), pos + T; nullptr when
+// A window of T tokens at pos (pending until window_keep) -> their T x vocab logits (host), pos + T; nullptr when
 // windows are off, T is out of range or they do not fit (the caller steps), or a card gave up (failed())
 const float* Engine::Impl::step_window(const int* toks, int T) {
     if (wp_T > 0) window_keep(wp_T);   // (the last window, all of it, when the caller did not say)
@@ -4859,7 +4931,8 @@ const float* Engine::Impl::step_window(const int* toks, int T) {
             (void) cudaStreamQuery(s);
             if (hd && il + 1 < g.n_layer) hd_go(il + 1);
         };
-        // each token's choices: the scores (7a-i: every token kept), the CPU lane's in the token's order
+        // each token's choices: recorded for the scores (window_keep counts the kept ones), the CPU lane's in the
+        // token's order
         int nc_all = 0, nh = 0;
         for (int t = 0; t < T; ++t) {
             cnt[(size_t) t] = 0;
@@ -4965,6 +5038,8 @@ void Engine::Impl::window_keep(int kept) {
     kept = std::max(0, std::min(kept, T));
     wp_T = 0;
     pos = wp_pos0 + kept;
+    dfl_row = kept - 1;   // (DFly2: the last kept row the source for a draft at pos)
+    dfl_P = kept > 0 ? pos : -1;
     for (int il = g.n_dense; il < g.n_layer; ++il)
         for (int t = 0; t < kept; ++t)
             for (int i = 0; i < nu; ++i) {
@@ -4981,8 +5056,8 @@ void Engine::Impl::window_keep(int kept) {
         ec.tok += kept;
         if (ec.tok / ec.every != before / ec.every) ec_adapt();
     }
-    if (hc.slots && hc.fill_left > 0) {
-        hc_update(std::min(hc.fill_left, hc.fill_batch), false, true);
+    if (hc.slots && hc.fill_left > 0) {   // (a batch a kept token: the fill's pace a token as single steps')
+        hc_update(std::min(hc.fill_left, hc.fill_batch * kept), false, true);
         if (hc.issued == 0 && hc.inflight == 0) hc.fill_left = 0;
         else hc.fill_left -= hc.issued;
     } else if (hc.slots) {
@@ -5134,6 +5209,8 @@ const float* Engine::Impl::step(int token) {
     }   // (the host's routing)
     dump("final", g.n_layer, R, pos);
     ++pos;
+    dfl_row = 0;   // (DFly2: the source row for a draft at pos)
+    dfl_P = pos;
     if (route_log) {
         std::fputc('T', route_log);
         std::fwrite(route_tok.data(), 2, route_tok.size(), route_log);

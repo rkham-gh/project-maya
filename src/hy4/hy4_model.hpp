@@ -55,6 +55,7 @@ struct Options {
     int helper_gpu = -1;
     double helper_gb = -1; // its VRAM for them (-1: what is free, less HY4_HELPER_RESERVE_MIB)
     std::string profile;  // the experts' use scores: read at the start (the cache filled from them), save_profile()
+    std::string dfly;     // DFly2's weights (the checkpoint's model-00148-of-00148.safetensors; empty: no drafter)
     bool verbose = true;
 };
 
@@ -84,6 +85,18 @@ public:
     /// The last window's first `kept` tokens kept (0 .. T; a verified draft's), pos() after them.  Until it is called the
     /// window is pending; step() / step_window() / prefill keep a pending one whole first.
     void window_keep(int kept);
+    /// DFly2 (Options::dfly) loaded.
+    bool dfly() const;
+    /// The caches' refill after a prompt is under way (HY4_BG_REFILL): tokens are slower until it is up, windows more.
+    bool refilling() const;
+    /// DFly2's drafts after tok (the newest token, at pos(), not fed yet): up to max_n (5 at most) into out, each one's
+    /// confidence (its probability) into conf; their count.  -1 when it cannot draft now: no drafter, a window pending,
+    /// or the row before pos() not one the target decoded and kept (after a prompt or restore() the first token steps),
+    /// or no room for the block before max_ctx().  The block's cache rows at pos() .. pos() + 5 are written (the target
+    /// rewrites them as it decodes those positions).
+    int dfly_draft(int tok, int max_n, int* out, float* conf);
+    double dfly_ms() const;   // (the last dfly_draft's time)
+    float dfly_conf2(int i) const;   // (the last drafts' other confidence: HY4_DFLY_CONF's other one)
     /// n tokens at pos() as one prompt: the logits after the last one (as step()), pos + n.  nullptr when they do not
     /// fit before max_ctx().  progress (when set) is called as they go, with the tokens read so far.
     const float* prefill(const int* ids, int n, void (*progress)(void*, int) = nullptr, void* ctx = nullptr);
