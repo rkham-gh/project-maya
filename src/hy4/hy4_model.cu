@@ -2485,7 +2485,7 @@ bool Engine::Impl::ec_stage_begin(size_t budget, bool wait) {
     ec.stage_n = n;
     ec.stage_parts.clear();
     ec_src_parts(p0.key, p0.done, n, ec.stage_parts);
-    ec.stage_direct = false;   // (the experts pinned: ec_stage_end's DMAs straight from them, no staging job)
+    ec.stage_direct = false;   // (the mapping's experts: the pool's threads stage the piece, ec_stage_end's DMA)
     const auto* parts = &ec.stage_parts;   // (by pointer: the workers run the job)
     const size_t jb = (size_t) 128 << 10;
     const int nj = (int) ((n + jb - 1) / jb);
@@ -3955,7 +3955,15 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
         std::fputc('E', route_log);
         std::fflush(route_log);
     }
-    ec_fill();
+    // The cache filled by the prompt's scores - here, before the first token, only when nothing fills it after: with
+    // HY4_BG_REFILL on and an arena to lend, the first token's pre_step fills every usable slot (its own, the cache
+    // rows', the arena's) by the same scores, best first, in the background, so this one (~2,700 copies, ~0.35 s with
+    // no kernel running, all before the first token) would only be undone and redone.  HY4_PF_SYNC_FILL=1: always
+    {
+        static const bool bg = !(std::getenv("HY4_BG_REFILL") && std::atoi(std::getenv("HY4_BG_REFILL")) == 0);
+        static const bool sync_fill = std::getenv("HY4_PF_SYNC_FILL") && std::atoi(std::getenv("HY4_PF_SYNC_FILL")) != 0;
+        if (sync_fill || !bg || ec.arena_end <= ec.own) ec_fill();
+    }
     CK(cudaStreamSynchronize(s));
     st.pf_ms += now_ms() - t0;
     st.pf_tokens += n;
