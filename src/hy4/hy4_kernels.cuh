@@ -298,6 +298,9 @@ bool selftest();
 
 /// One warp that sleeps for ns nanoseconds: a card's work kept "busy" for its driver's clocks.
 void keepalive(unsigned long long ns, cudaStream_t s);
+/// (a check) the largest |x| of n values, its float's bits atomicMax'ed into *out (device memory)
+void absmax(const float* x, size_t n, unsigned* out, cudaStream_t s);
+void absmax(const __half* x, size_t n, unsigned* out, cudaStream_t s);
 
 // ------------------------------------------------------------------------------------------------ DFly2 (the drafter)
 /// The draft block's cells: for each of nl layers d and rows t < T, out[d][t] = src[d][0 .. src_n[d]) (the source

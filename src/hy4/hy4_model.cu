@@ -675,6 +675,7 @@ struct Engine::Impl {
         long group_ctr = 0;
         size_t s_elems = 0, slot_bytes = 0, w1_elems = 0, w2_elems = 0;
         uint8_t* arena = nullptr;   // the buffers below: one allocation, lent to the expert cache between prompts
+        unsigned* qmax = nullptr;   // (HY4_PF_QMAX: the read's largest |q|, F32 and Qcat's F16, as float bits)
         size_t arena_bytes = 0;
         uint8_t* gbuf[2] = {nullptr, nullptr};
         cudaEvent_t gready[2] = {nullptr, nullptr}, gfreed[2] = {nullptr, nullptr};
@@ -805,6 +806,7 @@ struct Engine::Impl {
     // tokens would.  0 is the old raw counts - thousands after a long prompt, where a written token adds 1 and an expert
     // every token chose settles at 99, so no swap cleared the bar for some hundred tokens; 1 scales without the decay.
     static constexpr int kKvSlack = 4096;   // (cache rows reserved past the position)
+    int kv_slack = kKvSlack;                 // (HY4_KV_SLACK, a check: smaller, so the reserve moves often)
     struct EC {
         int slots = 0, ne = 0, own = 0, lend_cls = 0, arena_end = 0;   // [own, arena_end): the prompt path's
         int lent_from = 0;                   // (8c) the arena's slots from here on lent: usable (arena_end: none)
@@ -1839,6 +1841,7 @@ void Engine::Impl::ec_alloc() {
     if (const char* v = std::getenv("HY4_CACHE_SWAPS")) ec.per = std::max(0, std::atoi(v));
     if (const char* v = std::getenv("HY4_CACHE_MARGIN")) ec.margin = (float) std::atof(v);
     if (const char* v = std::getenv("HY4_CACHE_PROMPT")) ec.prompt = std::max(0, std::min(2, std::atoi(v)));
+    if (const char* v = std::getenv("HY4_KV_SLACK")) kv_slack = std::max(8, std::min(kKvSlack, std::atoi(v)));
     if (const char* v = std::getenv("HY4_CACHE_DEFER")) ec.defer = std::atoi(v) != 0;
     if (const char* v = std::getenv("HY4_CACHE_STAGE_KB")) ec.piece = (size_t) std::max(64, std::atoi(v)) << 10;
     if (ec.defer) {
@@ -2601,7 +2604,7 @@ void Engine::Impl::ec_reclaim(size_t bytes) {
 // into them finished), and the reserve kKvSlack rows past it, so this happens once in kKvSlack tokens
 void Engine::Impl::ec_kv_reserve(int rows) {
     if (rows <= ec.kv_hi || ec.slots == ec.arena_end) return;
-    const int hi = std::min(max_ctx, rows + kKvSlack);
+    const int hi = std::min(max_ctx, rows + kv_slack);
     bool any = false;
     for (int sl = ec.arena_end; sl < ec.slots && !any; ++sl) any = ec.kv_row[(size_t) sl] < hi && ec.owner[(size_t) sl] >= 0;
     if (any) {
@@ -3333,6 +3336,8 @@ void Engine::Impl::hc_alloc() {
     const char* hsv = std::getenv("HY4_HELPER_STAGE");
     if (!hsv || std::atoi(hsv) > 0) {
         hc.pcap = (size_t) (hsv ? std::atoi(hsv) : 64) << 20;
+        // (at least one expert: the swap worker stages an expert whole - the review's finding 6)
+        hc.pcap = std::max(hc.pcap, *std::max_element(ec.cls_bytes.begin(), ec.cls_bytes.end()));
         hc.stage = cudaHostAlloc((void**) &hc.pin[0], hc.pcap, cudaHostAllocPortable) == cudaSuccess &&
                    cudaHostAlloc((void**) &hc.pin[1], hc.pcap, cudaHostAllocPortable) == cudaSuccess;
         if (hc.stage) {
@@ -3854,7 +3859,7 @@ bool Engine::Impl::pf_alloc(std::string& err) {
     // (the BF16 routers' F32 values for the prompt path: allocated here, at the load - dalloc's memset is on the legacy
     //  stream, which nothing orders against s mid-prompt)
     if (router_f32 && !router_f32_buf) router_f32_buf = dalloc<float>(router_f32);
-    const int Cn = pf.C = std::max(64, o.chunk);
+    const int Cn = pf.C = (std::max(64, o.chunk) + 15) / 16 * 16;
     pf.Ca = std::max(16, std::min(o.sub, Cn));
     const int Ca = pf.Ca, E = g.n_embd, HC = g.hc, NL = g.n_lat, ne = g.n_expert;
     const int ffe = g.n_ff_exp, ffd = g.n_ff, ffs = g.n_ff_sh, ql = g.q_lora, QK = g.qk_head, V = g.v_head;
@@ -4279,6 +4284,16 @@ void Engine::Impl::pf_attn(Layer& l, const float* A_, const __half* Ah_, int T, 
     k::rmsnorm(pf.QA, l.q_a_norm, pf.QA, T, ql, g.eps, s);
     k::to_f16(pf.QA, pf.QAh, (size_t) T * ql, s);
     lin(l.q_b, pf.QAh, nullptr, T, pf.Q);
+    // (HY4_PF_QMAX=1, a check - the review's finding 9: the prompt path's queries go to F16 unscaled, so their largest
+    //  |q| against F16's 65,504 - before the conversion, and in Qcat after k_b - printed after each read)
+    static const bool qmx = std::getenv("HY4_PF_QMAX") && std::atoi(std::getenv("HY4_PF_QMAX")) != 0;
+    if (qmx) {
+        if (!pf.qmax) {
+            pf.qmax = dalloc<unsigned>(2);
+            CK(cudaMemsetAsync(pf.qmax, 0, 2 * sizeof(unsigned), s));
+        }
+        k::absmax(pf.Q, (size_t) T * H * QK, pf.qmax, s);
+    }
     k::to_f16(pf.Q, pf.QH, (size_t) T * H * QK, s);
     // q's nope part through k_b a head: Qcat[t][h][0:512] (F16), its rope part after it
     f16w(l.k_b, pf.W1);   // [H][512][nope]
@@ -4287,6 +4302,7 @@ void Engine::Impl::pf_attn(Layer& l, const float* A_, const __half* Ah_, int T, 
                                          CUDA_R_16F, H * 576, 576, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
               "k_b batch");
     k::qpe_f16(pf.Q, pf.Qcat, T, H, QK, nope, p0, l.theta_scale, s);
+    if (qmx) k::absmax(pf.Qcat, (size_t) T * H * 576, pf.qmax + 1, s);
     if (l.idx) pf_index(l, A_, Ah_, T, p0);
     // the keys: a sliding-window layer's from its ring (the window before the piece) and the piece's own, in one
     // buffer from position kb0; a sparse layer's its cache
@@ -5002,6 +5018,15 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     st.pf_tokens += n;
     st.pf_copy_gb = pf.copy_bytes / 1e9;
     st.pf_copy_last_gb = (pf.copy_bytes - cb0) / 1e9;
+    if (pf.qmax) {   // (HY4_PF_QMAX) this read's largest |q|, then cleared
+        unsigned u[2] = {0, 0};
+        CK(cudaMemcpy(u, pf.qmax, sizeof u, cudaMemcpyDeviceToHost));
+        CK(cudaMemset(pf.qmax, 0, sizeof u));
+        float f[2];
+        std::memcpy(f, u, sizeof f);
+        std::fprintf(stderr, "maya-hy4: HY4_PF_QMAX: this read's largest |q| %.1f (F32, before its F16 copy), %.1f in Qcat "
+                     "(F16, after k_b and the rope part); F16 holds 65,504\n", f[0], f[1]);
+    }
     if (hp.log) {   // (the last jobs' lines, now that the stream is done)
         hp_collect(0);
         hp_collect(1);

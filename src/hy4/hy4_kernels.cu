@@ -1844,6 +1844,29 @@ __global__ void keepalive_kernel(unsigned long long ns) {
 }
 void keepalive(unsigned long long ns, cudaStream_t s) { keepalive_kernel<<<1, 32, 0, s>>>(ns); }
 
+// (a check) the largest |x| into *out as its float's bits - positive floats order as unsigned ints, and an inf or a
+// NaN ranks above every finite value
+template <typename T>
+__global__ void absmax_kernel(const T* __restrict__ x, size_t n, unsigned* out) {
+    unsigned m = 0;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const float v = fabsf((float) x[i]);
+        const unsigned u = isnan(v) ? 0x7fc00000u : __float_as_uint(v);
+        m = u > m ? u : m;
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const unsigned w = __shfl_xor_sync(0xffffffffu, m, o);
+        m = w > m ? w : m;
+    }
+    if ((threadIdx.x & 31) == 0) atomicMax(out, m);
+}
+void absmax(const float* x, size_t n, unsigned* out, cudaStream_t s) {
+    if (n) absmax_kernel<float><<<256, 256, 0, s>>>(x, n, out);
+}
+void absmax(const __half* x, size_t n, unsigned* out, cudaStream_t s) {
+    if (n) absmax_kernel<__half><<<256, 256, 0, s>>>(x, n, out);
+}
+
 // ------------------------------------------------------------------------------------------------ the device's routing
 namespace {
 constexpr unsigned long long kSpinNs = 30ull * 1000000000ull;   // (a spin's bound: %globaltimer's ns, the same on both

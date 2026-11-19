@@ -469,6 +469,27 @@ int Engine::Impl::dfly_draft(int tok, int max_n, int* out, float* conf) {
     if (dfl.empty() || fault || wp_T > 0 || dfl_P != pos || pos + kDflT > max_ctx || tok < 0 || tok >= g.vocab) return -1;
     max_n = std::min(max_n, kDflN);
     if (max_n <= 0) return 0;
+    // The block writes rows pos .. pos + kDflT - 1 of its target layers' caches: those rows reserved first, as a step's
+    // and a chunk's are - a slot lent from a cache's unused tail would otherwise be overwritten while an expert sits in
+    // it (the review's finding 1; HY4_DFLY_NORESERVE=1, a check, leaves it out)
+    static const bool no_reserve = std::getenv("HY4_DFLY_NORESERVE") && std::atoi(std::getenv("HY4_DFLY_NORESERVE")) != 0;
+    if (!no_reserve) ec_kv_reserve(pos + kDflT);
+    // (HY4_KV_CHECK=1, a check: no expert left in a lent slot the block writes into)
+    static const bool kv_check = std::getenv("HY4_KV_CHECK") && std::atoi(std::getenv("HY4_KV_CHECK")) != 0;
+    if (kv_check) {
+        const size_t row = (size_t) 576 * sizeof(__half);
+        for (int sl = ec.arena_end; sl < ec.slots; ++sl) {
+            const int r0 = ec.kv_row[(size_t) sl];
+            const int nr = (int) (ec.cls_bytes[(size_t) ec.cls[(size_t) sl]] / row);
+            if (ec.owner[(size_t) sl] >= 0 && r0 < pos + kDflT && r0 + nr > pos) {
+                std::fprintf(stderr, "maya-hy4: HY4_KV_CHECK: DFly2's block at rows %d-%d would overwrite expert %d of "
+                             "layer %d in the cache rows' slot %d (rows %d-%d, the reserve up to %d)\n", pos,
+                             pos + kDflT - 1, ec.owner[(size_t) sl] % ec.ne, ec.owner[(size_t) sl] / ec.ne, sl, r0,
+                             r0 + nr - 1, ec.kv_hi);
+                std::abort();
+            }
+        }
+    }
     const double t0 = now_ms();
     const int T = kDflT, P = pos, r = dfl_row;
     for (int t = 0; t < T; ++t) {
