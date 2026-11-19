@@ -118,6 +118,8 @@ struct DMat {   // n rows of k values in VRAM, as the GGUF holds them
 struct Tensor {
     const strata::TensorInfo* info = nullptr;
     const uint8_t* data = nullptr;
+    int file = -1;          // (its shard: Impl::file_paths)
+    uint64_t file_off = 0;  // (its bytes' offset in that file)
 };
 
 double now_ms() {
@@ -186,6 +188,7 @@ struct Engine::Impl {
     int max_ctx = 0, pos = 0, C = 0;   // C: a KDA layer's channels (n_head x head_dim)
     float theta_scale = 1.0f, mla_scale = 1.0f;
     std::vector<std::unique_ptr<strata::GgufFile>> files;
+    std::vector<std::string> file_paths;   // (files' paths, for reads past the mapping: xp_pin)
     std::map<std::string, Tensor> tens;
     cudaStream_t s = nullptr;
     std::vector<Layer> L;
@@ -392,6 +395,7 @@ struct Engine::Impl {
     // Engram's tables and the token history its n-grams read (hist[p]: the token at position p)
     const uint8_t* eg_table = nullptr;
     size_t eg_rb = 0;
+    uint64_t eg_rows = 0;   // (the table's rows: eg_rows x eg_rb bytes)
     std::vector<uint64_t> eg_mult, eg_off, eg_prime;
     std::vector<int64_t> eg_map;
     std::vector<int> hist;
@@ -401,6 +405,8 @@ struct Engine::Impl {
     // (HY4_STEP_TIMES) the token path's host time by phase, printed every 64 tokens
     struct PhaseTimes {
         double att = 0, route = 0, glaunch = 0, cpu = 0, tail = 0, head = 0, adapt = 0, embed = 0;
+        double pre = 0, eg = 0;           // (in embed: pre_step's part, Engram's rows' part)
+        unsigned long long faults = 0;    // (the process's page faults over the block)
         long cpu_experts = 0, tokens = 0;
     } pt;
     // (HY4_ROUTE_LOG=FILE) the routing as it goes, for replaying the expert cache's choices offline: 'T' + a token's
@@ -703,6 +709,13 @@ struct Engine::Impl {
         bool on = false;
     } stg;
     void stage_copy(uint8_t* dst, const uint8_t* src, size_t len);
+    // ---- the routed experts pinned (HY4_PIN_EXPERTS, 1): each MoE layer's gate / up / down banks copied into pinned
+    // host memory at the load, the CpuLayer's pointers moved there - the CPU lane reads them, and every copy to a card
+    // (the prompt path's groups and its prefetch, the main cache's fills and swaps, the helper's) is one DMA from them
+    // instead of a CPU copy into a staging buffer and a DMA from that.  false: the GGUF's mapping, as before
+    bool xp_on = false;
+    std::vector<void*> xp_bufs;
+    bool xp_pin();
     bool pf_alloc(std::string& err);
     size_t u_kda_bytes() const;
     size_t u_mla_bytes() const;
@@ -803,6 +816,7 @@ struct Engine::Impl {
         int ak = 0;
         size_t stage_n = 0;
         std::vector<std::pair<const uint8_t*, size_t>> stage_parts;
+        bool stage_direct = false;   // (the experts pinned: the piece's DMAs straight from them, no staging job)
         std::function<void(int)> stage_fn;
         // The fill's worker (HY4_BG_REFILL: the fill after a prompt in the background): (key, slot) jobs from fq, the
         // copied ones to fdone (both under fmu), through its own two pinned buffers on its own stream; finflight is the
@@ -1076,6 +1090,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     const double t0 = now_ms();
     try {
         files.emplace_back(new strata::GgufFile(o.gguf));
+        file_paths.push_back(o.gguf);
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -1096,13 +1111,15 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
         }
         try {
             files.emplace_back(new strata::GgufFile(nm));
+            file_paths.push_back(nm);
         } catch (const std::exception& e) {
             err = std::string(e.what()) + " (" + nm + ")";
             return false;
         }
     }
-    for (auto& fp : files)
-        for (const auto& t : fp->tensors()) tens[t.name] = Tensor{&t, fp->tensor_data(t)};
+    for (size_t fi = 0; fi < files.size(); ++fi)
+        for (const auto& t : files[fi]->tensors())
+            tens[t.name] = Tensor{&t, files[fi]->tensor_data(t), (int) fi, files[fi]->data_start() + t.offset};
 
     // the shape
     const std::string A = "hy_v4_flash.";
@@ -1257,6 +1274,7 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
         eg_table = t->data;
         eg_rb = (size_t) g.eg_dim;
         const uint64_t rows = t->info->shape[1];
+        eg_rows = rows;
         for (size_t c = 0; c < eg_off.size(); ++c)
             if (eg_prime[c] < 2 || eg_off[c] + eg_prime[c] > rows) {
                 err = "Engram column " + std::to_string(c) + ": its buckets run past the table's rows";
@@ -1496,8 +1514,32 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     // Every routed expert's pages touched once, now: the first touch of a mapped page costs a fault (~1 us a 4 KB
     // page on Windows even with the file in RAM), which held maya-ink's prompt-path copies to 3.5 GB/s and the CPU
     // lane's first tokens back.  HY4_PREFAULT=0: not done.
+    xp_pin();
+    // Engram's table read once, now, when the experts are pinned (HY4_EG_PREFAULT, 1 then): its rows are read through
+    // the mapping a few at a time, and with the experts out of the file cache there is room for all of it - without
+    // this its pages come in from the disk as new n-grams meet them (3-4 ms a token measured after the cache had been
+    // filled with other files), and nothing else brings them back
+    {
+        const char* ev = std::getenv("HY4_EG_PREFAULT");
+        const bool on = ev ? std::atoi(ev) != 0 : xp_on;
+        if (on && eg_table && eg_rows) {
+            const double te = now_ms();
+            const size_t bytes = (size_t) eg_rows * eg_rb, piece = (size_t) 64 << 20;
+            std::atomic<unsigned> sink{0};
+            pool->run((int) ((bytes + piece - 1) / piece), [&](int j) {
+                const volatile uint8_t* p0 = eg_table + (size_t) j * piece;
+                const size_t n = std::min(piece, bytes - (size_t) j * piece);
+                unsigned acc = 0;
+                for (size_t i = 0; i < n; i += 4096) acc += p0[i];
+                sink.fetch_add(acc, std::memory_order_relaxed);
+            });
+            if (o.verbose)
+                std::fprintf(stderr, "maya-hy4: Engram's table (%.1f GB) read into memory in %.1f s (working set %.1f GB)\n",
+                             bytes / 1e9, (now_ms() - te) / 1000.0, working_set_gb());
+        }
+    }
     const char* pv = std::getenv("HY4_PREFAULT");
-    if (!pv || std::atoi(pv) != 0) {
+    if (!xp_on && (!pv || std::atoi(pv) != 0)) {
         const double tp = now_ms();
         std::vector<std::pair<const uint8_t*, size_t>> parts;
         double gb = 0;
@@ -1567,10 +1609,11 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
         std::fprintf(stderr,
                      "maya-hy4: Hy4 Flash %d layers (%d sliding-window, %d sparse), %d experts (top %d + 1 shared, latent "
                      "%d), %d hc streams, Engram at %zu layers, context %d; %.2f GB in VRAM (%d expert slots %.2f, %d in the "
-                     "caches' rows past the position: %s), the routed experts in the GGUF's mapping; CPU lane %d threads; "
+                     "caches' rows past the position: %s), the routed experts %s; CPU lane %d threads; "
                      "loaded in %.1f s; eos %d\n",
                      g.n_layer, n_swa, g.n_layer - n_swa, g.n_expert, g.n_used, g.n_lat, g.hc, g.eg_layers.size(), max_ctx,
                      dev_bytes / 1e9, ec.own, (dev_bytes - before_ec) / 1e9, ec.slots - ec.arena_end, cls.c_str(),
+                     xp_on ? "pinned in host memory" : "in the GGUF's mapping",
                      pool->threads(), (now_ms() - t0) / 1000.0, g.eos);
     }
     win_alloc();
@@ -1700,6 +1743,184 @@ void Engine::Impl::ec_alloc() {
     ec.owner.assign((size_t) ec.slots, -1);
 }
 
+// The routed experts into pinned host memory (xp_on, above): an allocation a bank (gate / up / down of a MoE layer),
+// filled by the pool's threads from the mapping, whose pages then leave the working set (trim: they stay in the file
+// cache, available to the system).  Any allocation that fails: every one freed, the mapping kept, a line said.
+bool Engine::Impl::xp_pin() {
+    const char* v = std::getenv("HY4_PIN_EXPERTS");
+    if (v && std::atoi(v) == 0) return false;
+    const double t0 = now_ms();
+    const int ne = g.n_expert, E = g.n_lat, ff = g.n_ff_exp;
+    struct Bank {
+        CpuLayer* c;
+        int which;   // 0 gate, 1 up, 2 down
+        const uint8_t* src;
+        size_t bytes;
+        uint8_t* dst = nullptr;   // (the bank's bytes in the pinned allocation)
+        uint8_t* base = nullptr;  // (the allocation: 4 KB-aligned, the bank at dst = base + its offset's remainder)
+        int file = -1;
+        uint64_t off = 0;
+    };
+    std::vector<Bank> banks;
+    size_t total = 0;
+    for (Layer& l : L) {
+        if (l.dense) continue;
+        CpuLayer& c = l.cl;
+        const size_t gb = (size_t) ff * c.rg * ne, ub = (size_t) ff * c.ru * ne, db = (size_t) E * c.rd * ne;
+        banks.push_back({&c, 0, c.gate, gb});
+        banks.push_back({&c, 1, c.up, ub});
+        banks.push_back({&c, 2, c.down, db});
+        total += gb + ub + db;
+    }
+    for (Bank& b : banks)   // (each bank's shard and offset, from its tensor)
+        for (const auto& kv : tens)
+            if (kv.second.data == b.src) {
+                b.file = kv.second.file;
+                b.off = kv.second.file_off;
+                break;
+            }
+    for (Bank& b : banks) {
+        void* hp = nullptr;
+        // (4 KB of slack each side: an unbuffered read covers the bank's 4 KB-aligned range; portable: the helper's
+        //  copies read them too.  One allocation for all, or the main card's mapping alone, measured no different)
+        if (cudaHostAlloc(&hp, b.bytes + 8192, cudaHostAllocPortable) != cudaSuccess) {
+            cudaGetLastError();
+            size_t got = 0;
+            for (const Bank& x : banks)
+                if (x.dst) got += x.bytes;
+            for (void* q : xp_bufs) cudaFreeHost(q);
+            xp_bufs.clear();
+            std::fprintf(stderr,
+                         "maya-hy4: the routed experts could not be pinned (%.1f of %.1f GB allocated when it failed): "
+                         "they stay in the GGUF's mapping, copied through staging as before\n",
+                         got / 1e9, total / 1e9);
+            return false;
+        }
+        b.base = (uint8_t*) hp;
+        b.dst = b.base + (b.off & 4095);
+        xp_bufs.push_back(hp);
+    }
+    // the copy, in 64 MB pieces over the pool's threads; then the mapping's pages out of the working set
+    struct Piece {
+        const uint8_t* src;
+        uint8_t* dst;
+        size_t n;
+    };
+    std::vector<Piece> pieces;
+    for (const Bank& b : banks)
+        for (size_t off = 0; off < b.bytes; off += (size_t) 64 << 20)
+            pieces.push_back({b.src + off, b.dst + off, std::min((size_t) 64 << 20, b.bytes - off)});
+    // read from the files unbuffered (Windows: FILE_FLAG_NO_BUFFERING - the expert pages never enter the file cache,
+    // where they would push out Engram's table, read through the mapping a row at a time); else, or if a read fails,
+    // copied from the mapping, whose pages then leave the working set
+    bool direct = false;
+#ifdef _WIN32
+    direct = !(std::getenv("HY4_PIN_DIRECT") && std::atoi(std::getenv("HY4_PIN_DIRECT")) == 0);
+    {
+        int unfound = 0;
+        for (const Bank& b : banks) unfound += b.file < 0;
+        if (unfound) {
+            std::fprintf(stderr, "maya-hy4: %d of %zu expert banks not found among the GGUF's tensors: copied from the "
+                         "mapping\n", unfound, banks.size());
+            direct = false;
+        }
+    }
+    if (direct) {
+        struct Rd {
+            int file;
+            uint64_t off;   // (4 KB-aligned)
+            uint8_t* dst;   // (4 KB-aligned)
+            size_t n;       // (a multiple of 4 KB)
+        };
+        std::vector<Rd> rds;
+        for (const Bank& b : banks) {
+            const uint64_t a0 = b.off & ~(uint64_t) 4095, a1 = (b.off + b.bytes + 4095) & ~(uint64_t) 4095;
+            for (uint64_t o = a0; o < a1; o += (uint64_t) 64 << 20)
+                rds.push_back({b.file, o, b.base + (o - a0), (size_t) std::min<uint64_t>((uint64_t) 64 << 20, a1 - o)});
+        }
+        std::vector<HANDLE> hs;
+        for (const std::string& fp : file_paths)
+            hs.push_back(CreateFileA(fp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                     FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+        std::atomic<bool> ok{true};
+        std::atomic<unsigned long> rerr{0};
+        for (HANDLE h : hs)
+            if (h == INVALID_HANDLE_VALUE) ok = false, rerr = GetLastError();
+        if (ok)
+            pool->run((int) rds.size(), [&](int j) {
+                const Rd& r = rds[(size_t) j];
+                size_t got = 0;
+                while (got < r.n && ok) {
+                    OVERLAPPED ov{};
+                    const uint64_t at = r.off + got;
+                    ov.Offset = (DWORD) at;
+                    ov.OffsetHigh = (DWORD) (at >> 32);
+                    DWORD nr = 0;
+                    const DWORD want = (DWORD) std::min<size_t>(r.n - got, (size_t) 32 << 20);
+                    if (!ReadFile(hs[(size_t) r.file], r.dst + got, want, &nr, &ov) || nr == 0) {
+                        const unsigned long e = GetLastError();
+                        if (e == ERROR_HANDLE_EOF || (nr == 0 && got > 0)) break;   // (the rounded-up tail past the end)
+                        rerr = e;
+                        ok = false;
+                        break;
+                    }
+                    got += nr;
+                    if (nr < want) break;   // (the file's end)
+                }
+            });
+        for (HANDLE h : hs)
+            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        direct = ok;
+        // (each bank's first, middle and last 4 KB against the mapping's: a read that went wrong is caught here)
+        if (direct)
+            for (const Bank& b : banks) {
+                const size_t n4 = std::min<size_t>(4096, b.bytes), at[3] = {0, b.bytes / 2 & ~(size_t) 63,
+                                                                            b.bytes - n4};
+                for (size_t a : at)
+                    if (std::memcmp(b.dst + a, b.src + a, std::min(n4, b.bytes - a)) != 0) {
+                        std::fprintf(stderr, "maya-hy4: an unbuffered read of the experts differs from the mapping "
+                                     "(bank of %zu bytes at file offset %llu, byte %zu)\n", b.bytes,
+                                     (unsigned long long) b.off, a);
+                        direct = false;
+                        rerr = 0;
+                        break;
+                    }
+                if (!direct) break;
+            }
+        if (!direct)
+            std::fprintf(stderr,
+                         "maya-hy4: unbuffered reads of the experts failed (error %lu): copied from the mapping\n",
+                         rerr.load());
+    }
+#endif
+    if (!direct)
+        pool->run((int) pieces.size(), [&](int j) {
+            const Piece& pc = pieces[(size_t) j];
+            std::memcpy(pc.dst, pc.src, pc.n);
+        });
+    for (Bank& b : banks) {
+        if (!direct) trim(b.src, b.bytes);
+        (b.which == 0 ? b.c->gate : b.which == 1 ? b.c->up : b.c->down) = b.dst;
+    }
+    xp_on = true;
+    double avail_gb = 0, commit_gb = 0;
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) {
+        avail_gb = ms.ullAvailPhys / 1e9;
+        commit_gb = (ms.ullTotalPageFile - ms.ullAvailPageFile) / 1e9;
+    }
+#endif
+    if (o.verbose)
+        std::fprintf(stderr,
+                     "maya-hy4: the routed experts pinned: %.1f GB in %zu banks, %s in %.1f s; RAM available %.1f GB, "
+                     "commit charge %.1f GB, working set %.1f GB\n",
+                     total / 1e9, banks.size(), direct ? "read unbuffered from the files" : "copied from the mapping",
+                     (now_ms() - t0) / 1000.0, avail_gb, commit_gb, working_set_gb());
+    return true;
+}
+
 // (the driver's staging; ec_copy_many's when there is no pinned staging)
 void Engine::Impl::ec_copy(int key, int slot) {
     const int il = key / ec.ne, e = key % ec.ne, E = g.n_lat, ff = g.n_ff_exp;
@@ -1720,6 +1941,26 @@ void Engine::Impl::ec_copy(int key, int slot) {
 // (Called with the GPU done with the slots' old experts: after a prompt, or at the end of a token.)
 void Engine::Impl::ec_copy_many(const std::vector<std::pair<int, int>>& todo) {
     if (todo.empty()) return;
+    if (xp_on) {   // (the experts pinned: one DMA a bank piece, straight from them, on the copy stream)
+        std::vector<std::pair<const uint8_t*, size_t>> parts;
+        for (const auto& kv : todo) {
+            const int key = kv.first, sl = kv.second, il = key / ec.ne;
+            parts.clear();
+            ec_src_parts(key, 0, expert_bytes(il), parts);
+            size_t at = 0;
+            for (const auto& pr : parts) {
+                CK(cudaMemcpyAsync(ec.ptr[(size_t) sl] + at, pr.first, pr.second, cudaMemcpyHostToDevice, pf.cs));
+                at += pr.second;
+            }
+            if (ec.owner[(size_t) sl] >= 0) ec.where[(size_t) ec.owner[(size_t) sl]] = -1;
+            ec.owner[(size_t) sl] = key;
+            ec.where[(size_t) key] = sl;
+            ++ec.copies;
+        }
+        CK(cudaEventRecord(ec.copied, pf.cs));
+        CK(cudaStreamWaitEvent(s, ec.copied, 0));
+        return;
+    }
     if (!stg.on) {
         for (const auto& kv : todo) ec_copy(kv.first, kv.second);
         return;
@@ -1841,6 +2082,15 @@ void Engine::Impl::ec_fworker() {
             const size_t eb = expert_bytes(kv.first / ec.ne);
             parts.clear();
             ec_src_parts(kv.first, 0, eb, parts);
+            if (xp_on) {   // (the experts pinned: straight from them)
+                size_t o0 = 0;
+                for (const auto& pr : parts) {
+                    CK(cudaMemcpyAsync(ec.ptr[(size_t) kv.second] + o0, pr.first, pr.second, cudaMemcpyHostToDevice,
+                                       ec.fcs));
+                    o0 += pr.second;
+                }
+                continue;
+            }
             size_t o0 = at;
             for (const auto& pr : parts) {
                 std::memcpy(pin + o0, pr.first, pr.second);
@@ -2157,6 +2407,8 @@ bool Engine::Impl::ec_stage_begin(size_t budget, bool wait) {
     ec.stage_n = n;
     ec.stage_parts.clear();
     ec_src_parts(p0.key, p0.done, n, ec.stage_parts);
+    ec.stage_direct = xp_on;
+    if (ec.stage_direct) return true;   // (the experts pinned: ec_stage_end's DMAs straight from them, no staging job)   // (the experts pinned: ec_stage_end's DMAs straight from them, no staging job)
     const auto* parts = &ec.stage_parts;   // (by pointer: the workers run the job)
     const size_t jb = (size_t) 128 << 10;
     const int nj = (int) ((n + jb - 1) / jb);
@@ -2175,9 +2427,19 @@ bool Engine::Impl::ec_stage_begin(size_t budget, bool wait) {
 }
 
 void Engine::Impl::ec_stage_end() {
-    pool->join();
     EC::Pending& p0 = ec.pend[ec.pend_head];
-    CK(cudaMemcpyAsync(ec.ptr[(size_t) p0.slot] + p0.done, ec.apin[ec.ak], ec.stage_n, cudaMemcpyHostToDevice, pf.cs));
+    if (ec.stage_direct) {
+        size_t at = 0;
+        for (const auto& pr : ec.stage_parts) {
+            CK(cudaMemcpyAsync(ec.ptr[(size_t) p0.slot] + p0.done + at, pr.first, pr.second, cudaMemcpyHostToDevice,
+                               pf.cs));
+            at += pr.second;
+        }
+    } else {
+        pool->join();
+        CK(cudaMemcpyAsync(ec.ptr[(size_t) p0.slot] + p0.done, ec.apin[ec.ak], ec.stage_n, cudaMemcpyHostToDevice,
+                           pf.cs));
+    }
     CK(cudaEventRecord(ec.aev[ec.ak], pf.cs));
     // (submitted now: WDDM holds a stream's work until something flushes it, and the device's routing has no sync
     //  before the next piece waits for this one)
@@ -2466,6 +2728,10 @@ void Engine::Impl::hc_copy(int key, int slot, cudaStream_t st) {
 // stream from there.  The same bytes into the same slots as hc_copy's; called from the token's thread between tokens
 // (the pool idle), never from the swaps' thread.
 void Engine::Impl::hc_copy_many(const std::vector<std::pair<int, int>>& todo) {
+    if (xp_on) {   // (the experts pinned: hc_copy's DMAs are straight from them)
+        for (const auto& kv : todo) hc_copy(kv.first, kv.second, hc.s);
+        return;
+    }
     const int E = g.n_lat, ff = g.n_ff_exp;
     struct Part {
         const uint8_t* src;
@@ -2571,7 +2837,9 @@ void Engine::Impl::hc_worker() {
         finish(k);   // (this buffer's last batch: its DMAs done before it is written again)
         uint8_t* pin = hc.wpin[k];
         size_t at = 0;
-        for (const auto& kv : jobs) {
+        if (xp_on)   // (the experts pinned: straight from them)
+            for (const auto& kv : jobs) hc_copy(kv.first, kv.second, hc.cs);
+        for (const auto& kv : xp_on ? std::vector<std::pair<int, int>>() : jobs) {
             std::vector<std::pair<const uint8_t*, size_t>> parts;
             const size_t eb = expert_bytes(kv.first / ec.ne);
             ec_src_parts(kv.first, 0, eb, parts);
@@ -2906,12 +3174,20 @@ bool Engine::Impl::pf_alloc(std::string& err) {
     const size_t gu_cols = (size_t) std::max(ffe, ffs) * 2;
     // Every buffer in one arena (none holds anything from one prompt to the next, so the expert cache can borrow it,
     // and each is written before it is read): the same list twice, first its size, then its pointers, 256-byte aligned.
+    // (HY4_PF_LAYOUT=1: the arena's parts at the load - the chunk's rows (x Cn), the attention's piece (x Ca), the
+    //  score and weight tiles, the group buffers, the prefetch's layer buffers, the embedding rows)
+    static const bool layout = std::getenv("HY4_PF_LAYOUT") != nullptr;
     for (int pass = 0; pass < 2; ++pass) {
-        size_t at = 0;
+        size_t at = 0, mark = 0;
         auto carve = [&](auto*& ptr, size_t n) {
             using T = std::remove_reference_t<decltype(*ptr)>;
             if (pass == 1) ptr = (T*) (pf.arena + at);
             at += (n * sizeof(T) + 255) & ~(size_t) 255;
+        };
+        auto part = [&](const char* what) {
+            if (layout && pass == 0)
+                std::fprintf(stderr, "maya-hy4: the prompt path's arena: %-26s %8.1f MiB\n", what, (at - mark) / 1048576.0);
+            mark = at;
         };
         carve(pf.ids, (size_t) Cn);
         carve(pf.R, (size_t) Cn * HC * E);
@@ -2937,6 +3213,7 @@ bool Engine::Impl::pf_alloc(std::string& err) {
         carve(pf.Ye, (size_t) Cn * std::max(E, NL));
         carve(pf.GU, (size_t) Cn * gu_cols);
         carve(pf.He, (size_t) Cn * std::max(ffe, ffs));
+        part("the chunk's rows (x Cn)");
         // Engram (a piece of `sub` rows at a time)
         carve(pf.EGR, (size_t) Ca * std::max(cd, 1));
         carve(pf.EGY, (size_t) Ca * std::max(cd, 1));
@@ -2968,18 +3245,23 @@ bool Engine::Impl::pf_alloc(std::string& err) {
             carve(pf.IS, (size_t) pf.tqi * max_pools);
             carve(pf.icells, (size_t) pf.tqi * std::max(1, pf.top_pools) * KP);
         }
+        part("the attention's piece (x Ca)");
         carve(pf.S, pf.s_elems);
         carve(pf.P, pf.s_elems);
         carve(pf.W1, pf.w1_elems);
         carve(pf.W2, pf.w2_elems);
+        part("the score / weight tiles");
         // two group buffers in turn, `stage` experts each (the copy of one group while the other's are multiplied)
         carve(pf.gbuf[0], (size_t) pf.GE * pf.slot_bytes);
         carve(pf.gbuf[1], (size_t) pf.GE * pf.slot_bytes);
+        part("the group buffers");
         if (pre.on) {   // (the prefetch's two layer buffers)
             carve(pre.buf[0], pre.bytes);
             carve(pre.buf[1], pre.bytes);
         }
+        part("the prefetch's layer buffers");
         if (embd_host) carve(pf.Erows, (size_t) Cn * embd.rb);   // (a chunk's embedding rows)
+        part("the embedding rows (x Cn)");
         if (pass == 0) {
             pf.arena_bytes = at;
             pf.arena = dalloc<uint8_t>(at);
@@ -3010,7 +3292,7 @@ bool Engine::Impl::pf_alloc(std::string& err) {
 }
 
 void Engine::Impl::stage_copy(uint8_t* dst, const uint8_t* src, size_t len) {
-    if (!stg.on) {
+    if (!stg.on || xp_on) {   // (xp_on: a DMA straight from the pinned experts)
         CK(cudaMemcpyAsync(dst, src, len, cudaMemcpyHostToDevice, pf.cs));
         return;
     }
@@ -3034,6 +3316,10 @@ void Engine::Impl::stage_copy(uint8_t* dst, const uint8_t* src, size_t len) {
 }
 
 void Engine::Impl::pre_stage(uint8_t* dst, const uint8_t* src, size_t len) {
+    if (xp_on) {   // (the experts pinned: a DMA straight from them)
+        CK(cudaMemcpyAsync(dst, src, len, cudaMemcpyHostToDevice, pre.cs));
+        return;
+    }
     const int nt = pre.pool->threads();
     while (len) {
         const size_t n = std::min(len, pre.pcap);
@@ -5105,7 +5391,10 @@ const float* Engine::Impl::step(int token) {
         acc += t - tp;
         tp = t;
     };
+    const unsigned long long pf0 = ptimes ? page_faults() : 0;
     pre_step(1);
+    const double tpre = ptimes ? now_ms() : 0.0;
+    if (ptimes) pt.pre += tpre - t0;
 
     // the token's row (to d_erow, decoded by segment 0), its Engram rows (h_eg, copied up by segment 0), the position
     // and the row's index on the device
@@ -5114,6 +5403,10 @@ const float* Engine::Impl::step(int token) {
         CK(cudaMemcpyAsync(d_erow, h_erow, embd.rb, cudaMemcpyHostToDevice, s));
     }
     eg_fill(token);
+    if (ptimes) {
+        pt.eg += now_ms() - tpre;
+        pt.faults += page_faults() - pf0;
+    }
     if ((int) hist.size() <= pos) hist.resize((size_t) pos + 1);
     hist[(size_t) pos] = token;
     h_pos[0] = pos;
@@ -5282,10 +5575,11 @@ const float* Engine::Impl::step(int token) {
     if (ptimes && ++pt.tokens == pblock) {
         const double n = (double) pt.tokens;
         std::fprintf(stderr,
-                     "maya-hy4: step phases, ms a token (%d tokens): embed %.2f, attention+sync %.2f, routing %.2f, GPU "
+                     "maya-hy4: step phases, ms a token (%d tokens): embed %.2f (pre_step %.2f, Engram rows %.2f; %.0f "
+                     "page faults a token at the start), attention+sync %.2f, routing %.2f, GPU "
                      "launches %.2f, CPU lane %.2f (%.1f experts, %.3f ms each), tail %.2f, head %.2f, adapt %.2f; "
                      "total %.2f\n",
-                     pblock, pt.embed / n, pt.att / n, pt.route / n, pt.glaunch / n, pt.cpu / n, pt.cpu_experts / n,
+                     pblock, pt.embed / n, pt.pre / n, pt.eg / n, (double) pt.faults / n, pt.att / n, pt.route / n, pt.glaunch / n, pt.cpu / n, pt.cpu_experts / n,
                      pt.cpu_experts ? pt.cpu / pt.cpu_experts : 0.0, pt.tail / n, pt.head / n, pt.adapt / n,
                      (pt.embed + pt.att + pt.route + pt.glaunch + pt.cpu + pt.tail + pt.head + pt.adapt) / n);
         float qm[2];
