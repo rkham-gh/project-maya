@@ -570,9 +570,9 @@ int main(int argc, char** argv) {
         lg = eng.prefill(p2.data(), (int) p2.size());
         if (!lg) return false;
         const double t3 = now_ms();
-        std::fprintf(stderr, "turn2: p1 %zu tok %.2f s, a1 %zu tok %.2f s (%.1f tok/s), p2 %zu tok %.3f s\n", p1.size(),
-                     (t1 - t0) / 1000.0, a1.size(), (t2 - t1) / 1000.0, a1.size() * 1000.0 / (t2 - t1), p2.size(),
-                     (t3 - t2) / 1000.0);
+        std::fprintf(stderr, "turn2: p1 %zu tok %.2f s, a1 %zu tok %.2f s (%.1f tok/s), p2 %zu tok %.3f s (%.2f GB of "
+                     "experts copied)\n", p1.size(), (t1 - t0) / 1000.0, a1.size(), (t2 - t1) / 1000.0,
+                     a1.size() * 1000.0 / (t2 - t1), p2.size(), (t3 - t2) / 1000.0, eng.stats().pf_copy_last_gb);
         int agree = argmax(lg, V) == a2[0];
         double sum_ms[2] = {}, sum_lane[2] = {};
         long sum_n[2] = {};

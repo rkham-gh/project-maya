@@ -665,6 +665,11 @@ struct Engine::Impl {
     // run.
     struct PF {
         int C = 0, Ca = 0, GE = 0;
+        // (8c) C / Ca / tqi are the current layout's; the load's (the full one) here.  `used`: the arena's bytes the
+        // current layout takes from its start - a read under the prefetch's min_T carves a small one (HY4_PF_SMALL)
+        int C_full = 0, Ca_full = 0, tqi_full = 1;
+        size_t used = 0;
+        bool small = false;
         long group_ctr = 0;
         size_t s_elems = 0, slot_bytes = 0, w1_elems = 0, w2_elems = 0;
         uint8_t* arena = nullptr;   // the buffers below: one allocation, lent to the expert cache between prompts
@@ -732,6 +737,8 @@ struct Engine::Impl {
     long verify_slots(long* checked);
     bool xp_pin();
     bool pf_alloc(std::string& err);
+    size_t pf_carve(int Cn, int Ca, bool with_pre, bool assign);
+    void pf_layout(int n);
     size_t u_kda_bytes() const;
     size_t u_mla_bytes() const;
     void f16w(const DMat& m, __half* dst);
@@ -798,7 +805,7 @@ struct Engine::Impl {
     static constexpr int kKvSlack = 4096;   // (cache rows reserved past the position)
     struct EC {
         int slots = 0, ne = 0, own = 0, lend_cls = 0, arena_end = 0;   // [own, arena_end): the prompt path's
-        bool lent = false;                   // the prompt path's slots usable
+        int lent_from = 0;                   // (8c) the arena's slots from here on lent: usable (arena_end: none)
         std::vector<int> kv_row;             // slot -> its first cache row (a slot in an MLA cache), else -1
         int kv_hi = 0;                       // the cache rows below it reserved (not usable as slots)
         std::vector<uint8_t*> ptr;           // slot -> its VRAM
@@ -875,14 +882,14 @@ struct Engine::Impl {
     long verified_main = 0, verified_helper = 0;   // (HY4_VERIFY_FILLS) the workers' copies read back so far
     void ec_drop_pending();
     void ec_adapt();
-    void ec_reclaim();
+    void ec_reclaim(size_t bytes);
     void ec_flush();
     bool ec_stage_begin(size_t budget, bool wait = true);
     void ec_stage_end();
     void ec_arrive();
     bool ec_usable(int sl) const {
         if (sl < ec.own) return true;
-        if (sl < ec.arena_end) return ec.lent;
+        if (sl < ec.arena_end) return sl >= ec.lent_from;
         return ec.kv_row[(size_t) sl] >= ec.kv_hi;
     }
     void ec_kv_reserve(int rows);
@@ -1747,7 +1754,7 @@ void Engine::Impl::ec_alloc() {
         }
     }
     ec.arena_end = (int) ec.ptr.size();
-    ec.lent = ec.arena_end > ec.own;
+    ec.lent_from = ec.own;   // (all of the arena lent)
     ec.kv_row.assign(ec.ptr.size(), -1);
     const char* kvv = std::getenv("HY4_LEND_KV");
     if (base && (!kvv || std::atoi(kvv) != 0)) {
@@ -2404,18 +2411,21 @@ void Engine::Impl::ec_drop_pending() {
         std::fprintf(stderr, "maya-hy4: a new prompt: %ld of the cache's copies still to come dropped\n", dropped);
 }
 
-void Engine::Impl::ec_reclaim() {
-    if (!ec.lent) return;
+void Engine::Impl::ec_reclaim(size_t bytes) {
+    // (8c) only the slots the layout's first `bytes` overlap - those not taken back yet this prompt
+    const size_t b = ec.arena_end > ec.own ? ec.cls_bytes[(size_t) ec.lend_cls] : 1;
+    const int to = std::min(ec.arena_end, ec.own + (int) ((bytes + b - 1) / b));
+    if (to <= ec.lent_from) return;
     ec_drop_pending();
     ec_flush();
     CK(cudaStreamSynchronize(pf.cs));
     CK(cudaStreamSynchronize(s));
-    for (int sl = ec.own; sl < ec.arena_end; ++sl)
+    for (int sl = ec.lent_from; sl < to; ++sl)
         if (ec.owner[(size_t) sl] >= 0) {
             ec.where[(size_t) ec.owner[(size_t) sl]] = -1;
             ec.owner[(size_t) sl] = -1;
         }
-    ec.lent = false;
+    ec.lent_from = to;
 }
 
 // The cache rows below `rows` about to be written: the slots there emptied first (the GPU done with them, the copies
@@ -3277,107 +3287,14 @@ bool Engine::Impl::pf_alloc(std::string& err) {
             if (!xp_on) pre.pool.reset(new Pool(7));
         }
     }
-    const size_t gu_cols = (size_t) std::max(ffe, ffs) * 2;
     // Every buffer in one arena (none holds anything from one prompt to the next, so the expert cache can borrow it,
-    // and each is written before it is read): the same list twice, first its size, then its pointers, 256-byte aligned.
-    // (HY4_PF_LAYOUT=1: the arena's parts at the load - the chunk's rows (x Cn), the attention's piece (x Ca), the
-    //  score and weight tiles, the group buffers, the prefetch's layer buffers, the embedding rows)
-    static const bool layout = std::getenv("HY4_PF_LAYOUT") != nullptr;
-    for (int pass = 0; pass < 2; ++pass) {
-        size_t at = 0, mark = 0;
-        auto carve = [&](auto*& ptr, size_t n) {
-            using T = std::remove_reference_t<decltype(*ptr)>;
-            if (pass == 1) ptr = (T*) (pf.arena + at);
-            at += (n * sizeof(T) + 255) & ~(size_t) 255;
-        };
-        auto part = [&](const char* what) {
-            if (layout && pass == 0)
-                std::fprintf(stderr, "maya-hy4: the prompt path's arena: %-26s %8.1f MiB\n", what, (at - mark) / 1048576.0);
-            mark = at;
-        };
-        carve(pf.ids, (size_t) Cn);
-        carve(pf.R, (size_t) Cn * HC * E);
-        carve(pf.X, CE);
-        carve(pf.A, CE);
-        carve(pf.Y, CE);
-        carve(pf.Y2, CE);
-        carve(pf.Ah, CE);
-        carve(pf.MIX, (size_t) Cn * 2 * HC);
-        carve(pf.POST, (size_t) Cn * HC);
-        carve(pf.RL, (size_t) Cn * ne);
-        carve(pf.sel, (size_t) Cn * nu);
-        carve(pf.wts, (size_t) Cn * nu);
-        carve(pf.cnt, (size_t) ne);
-        carve(pf.off, (size_t) ne);
-        carve(pf.list, (size_t) Cn * nu);
-        carve(pf.wl, (size_t) Cn * nu);
-        carve(pf.LAT, (size_t) Cn * NL);
-        carve(pf.LATh, (size_t) Cn * NL);
-        carve(pf.YL, (size_t) Cn * NL);
-        carve(pf.YLh, (size_t) Cn * NL);
-        carve(pf.Xe, (size_t) Cn * NL);
-        carve(pf.Ye, (size_t) Cn * std::max(E, NL));
-        carve(pf.GU, (size_t) Cn * gu_cols);
-        carve(pf.He, (size_t) Cn * std::max(ffe, ffs));
-        part("the chunk's rows (x Cn)");
-        // Engram (a piece of `sub` rows at a time)
-        carve(pf.EGR, (size_t) Ca * std::max(cd, 1));
-        carve(pf.EGY, (size_t) Ca * std::max(cd, 1));
-        carve(pf.EGYh, (size_t) Ca * std::max(cd, 1));
-        carve(pf.KVO, (size_t) Ca * (HC + 1) * E);
-        // the attention's piece
-        carve(pf.QA, (size_t) Ca * ql);
-        carve(pf.QAh, (size_t) Ca * ql);
-        carve(pf.KVA, (size_t) Ca * 576);
-        carve(pf.GATE, (size_t) Ca * Hm * V);
-        carve(pf.Q, (size_t) Ca * Hm * QK);
-        carve(pf.QH, (size_t) Ca * Hm * QK);
-        carve(pf.Qcat, (size_t) Ca * Hm * 576);
-        carve(pf.O16, (size_t) Ca * Hm * 512);
-        carve(pf.OB, (size_t) Ca * Hm * V);
-        carve(pf.OBh, (size_t) Ca * Hm * V);
-        carve(pf.Kbuf, (size_t) (Ca + std::max(g.swa_window, 1)) * 576);
-        if (max_pools) {   // the indexer's
-            carve(pf.IK, (size_t) Ca * D);
-            carve(pf.IKN, (size_t) Ca * D);
-            carve(pf.IKNh, (size_t) Ca * D);
-            carve(pf.IV, (size_t) Ca * D);
-            carve(pf.IG, (size_t) Ca * D);
-            carve(pf.IW, (size_t) Ca * NH);
-            carve(pf.IQ, (size_t) Ca * NH * D);
-            carve(pf.bits, (size_t) Ca * pf.nwords);
-            carve(pf.sel_on, (size_t) Ca);
-            carve(pf.IA, (size_t) pf.tqi * NH * max_pools);
-            carve(pf.IS, (size_t) pf.tqi * max_pools);
-            carve(pf.icells, (size_t) pf.tqi * std::max(1, pf.top_pools) * KP);
-        }
-        part("the attention's piece (x Ca)");
-        carve(pf.S, pf.s_elems);
-        carve(pf.P, pf.s_elems);
-        carve(pf.W1, pf.w1_elems);
-        carve(pf.W2, pf.w2_elems);
-        if (pf.grouped) {   // (8e: a group's F16 experts - lent to the cache with the rest between prompts)
-            carve(pf.GWg, (size_t) pf.GE * ffe * NL);
-            carve(pf.GWu, (size_t) pf.GE * ffe * NL);
-            carve(pf.GWd, (size_t) pf.GE * ffe * NL);
-        }
-        part("the score / weight tiles");
-        // two group buffers in turn, `stage` experts each (the copy of one group while the other's are multiplied)
-        carve(pf.gbuf[0], (size_t) pf.GE * pf.slot_bytes);
-        carve(pf.gbuf[1], (size_t) pf.GE * pf.slot_bytes);
-        part("the group buffers");
-        if (pre.on) {   // (the prefetch's two layer buffers)
-            carve(pre.buf[0], pre.bytes);
-            carve(pre.buf[1], pre.bytes);
-        }
-        part("the prefetch's layer buffers");
-        if (embd_host) carve(pf.Erows, (size_t) Cn * embd.rb);   // (a chunk's embedding rows)
-        part("the embedding rows (x Cn)");
-        if (pass == 0) {
-            pf.arena_bytes = at;
-            pf.arena = dalloc<uint8_t>(at);
-        }
-    }
+    // and each is written before it is read): its size from the full layout, then its pointers (pf_carve)
+    pf.C_full = Cn;
+    pf.Ca_full = Ca;
+    pf.tqi_full = pf.tqi;
+    pf.arena_bytes = pf_carve(Cn, Ca, true, false);
+    pf.arena = dalloc<uint8_t>(pf.arena_bytes);
+    pf.used = pf_carve(Cn, Ca, true, true);
     for (int i = 0; i < 2; ++i) {
         CK(cudaEventCreateWithFlags(&pf.gready[i], cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&pf.gfreed[i], cudaEventDisableTiming));
@@ -3400,6 +3317,132 @@ bool Engine::Impl::pf_alloc(std::string& err) {
         }
     }
     return true;
+}
+
+// The prompt path's buffers from the arena's start for chunks of up to Cn rows, attention pieces of Ca (pf.tqi the
+// indexer's tile), the prefetch's layer buffers with_pre: the same list for the size (assign false) and the pointers,
+// 256-byte aligned; the bytes taken.  (HY4_PF_LAYOUT=1: the full layout's parts at the load - the chunk's rows (x Cn),
+// the attention's piece (x Ca), the score and weight tiles, the group buffers, the prefetch's layer buffers, the
+// embedding rows)
+size_t Engine::Impl::pf_carve(int Cn, int Ca, bool with_pre, bool assign) {
+    const int E = g.n_embd, HC = g.hc, NL = g.n_lat, ne = g.n_expert, nu = g.n_used;
+    const int ffe = g.n_ff_exp, ffs = g.n_ff_sh, ql = g.q_lora, QK = g.qk_head, V = g.v_head;
+    const int Hm = *std::max_element(g.n_head.begin(), g.n_head.end());
+    const int cd = g.eg_cols * g.eg_dim, D = g.idx_dim, NH = g.idx_heads, KP = std::max(1, g.idx_kpool);
+    const size_t CE = (size_t) Cn * E;
+    const size_t gu_cols = (size_t) std::max(ffe, ffs) * 2;
+    static const bool layout = std::getenv("HY4_PF_LAYOUT") != nullptr;
+    size_t at = 0, mark = 0;
+    auto carve = [&](auto*& ptr, size_t n) {
+        using T = std::remove_reference_t<decltype(*ptr)>;
+        if (assign) ptr = (T*) (pf.arena + at);
+        at += (n * sizeof(T) + 255) & ~(size_t) 255;
+    };
+    auto part = [&](const char* what) {
+        if (layout && !assign)
+            std::fprintf(stderr, "maya-hy4: the prompt path's arena: %-26s %8.1f MiB\n", what, (at - mark) / 1048576.0);
+        mark = at;
+    };
+    carve(pf.ids, (size_t) Cn);
+    carve(pf.R, (size_t) Cn * HC * E);
+    carve(pf.X, CE);
+    carve(pf.A, CE);
+    carve(pf.Y, CE);
+    carve(pf.Y2, CE);
+    carve(pf.Ah, CE);
+    carve(pf.MIX, (size_t) Cn * 2 * HC);
+    carve(pf.POST, (size_t) Cn * HC);
+    carve(pf.RL, (size_t) Cn * ne);
+    carve(pf.sel, (size_t) Cn * nu);
+    carve(pf.wts, (size_t) Cn * nu);
+    carve(pf.cnt, (size_t) ne);
+    carve(pf.off, (size_t) ne);
+    carve(pf.list, (size_t) Cn * nu);
+    carve(pf.wl, (size_t) Cn * nu);
+    carve(pf.LAT, (size_t) Cn * NL);
+    carve(pf.LATh, (size_t) Cn * NL);
+    carve(pf.YL, (size_t) Cn * NL);
+    carve(pf.YLh, (size_t) Cn * NL);
+    carve(pf.Xe, (size_t) Cn * NL);
+    carve(pf.Ye, (size_t) Cn * std::max(E, NL));
+    carve(pf.GU, (size_t) Cn * gu_cols);
+    carve(pf.He, (size_t) Cn * std::max(ffe, ffs));
+    part("the chunk's rows (x Cn)");
+    // Engram (a piece of `sub` rows at a time)
+    carve(pf.EGR, (size_t) Ca * std::max(cd, 1));
+    carve(pf.EGY, (size_t) Ca * std::max(cd, 1));
+    carve(pf.EGYh, (size_t) Ca * std::max(cd, 1));
+    carve(pf.KVO, (size_t) Ca * (HC + 1) * E);
+    // the attention's piece
+    carve(pf.QA, (size_t) Ca * ql);
+    carve(pf.QAh, (size_t) Ca * ql);
+    carve(pf.KVA, (size_t) Ca * 576);
+    carve(pf.GATE, (size_t) Ca * Hm * V);
+    carve(pf.Q, (size_t) Ca * Hm * QK);
+    carve(pf.QH, (size_t) Ca * Hm * QK);
+    carve(pf.Qcat, (size_t) Ca * Hm * 576);
+    carve(pf.O16, (size_t) Ca * Hm * 512);
+    carve(pf.OB, (size_t) Ca * Hm * V);
+    carve(pf.OBh, (size_t) Ca * Hm * V);
+    carve(pf.Kbuf, (size_t) (Ca + std::max(g.swa_window, 1)) * 576);
+    if (max_pools) {   // the indexer's
+        carve(pf.IK, (size_t) Ca * D);
+        carve(pf.IKN, (size_t) Ca * D);
+        carve(pf.IKNh, (size_t) Ca * D);
+        carve(pf.IV, (size_t) Ca * D);
+        carve(pf.IG, (size_t) Ca * D);
+        carve(pf.IW, (size_t) Ca * NH);
+        carve(pf.IQ, (size_t) Ca * NH * D);
+        carve(pf.bits, (size_t) Ca * pf.nwords);
+        carve(pf.sel_on, (size_t) Ca);
+        carve(pf.IA, (size_t) pf.tqi * NH * max_pools);
+        carve(pf.IS, (size_t) pf.tqi * max_pools);
+        carve(pf.icells, (size_t) pf.tqi * std::max(1, pf.top_pools) * KP);
+    }
+    part("the attention's piece (x Ca)");
+    carve(pf.S, pf.s_elems);
+    carve(pf.P, pf.s_elems);
+    carve(pf.W1, pf.w1_elems);
+    carve(pf.W2, pf.w2_elems);
+    if (pf.grouped) {   // (8e: a group's F16 experts - lent to the cache with the rest between prompts)
+        carve(pf.GWg, (size_t) pf.GE * ffe * NL);
+        carve(pf.GWu, (size_t) pf.GE * ffe * NL);
+        carve(pf.GWd, (size_t) pf.GE * ffe * NL);
+    }
+    part("the score / weight tiles");
+    // two group buffers in turn, `stage` experts each (the copy of one group while the other's are multiplied)
+    carve(pf.gbuf[0], (size_t) pf.GE * pf.slot_bytes);
+    carve(pf.gbuf[1], (size_t) pf.GE * pf.slot_bytes);
+    part("the group buffers");
+    if (pre.on && with_pre) {   // (the prefetch's two layer buffers)
+        carve(pre.buf[0], pre.bytes);
+        carve(pre.buf[1], pre.bytes);
+    } else if (assign) {
+        pre.buf[0] = pre.buf[1] = nullptr;   // (a small layout: no prefetch)
+    }
+    part("the prefetch's layer buffers");
+    if (embd_host) carve(pf.Erows, (size_t) Cn * embd.rb);   // (a chunk's embedding rows)
+    part("the embedding rows (x Cn)");
+    return at;
+}
+
+// (8c) The layout for a read of n tokens: under the prefetch's min_T (a single chunk, no prefetch) the chunk's rows
+// and the attention's piece clamped to the read, no prefetch buffers - ~2.4-3 GB of the arena's ~8.8 for 663-3,840
+// tokens, so the expert cache keeps the rest lent (its experts, the decode's) through the read; otherwise the full
+// layout.  HY4_PF_SMALL=0: always the full one.
+void Engine::Impl::pf_layout(int n) {
+    static const bool small_on = !(std::getenv("HY4_PF_SMALL") && std::atoi(std::getenv("HY4_PF_SMALL")) == 0);
+    int Cn = pf.C_full, Ca = pf.Ca_full;
+    const bool small = small_on && n < pf.C_full && (!pre.on || n < pre.min_T);
+    if (small) {
+        Cn = std::min(pf.C_full, std::max(64, (n + 255) / 256 * 256));        Ca = std::max(16, std::min(pf.Ca_full, Cn));
+    }
+    if (Cn == pf.C && Ca == pf.Ca && small == pf.small) return;
+    pf.C = Cn;
+    pf.Ca = Ca;
+    pf.tqi = std::min(pf.tqi_full, Ca);
+    pf.small = small;
+    pf.used = pf_carve(Cn, Ca, !small, true);
 }
 
 void Engine::Impl::stage_copy(uint8_t* dst, const uint8_t* src, size_t len) {
@@ -4130,7 +4173,17 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     }
     // the lent slots back to their buffers until the next token is written (a long prompt comes in pieces); the
     // background refill's copies still to come dropped (the prompt fills by its own scores)
-    ec_reclaim();
+    const double cb0 = pf.copy_bytes;
+    pf_layout(n);   // (8c: a read under the prefetch's min_T takes only the arena's start)
+    {
+        const int lf0 = ec.lent_from;
+        ec_reclaim(pf.used);
+        if (o.verbose && ec.arena_end > ec.own)
+            std::fprintf(stderr, "maya-hy4: a prompt-path read of %d tokens: the %s layout, %.0f MiB of the arena's %.0f; "
+                         "%d of its %d slots taken back (%d still lent)\n", n, pf.small ? "small" : "full",
+                         pf.used / 1048576.0, pf.arena_bytes / 1048576.0, ec.lent_from - lf0, ec.arena_end - ec.own,
+                         ec.arena_end - ec.lent_from);
+    }
     ec_drop_pending();
     hc_drop_queued();
     pf_open = true;
@@ -4157,6 +4210,7 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     st.pf_ms += now_ms() - t0;
     st.pf_tokens += n;
     st.pf_copy_gb = pf.copy_bytes / 1e9;
+    st.pf_copy_last_gb = (pf.copy_bytes - cb0) / 1e9;
     return h_logits;
 }
 
@@ -4891,7 +4945,7 @@ void Engine::Impl::pre_step(int rows) {
             return !(v && std::atoi(v) == 0);
         }();
         if (ec.arena_end > ec.own) {
-            ec.lent = true;
+            ec.lent_from = ec.own;   // (all of the arena lent again: C fills the empty ones)
             ec_fill(bg_refill);
         }
         // The prompt changed the scores, and the main cache with them: the helper follows, with more copies after a

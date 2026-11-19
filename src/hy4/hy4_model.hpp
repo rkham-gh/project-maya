@@ -112,6 +112,7 @@ public:
         double ms_total = 0, ms_cpu = 0;   // step()'s time, and the CPU lane's part of it
         long tokens = 0;
         double pf_ms = 0, pf_copy_gb = 0;  // prefill()'s time, and the expert bytes it copied to the GPU
+        double pf_copy_last_gb = 0;        // (the last prefill() call's alone)
         long pf_tokens = 0;
         long lookups = 0, hits = 0;        // step()'s routed experts, and those it found in VRAM
         long cache_slots = 0, cache_copies = 0;
