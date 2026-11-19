@@ -1942,6 +1942,17 @@ void Engine::Impl::ec_alloc() {
         }
     }
     ec.slots = (int) ec.ptr.size();
+    // (HY4_KV_CHECK, a check: the cache rows' slots' first rows, each start once - where a drafted block can meet one)
+    if (std::getenv("HY4_KV_CHECK") && std::atoi(std::getenv("HY4_KV_CHECK")) != 0) {
+        std::vector<int> starts;
+        for (int sl = ec.arena_end; sl < ec.slots; ++sl) starts.push_back(ec.kv_row[(size_t) sl]);
+        std::sort(starts.begin(), starts.end());
+        const size_t n = starts.size();
+        starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+        std::string list;
+        for (int r : starts) list += " " + std::to_string(r);
+        std::fprintf(stderr, "maya-hy4: HY4_KV_CHECK: %zu cache-row slots, their first rows:%s\n", n, list.c_str());
+    }
     ec.kv_hi = 0;
     ec.owner.assign((size_t) ec.slots, -1);
 }

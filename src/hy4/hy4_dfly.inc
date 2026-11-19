@@ -473,6 +473,17 @@ int Engine::Impl::dfly_draft(int tok, int max_n, int* out, float* conf) {
     // and a chunk's are - a slot lent from a cache's unused tail would otherwise be overwritten while an expert sits in
     // it (the review's finding 1; HY4_DFLY_NORESERVE=1, a check, leaves it out)
     static const bool no_reserve = std::getenv("HY4_DFLY_NORESERVE") && std::atoi(std::getenv("HY4_DFLY_NORESERVE")) != 0;
+    // (HY4_KV_CHECK: a block that crosses a cache-row slot's first row - that slot live or empty before the reserve)
+    static const bool kv_log = std::getenv("HY4_KV_CHECK") && std::atoi(std::getenv("HY4_KV_CHECK")) != 0;
+    if (kv_log)
+        for (int sl = ec.arena_end; sl < ec.slots; ++sl) {
+            const int r0 = ec.kv_row[(size_t) sl];
+            if (r0 >= pos && r0 < pos + kDflT)
+                std::fprintf(stderr, "maya-hy4: HY4_KV_CHECK: DFly2's block at rows %d-%d crosses slot %d's first row %d: "
+                             "%s, the reserve up to %d%s\n", pos, pos + kDflT - 1, sl, r0,
+                             ec.owner[(size_t) sl] >= 0 ? "live" : "empty", ec.kv_hi,
+                             no_reserve ? " (HY4_DFLY_NORESERVE)" : "");
+        }
     if (!no_reserve) ec_kv_reserve(pos + kDflT);
     // (HY4_KV_CHECK=1, a check: no expert left in a lent slot the block writes into)
     static const bool kv_check = std::getenv("HY4_KV_CHECK") && std::atoi(std::getenv("HY4_KV_CHECK")) != 0;
