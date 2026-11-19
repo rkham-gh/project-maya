@@ -520,6 +520,12 @@ int main(int argc, char** argv) {
             lg = eng.step(pick);
         }
         if (ldump) std::fflush(ldump);
+        if (std::getenv("HY4_VERIFY_FILLS") && std::atoi(std::getenv("HY4_VERIFY_FILLS")) != 0) {
+            long checked = 0;
+            const long bad = eng.verify_slots(&checked);
+            std::fprintf(stderr, "maya-hy4: HY4_VERIFY_FILLS: %ld settled expert slots on both cards read back, %ld differ "
+                         "from the mapping\n", checked, bad);
+        }
         const bool failed = eng.failed();   // (the run's output is cut short: not ok, so its END says so)
         if (failed) {
             std::fprintf(stderr, "maya-hy4: FAILED - a card gave up waiting for the other; reset\n");

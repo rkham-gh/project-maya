@@ -38,6 +38,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <immintrin.h>
 #include <atomic>
 #include <chrono>
@@ -715,6 +716,9 @@ struct Engine::Impl {
     // instead of a CPU copy into a staging buffer and a DMA from that.  false: the GGUF's mapping, as before
     bool xp_on = false;
     std::vector<void*> xp_bufs;
+    std::vector<std::array<const uint8_t*, 3>> xp_map;   // (a layer's gate / up / down banks in the mapping: checks)
+    void map_parts(int key, size_t off, size_t n, std::vector<std::pair<const uint8_t*, size_t>>& out) const;
+    long verify_slots(long* checked);
     bool xp_pin();
     bool pf_alloc(std::string& err);
     size_t u_kda_bytes() const;
@@ -987,6 +991,7 @@ const float* Engine::step(int token) { return p->step(token); }
 const float* Engine::step_window(const int* toks, int T) { return p->step_window(toks, T); }
 int Engine::window_max() const { return p->wTm; }
 bool Engine::dfly() const { return !p->dfl.empty(); }
+long Engine::verify_slots(long* checked) { return p->verify_slots(checked); }
 bool Engine::refilling() const { return p->ec.finflight > 0 || p->hc.fill_left > 0; }
 int Engine::dfly_draft(int tok, int max_n, int* out, float* conf) { return p->dfly_draft(tok, max_n, out, conf); }
 double Engine::dfly_ms() const { return p->dfl_ms; }
@@ -1525,6 +1530,12 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
         if (on && eg_table && eg_rows) {
             const double te = now_ms();
             const size_t bytes = (size_t) eg_rows * eg_rb, piece = (size_t) 64 << 20;
+#ifdef _WIN32
+            // (the pages asked for in large reads first: page faults alone brought them at ~2.4 GB/s)
+            WIN32_MEMORY_RANGE_ENTRY re{(PVOID) eg_table, bytes};
+            if (!PrefetchVirtualMemory(GetCurrentProcess(), 1, &re, 0))
+                std::fprintf(stderr, "maya-hy4: PrefetchVirtualMemory on Engram's table failed (%lu)\n", GetLastError());
+#endif
             std::atomic<unsigned> sink{0};
             pool->run((int) ((bytes + piece - 1) / piece), [&](int j) {
                 const volatile uint8_t* p0 = eg_table + (size_t) j * piece;
@@ -1754,6 +1765,7 @@ bool Engine::Impl::xp_pin() {
     struct Bank {
         CpuLayer* c;
         int which;   // 0 gate, 1 up, 2 down
+        int il;
         const uint8_t* src;
         size_t bytes;
         uint8_t* dst = nullptr;   // (the bank's bytes in the pinned allocation)
@@ -1766,10 +1778,11 @@ bool Engine::Impl::xp_pin() {
     for (Layer& l : L) {
         if (l.dense) continue;
         CpuLayer& c = l.cl;
+        const int il = (int) (&l - L.data());
         const size_t gb = (size_t) ff * c.rg * ne, ub = (size_t) ff * c.ru * ne, db = (size_t) E * c.rd * ne;
-        banks.push_back({&c, 0, c.gate, gb});
-        banks.push_back({&c, 1, c.up, ub});
-        banks.push_back({&c, 2, c.down, db});
+        banks.push_back({&c, 0, il, c.gate, gb});
+        banks.push_back({&c, 1, il, c.up, ub});
+        banks.push_back({&c, 2, il, c.down, db});
         total += gb + ub + db;
     }
     for (Bank& b : banks)   // (each bank's shard and offset, from its tensor)
@@ -1838,52 +1851,57 @@ bool Engine::Impl::xp_pin() {
             for (uint64_t o = a0; o < a1; o += (uint64_t) 64 << 20)
                 rds.push_back({b.file, o, b.base + (o - a0), (size_t) std::min<uint64_t>((uint64_t) 64 << 20, a1 - o)});
         }
-        std::vector<HANDLE> hs;
-        for (const std::string& fp : file_paths)
-            hs.push_back(CreateFileA(fp.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                                     FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+        std::vector<uint64_t> fsize;   // (each shard's size: a read must bring all of its range up to the end)
         std::atomic<bool> ok{true};
         std::atomic<unsigned long> rerr{0};
-        for (HANDLE h : hs)
-            if (h == INVALID_HANDLE_VALUE) ok = false, rerr = GetLastError();
+        for (const std::string& fp : file_paths) {
+            WIN32_FILE_ATTRIBUTE_DATA fa{};
+            if (!GetFileAttributesExA(fp.c_str(), GetFileExInfoStandard, &fa)) ok = false, rerr = GetLastError();
+            fsize.push_back(((uint64_t) fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
+        }
+        // (a handle a piece: I/O on one handle opened without FILE_FLAG_OVERLAPPED is serialized, OVERLAPPED offsets
+        //  or not - one read at a time, 2.4 GB/s)
         if (ok)
             pool->run((int) rds.size(), [&](int j) {
                 const Rd& r = rds[(size_t) j];
+                HANDLE h = CreateFileA(file_paths[(size_t) r.file].c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                       OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                if (h == INVALID_HANDLE_VALUE) {
+                    rerr = GetLastError();
+                    ok = false;
+                    return;
+                }
+                const uint64_t end = fsize[(size_t) r.file];
+                const size_t need = r.off >= end ? 0 : (size_t) std::min<uint64_t>(r.n, end - r.off);
                 size_t got = 0;
-                while (got < r.n && ok) {
+                while (got < need && ok) {
                     OVERLAPPED ov{};
                     const uint64_t at = r.off + got;
                     ov.Offset = (DWORD) at;
                     ov.OffsetHigh = (DWORD) (at >> 32);
                     DWORD nr = 0;
                     const DWORD want = (DWORD) std::min<size_t>(r.n - got, (size_t) 32 << 20);
-                    if (!ReadFile(hs[(size_t) r.file], r.dst + got, want, &nr, &ov) || nr == 0) {
-                        const unsigned long e = GetLastError();
-                        if (e == ERROR_HANDLE_EOF || (nr == 0 && got > 0)) break;   // (the rounded-up tail past the end)
-                        rerr = e;
+                    if (!ReadFile(h, r.dst + got, want, &nr, &ov) || nr == 0) {
+                        rerr = GetLastError();
                         ok = false;
                         break;
                     }
                     got += nr;
-                    if (nr < want) break;   // (the file's end)
                 }
+                if (got < need) ok = false;   // (a short read: the bytes the range needs did not all come)
+                CloseHandle(h);
             });
-        for (HANDLE h : hs)
-            if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
         direct = ok;
-        // (each bank's first, middle and last 4 KB against the mapping's: a read that went wrong is caught here)
+        // (the first 4 KB of every 64 MB piece of every bank against the mapping's: a read that went wrong is caught)
         if (direct)
             for (const Bank& b : banks) {
-                const size_t n4 = std::min<size_t>(4096, b.bytes), at[3] = {0, b.bytes / 2 & ~(size_t) 63,
-                                                                            b.bytes - n4};
-                for (size_t a : at)
-                    if (std::memcmp(b.dst + a, b.src + a, std::min(n4, b.bytes - a)) != 0) {
+                for (size_t a = 0; a < b.bytes && direct; a += (size_t) 64 << 20)
+                    if (std::memcmp(b.dst + a, b.src + a, std::min<size_t>(4096, b.bytes - a)) != 0) {
                         std::fprintf(stderr, "maya-hy4: an unbuffered read of the experts differs from the mapping "
                                      "(bank of %zu bytes at file offset %llu, byte %zu)\n", b.bytes,
                                      (unsigned long long) b.off, a);
                         direct = false;
                         rerr = 0;
-                        break;
                     }
                 if (!direct) break;
             }
@@ -1898,9 +1916,11 @@ bool Engine::Impl::xp_pin() {
             const Piece& pc = pieces[(size_t) j];
             std::memcpy(pc.dst, pc.src, pc.n);
         });
+    xp_map.assign(L.size(), {nullptr, nullptr, nullptr});
     for (Bank& b : banks) {
         if (!direct) trim(b.src, b.bytes);
         (b.which == 0 ? b.c->gate : b.which == 1 ? b.c->up : b.c->down) = b.dst;
+        xp_map[(size_t) b.il][(size_t) b.which] = b.src;
     }
     xp_on = true;
     double avail_gb = 0, commit_gb = 0;
@@ -2113,13 +2133,62 @@ bool Engine::Impl::verify_slot(int key, const uint8_t* ptr) const {
     std::vector<uint8_t> back(eb);
     CK(cudaMemcpy(back.data(), ptr, eb, cudaMemcpyDeviceToHost));
     std::vector<std::pair<const uint8_t*, size_t>> parts;
-    ec_src_parts(key, 0, eb, parts);
+    map_parts(key, 0, eb, parts);   // (the mapping's bytes, not the pinned copy's: the copy checked too)
     size_t at = 0;
     for (const auto& pr : parts) {
         if (std::memcmp(back.data() + at, pr.first, pr.second) != 0) return false;
         at += pr.second;
     }
     return true;
+}
+
+// ec_src_parts's ranges in the GGUF's mapping (the pinned experts' source; the same as ec_src_parts's without them)
+void Engine::Impl::map_parts(int key, size_t off, size_t n, std::vector<std::pair<const uint8_t*, size_t>>& out) const {
+    if (!xp_on) {
+        ec_src_parts(key, off, n, out);
+        return;
+    }
+    const int il = key / ec.ne, e = key % ec.ne, E = g.n_lat, ff = g.n_ff_exp;
+    const CpuLayer& c = L[(size_t) il].cl;
+    const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru, db = (size_t) E * c.rd;
+    const auto& m = xp_map[(size_t) il];
+    const std::pair<const uint8_t*, size_t> rs[3] = {
+        {m[0] + (size_t) e * gb, gb}, {m[1] + (size_t) e * ub, ub}, {m[2] + (size_t) e * db, db}};
+    size_t at = 0;
+    for (const auto& r0 : rs) {
+        const size_t a0 = std::max(off, at), a1 = std::min(off + n, at + r0.second);
+        if (a0 < a1) out.push_back({r0.first + (a0 - at), a1 - a0});
+        at += r0.second;
+    }
+}
+
+// (HY4_VERIFY_FILLS) every settled slot on both cards - its expert there and not on its way - read back against the
+// mapping, both cards synchronized first: the fills, the swaps and the workers' copies as they ended up.  The
+// mismatches; *checked the slots read
+long Engine::Impl::verify_slots(long* checked) {
+    long bad = 0, n = 0;
+    CK(cudaDeviceSynchronize());
+    for (int sl = 0; sl < ec.slots; ++sl) {
+        const int k = ec.owner[(size_t) sl];
+        if (k < 0 || ec.where[(size_t) k] != sl) continue;
+        ++n;
+        bad += !verify_slot(k, ec.ptr[(size_t) sl]);
+    }
+    if (hc.slots) {
+        int cur = 0;
+        CK(cudaGetDevice(&cur));
+        CK(cudaSetDevice(hc.dev));
+        CK(cudaDeviceSynchronize());
+        for (int sl = 0; sl < hc.slots; ++sl) {
+            const int k = hc.owner[(size_t) sl];
+            if (k < 0 || hc.where[(size_t) k] != sl || hc.busy[(size_t) sl]) continue;
+            ++n;
+            bad += !verify_slot(k, hc.ptr[(size_t) sl]);
+        }
+        CK(cudaSetDevice(cur));
+    }
+    if (checked) *checked = n;
+    return bad;
 }
 
 static bool verify_fills() {
@@ -2396,6 +2465,15 @@ void Engine::Impl::ec_src_parts(int key, size_t off, size_t n,
 // workers, while this thread waits for the GPU; ec_stage_end joins them and puts the piece's DMA on the copy stream.
 bool Engine::Impl::ec_stage_begin(size_t budget, bool wait) {
     if (!ec.defer || ec.pend_head >= ec.pend.size()) return false;
+    if (xp_on) {   // (the experts pinned: no staging buffer to wait for - ec_stage_end's DMAs straight from them; the
+                   //  copy stream keeps an expert's pieces in order)
+        EC::Pending& p0 = ec.pend[ec.pend_head];
+        ec.stage_n = std::min(budget, p0.bytes - p0.done);
+        ec.stage_parts.clear();
+        ec_src_parts(p0.key, p0.done, ec.stage_n, ec.stage_parts);
+        ec.stage_direct = true;
+        return true;
+    }
     // (wait false: none when that buffer's last DMA is still on its way - the device's routing must not block here)
     if (!wait && cudaEventQuery(ec.aev[ec.ak]) != cudaSuccess) {
         cudaGetLastError();
@@ -2407,8 +2485,7 @@ bool Engine::Impl::ec_stage_begin(size_t budget, bool wait) {
     ec.stage_n = n;
     ec.stage_parts.clear();
     ec_src_parts(p0.key, p0.done, n, ec.stage_parts);
-    ec.stage_direct = xp_on;
-    if (ec.stage_direct) return true;   // (the experts pinned: ec_stage_end's DMAs straight from them, no staging job)   // (the experts pinned: ec_stage_end's DMAs straight from them, no staging job)
+    ec.stage_direct = false;   // (the experts pinned: ec_stage_end's DMAs straight from them, no staging job)
     const auto* parts = &ec.stage_parts;   // (by pointer: the workers run the job)
     const size_t jb = (size_t) 128 << 10;
     const int nj = (int) ((n + jb - 1) / jb);
@@ -2837,19 +2914,21 @@ void Engine::Impl::hc_worker() {
         finish(k);   // (this buffer's last batch: its DMAs done before it is written again)
         uint8_t* pin = hc.wpin[k];
         size_t at = 0;
-        if (xp_on)   // (the experts pinned: straight from them)
+        if (xp_on) {   // (the experts pinned: straight from them)
             for (const auto& kv : jobs) hc_copy(kv.first, kv.second, hc.cs);
-        for (const auto& kv : xp_on ? std::vector<std::pair<int, int>>() : jobs) {
-            std::vector<std::pair<const uint8_t*, size_t>> parts;
-            const size_t eb = expert_bytes(kv.first / ec.ne);
-            ec_src_parts(kv.first, 0, eb, parts);
-            size_t o = at;
-            for (const auto& pr : parts) {
-                std::memcpy(pin + o, pr.first, pr.second);
-                o += pr.second;
+        } else {
+            for (const auto& kv : jobs) {
+                std::vector<std::pair<const uint8_t*, size_t>> parts;
+                const size_t eb = expert_bytes(kv.first / ec.ne);
+                ec_src_parts(kv.first, 0, eb, parts);
+                size_t o = at;
+                for (const auto& pr : parts) {
+                    std::memcpy(pin + o, pr.first, pr.second);
+                    o += pr.second;
+                }
+                CK(cudaMemcpyAsync(hc.ptr[(size_t) kv.second], pin + at, eb, cudaMemcpyHostToDevice, hc.cs));
+                at += eb;
             }
-            CK(cudaMemcpyAsync(hc.ptr[(size_t) kv.second], pin + at, eb, cudaMemcpyHostToDevice, hc.cs));
-            at += eb;
         }
         CK(cudaEventRecord(hc.wev[k], hc.cs));
         (void) cudaStreamQuery(hc.cs);   // (submitted now)
@@ -3155,7 +3234,8 @@ bool Engine::Impl::pf_alloc(std::string& err) {
         pre.pcap = (size_t) 64 << 20;
         bool ok = true;
         for (int i = 0; i < 2 && ok; ++i) {
-            ok = cudaHostAlloc((void**) &pre.pin[i], pre.pcap, cudaHostAllocPortable) == cudaSuccess;
+            // (the experts pinned: pre_stage's DMAs come straight from them - no staging buffers, no copy threads)
+            if (!xp_on) ok = cudaHostAlloc((void**) &pre.pin[i], pre.pcap, cudaHostAllocPortable) == cudaSuccess;
             if (ok) {
                 CK(cudaEventCreateWithFlags(&pre.pev[i], cudaEventDisableTiming));
                 CK(cudaEventCreateWithFlags(&pre.ready[i], cudaEventDisableTiming));
@@ -3168,7 +3248,7 @@ bool Engine::Impl::pf_alloc(std::string& err) {
             std::fprintf(stderr, "maya-hy4: no pinned staging for the prompt path's prefetch (off)\n");
         } else {
             CK(cudaStreamCreateWithFlags(&pre.cs, cudaStreamNonBlocking));
-            pre.pool.reset(new Pool(7));
+            if (!xp_on) pre.pool.reset(new Pool(7));
         }
     }
     const size_t gu_cols = (size_t) std::max(ffe, ffs) * 2;
@@ -3660,6 +3740,10 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
             }
             pf.copy_ms += now_ms() - tc;
             CK(cudaEventRecord(pf.gready[bi], pf.cs));
+            // (submitted now: WDDM holds a stream's work until something flushes it - the group's copies would wait for
+            //  the next sync, behind the compute they were meant to overlap; HY4_PF_FLUSH=0: not)
+            static const bool flush = !(std::getenv("HY4_PF_FLUSH") && std::atoi(std::getenv("HY4_PF_FLUSH")) == 0);
+            if (flush) (void) cudaStreamQuery(pf.cs);
             CK(cudaStreamWaitEvent(s, pf.gready[bi], 0));
         }
         for (int e = e0; e < e1; ++e) {

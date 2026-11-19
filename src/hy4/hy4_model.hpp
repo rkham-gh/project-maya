@@ -89,6 +89,8 @@ public:
     bool dfly() const;
     /// The caches' refill after a prompt is under way (HY4_BG_REFILL): tokens are slower until it is up, windows more.
     bool refilling() const;
+    /// (a check) every settled expert slot on both cards read back against the GGUF's mapping: the mismatches.
+    long verify_slots(long* checked);
     /// DFly2's drafts after tok (the newest token, at pos(), not fed yet): up to max_n (5 at most) into out, each one's
     /// confidence (its probability) into conf; their count.  -1 when it cannot draft now: no drafter, a window pending,
     /// or the row before pos() not one the target decoded and kept (after a prompt or restore() the first token steps),
