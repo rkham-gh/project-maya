@@ -698,6 +698,17 @@ struct Engine::Impl {
         unsigned* bits = nullptr;
         int *sel_on = nullptr, *icells = nullptr;
         int nwords = 0, top_pools = 0, tqi = 1;
+        // 8e: the experts a group at a time (pf_moe_group; HY4_PF_GROUPED, 1): their F16 gates, ups and downs ([GE]
+        // slots each), and a ring of per-batch metadata (the batched GEMMs' pointer arrays, the gather's row map) staged
+        // in pinned memory and copied up
+        bool grouped = false;
+        __half *GWg = nullptr, *GWu = nullptr, *GWd = nullptr;
+        static constexpr int kMeta = 8;
+        uint8_t* meta_h[kMeta] = {};
+        uint8_t* meta_d[kMeta] = {};
+        cudaEvent_t meta_ev[kMeta] = {};
+        size_t meta_bytes = 0;
+        int meta_k = 0;
     } pf;
     // The experts' copies to the GPU: the CPU lane's threads copy into two pinned buffers in turn and the DMA takes each
     // from there (the driver's own staging of pageable memory moved 4-15 GB/s on this machine; this held ~14 for
@@ -734,6 +745,8 @@ struct Engine::Impl {
     void pf_attn(Layer& l, const float* A_, const __half* Ah_, int T, int p0, float* Y_);
     void eg_row(int e, int token, int p, float* dst) const;
     void pf_moe(const Layer& l, int T);
+    void pf_moe_group(const Layer& l, int e0, int e1, const uint8_t* const* wg, const uint8_t* const* wu,
+                      const uint8_t* const* wd);
     void chunk(const int* ids, int T, bool want_logits);
     const float* prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx);
     // (HY4_PF_PREFETCH=1) A chunk of HY4_PF_PREFETCH_MIN tokens (4096) or more uses nearly every expert of every
@@ -3218,7 +3231,16 @@ bool Engine::Impl::pf_alloc(std::string& err) {
     pf.w2_elems = std::max({(size_t) ffd * E, (size_t) ffe * NL, (size_t) ffs * E});
     for (const Layer& l : L)
         if (!l.dense) pf.slot_bytes = std::max(pf.slot_bytes, expert_bytes((int) (&l - L.data())));
-    pf.GE = std::max(1, std::min(ne, o.stage));
+    pf.GE = std::max(1, std::min({ne, o.stage, 256}));   // (256: pf_moe's per-group pointer arrays)
+    pf.grouped = !(std::getenv("HY4_PF_GROUPED") && std::atoi(std::getenv("HY4_PF_GROUPED")) == 0);
+    if (pf.grouped) {   // the metadata ring: 9 pointer arrays of GE and a row map of up to a chunk's rows a batch
+        pf.meta_bytes = (size_t) 9 * pf.GE * sizeof(void*) + (size_t) Cn * sizeof(int);
+        for (int i = 0; i < PF::kMeta; ++i) {
+            pf.meta_h[i] = halloc<uint8_t>(pf.meta_bytes);
+            pf.meta_d[i] = dalloc<uint8_t>(pf.meta_bytes);
+            CK(cudaEventCreateWithFlags(&pf.meta_ev[i], cudaEventDisableTiming));
+        }
+    }
     pf.nwords = (max_pools + 31) / 32;
     pf.top_pools = g.idx_kpool ? g.idx_top_k / KP - g.idx_tail : 0;
     // the indexer's scoring tile: tokens whose [heads][pools] scores take at most HY4_IDX_MIB (256 MB)
@@ -3330,6 +3352,11 @@ bool Engine::Impl::pf_alloc(std::string& err) {
         carve(pf.P, pf.s_elems);
         carve(pf.W1, pf.w1_elems);
         carve(pf.W2, pf.w2_elems);
+        if (pf.grouped) {   // (8e: a group's F16 experts - lent to the cache with the rest between prompts)
+            carve(pf.GWg, (size_t) pf.GE * ffe * NL);
+            carve(pf.GWu, (size_t) pf.GE * ffe * NL);
+            carve(pf.GWd, (size_t) pf.GE * ffe * NL);
+        }
         part("the score / weight tiles");
         // two group buffers in turn, `stage` experts each (the copy of one group while the other's are multiplied)
         carve(pf.gbuf[0], (size_t) pf.GE * pf.slot_bytes);
@@ -3641,6 +3668,130 @@ void Engine::Impl::pf_dense(const Layer& l, int T) {
     }
 }
 
+// 8e: experts e0 .. e1 of a MoE layer for the chunk, their weights at wg / wu / wd [e - e0] (the copied ones in a buffer,
+// the cache's in its slots; the unused ones' ignored), a few launches a group instead of ~10 an expert:
+//  - their F16 rows, one f16_rows a tensor for each run of experts whose weights lie one after another (a buffer's),
+//    one an expert otherwise, into slot e - e0 of GWg / GWu / GWd;
+//  - each expert's rows padded to a bucket (powers of two from 16; past the chunk's rows, multiples of 16), the buckets
+//    in batches of at most a chunk's rows: one gather of the batch's input rows (gather_map_f16, zeros for padding),
+//    one batched GEMM a bucket for the gates, one for the ups, the SwiGLU of the batch, one batched GEMM a bucket for
+//    the downs;
+//  - each expert's scatter_add into YL as before, in ascending order within the batch (an expert's sum in order).
+void Engine::Impl::pf_moe_group(const Layer& l, int e0, int e1, const uint8_t* const* wg, const uint8_t* const* wu,
+                                const uint8_t* const* wd) {
+    const int NL = g.n_lat, ff = g.n_ff_exp, Cn = pf.C;
+    const CpuLayer& c = l.cl;
+    const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru, db = (size_t) NL * c.rd, se = (size_t) ff * NL;
+    auto deq = [&](int type, const uint8_t* const* w, size_t wb, int k, int n, __half* dst) {
+        for (int e = e0; e < e1;) {
+            if (!pf.h_cnt[e]) {
+                ++e;
+                continue;
+            }
+            int last = e;
+            for (int f = e + 1; f < e1; ++f) {
+                if (!pf.h_cnt[f]) continue;
+                if (w[f - e0] != w[e - e0] + (size_t) (f - e) * wb) break;
+                last = f;
+            }
+            if (!iq::f16_rows(type, w[e - e0], k, n * (last - e + 1), (uint16_t*) (dst + (size_t) (e - e0) * se), k, s)) {
+                std::fprintf(stderr, "maya-hy4: no F16 rows for the experts' type %d\n", type);
+                std::abort();
+            }
+            e = last + 1;
+        }
+    };
+    deq(c.tg, wg, gb, NL, ff, pf.GWg);
+    deq(c.tu, wu, ub, NL, ff, pf.GWu);
+    deq(c.td, wd, db, ff, NL, pf.GWd);
+    struct Ex {
+        int e, m, mp;
+    };
+    std::vector<Ex> xs;
+    for (int e = e0; e < e1; ++e) {
+        const int m = pf.h_cnt[e];
+        if (!m) continue;
+        int mp = 16;
+        while (mp < m) mp <<= 1;
+        if (mp > Cn) mp = (m + 15) & ~15;
+        xs.push_back({e, m, mp});
+    }
+    std::stable_sort(xs.begin(), xs.end(), [](const Ex& a, const Ex& b) { return a.mp < b.mp; });
+    const float one = 1.0f, zero = 0.0f;
+    for (size_t i0 = 0; i0 < xs.size();) {
+        size_t i1 = i0;
+        int R = 0;
+        while (i1 < xs.size() && R + xs[i1].mp <= Cn) R += xs[i1++].mp;
+        const int nb = (int) (i1 - i0);
+        // the batch's metadata: 9 pointer arrays (gate A B C, up A B C, down A B C) of nb, then the row map of R
+        const int k = pf.meta_k;
+        pf.meta_k = (pf.meta_k + 1) % PF::kMeta;
+        CK(cudaEventSynchronize(pf.meta_ev[k]));   // (that slot's last copy up is done)
+        const void** ph = (const void**) pf.meta_h[k];
+        const void** pd = (const void**) pf.meta_d[k];
+        int* map_h = (int*) (pf.meta_h[k] + (size_t) 9 * pf.GE * sizeof(void*));
+        const int* map_d = (const int*) (pf.meta_d[k] + (size_t) 9 * pf.GE * sizeof(void*));
+        std::vector<int> roff((size_t) nb);
+        int at = 0;
+        for (int j = 0; j < nb; ++j) {
+            const Ex& x = xs[i0 + (size_t) j];
+            roff[(size_t) j] = at;
+            const int o0 = pf.h_off[x.e];
+            for (int r = 0; r < x.mp; ++r) map_h[at + r] = r < x.m ? o0 + r : -1;
+            const size_t sl = (size_t) (x.e - e0);
+            ph[0 * nb + j] = pf.GWg + sl * se;
+            ph[1 * nb + j] = pf.Xe + (size_t) at * NL;
+            ph[2 * nb + j] = pf.GU + (size_t) at * 2 * ff;
+            ph[3 * nb + j] = pf.GWu + sl * se;
+            ph[4 * nb + j] = pf.Xe + (size_t) at * NL;
+            ph[5 * nb + j] = pf.GU + (size_t) at * 2 * ff + ff;
+            ph[6 * nb + j] = pf.GWd + sl * se;
+            ph[7 * nb + j] = pf.He + (size_t) at * ff;
+            ph[8 * nb + j] = pf.Ye + (size_t) at * NL;
+            at += x.mp;
+        }
+        CK(cudaMemcpyAsync(pf.meta_d[k], pf.meta_h[k], (size_t) 9 * pf.GE * sizeof(void*) + (size_t) R * sizeof(int),
+                           cudaMemcpyHostToDevice, s));
+        CK(cudaEventRecord(pf.meta_ev[k], s));
+        k::gather_map_f16(pf.LATh, NL, pf.list, map_d, R, NL, pf.Xe, s);
+        // the buckets: runs of the batch with one padded size
+        auto buckets = [&](auto&& fn) {
+            for (int j = 0; j < nb;) {
+                int j1 = j;
+                while (j1 < nb && xs[i0 + (size_t) j1].mp == xs[i0 + (size_t) j].mp) ++j1;
+                fn(j, j1 - j, xs[i0 + (size_t) j].mp);
+                j = j1;
+            }
+        };
+        auto gemm_b = [&](int a, int j, int n, int mp, int nout, int kk, int ldw, int ldx, int ldy) {
+            const cublasStatus_t r = cublasGemmBatchedEx(
+                pf.cb, CUBLAS_OP_T, CUBLAS_OP_N, nout, mp, kk, &one, pd + (size_t) (a + 0) * nb + j, CUDA_R_16F, ldw,
+                pd + (size_t) (a + 1) * nb + j, CUDA_R_16F, ldx, &zero, (void* const*) (pd + (size_t) (a + 2) * nb + j),
+                CUDA_R_32F, ldy, n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+            if (r != CUBLAS_STATUS_SUCCESS) {
+                std::fprintf(stderr, "maya-hy4: cuBLAS batched GEMM %d x (%dx%dx%d) failed (%d)\n", n, mp, nout, kk, (int) r);
+                std::abort();
+            }
+        };
+        buckets([&](int j, int n, int mp) {
+            gemm_b(0, j, n, mp, ff, NL, NL, NL, 2 * ff);   // the gates: GU[:, 0:ff]
+            gemm_b(3, j, n, mp, ff, NL, NL, NL, 2 * ff);   // the ups: GU[:, ff:2ff]
+        });
+        k::swiglu_rows(pf.GU, R, ff, l.clamp_exp, pf.He, s);
+        buckets([&](int j, int n, int mp) { gemm_b(6, j, n, mp, NL, ff, ff, ff, NL); });   // the downs: Ye
+        // the experts' sums into YL, in ascending order
+        std::vector<int> ord((size_t) nb);
+        for (int j = 0; j < nb; ++j) ord[(size_t) j] = j;
+        std::sort(ord.begin(), ord.end(), [&](int a, int b) { return xs[i0 + (size_t) a].e < xs[i0 + (size_t) b].e; });
+        for (int j : ord) {
+            const Ex& x = xs[i0 + (size_t) j];
+            const int o0 = pf.h_off[x.e];
+            k::scatter_add(pf.Ye + (size_t) roff[(size_t) j] * NL, pf.list + o0, pf.wl + o0, x.m, NL, pf.YL, s);
+        }
+        i0 = i1;
+    }
+}
+
 // A MoE layer for the chunk: Y = routed_up(the routed experts' sum, in the latent width), Y2 = the shared expert's
 void Engine::Impl::pf_moe(const Layer& l, int T) {
     const int E = g.n_embd, NL = g.n_lat, ne = g.n_expert, nu = g.n_used, ff = g.n_ff_exp, ffs = g.n_ff_sh;
@@ -3685,6 +3836,8 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
         gemm(pf.He, ff, pf.W2, ff, pf.Ye, NL, rows, NL, ff);
         k::scatter_add(pf.Ye, pf.list + o0, pf.wl + o0, rows, NL, pf.YL, s);
     };
+    // (HY4_PF_REV=1, a check: the per-expert path's experts in reverse order - the order-only floor 8e is held to)
+    static const bool rev = std::getenv("HY4_PF_REV") && std::atoi(std::getenv("HY4_PF_REV")) != 0;
     if (pre.active) {
         const int b = (il - g.n_dense) & 1;
         {
@@ -3693,11 +3846,26 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
         }
         CK(cudaStreamWaitEvent(s, pre.ready[b], 0));
         const uint8_t* B = pre.buf[b];
-        for (int e = 0; e < ne; ++e) {
-            if (pf.h_cnt[e] == 0) continue;
-            const uint8_t* blob = ec_blob(il, e);
-            experts(e, blob ? blob : B + (size_t) e * gb, blob ? blob + gb : B + (size_t) ne * gb + (size_t) e * ub,
-                    blob ? blob + gb + ub : B + (size_t) ne * (gb + ub) + (size_t) e * db);
+        if (pf.grouped) {   // (8e: a group of GE at a time)
+            std::vector<const uint8_t*> wg((size_t) GE), wu((size_t) GE), wd((size_t) GE);
+            for (int e0 = 0; e0 < ne; e0 += GE) {
+                const int e1 = std::min(ne, e0 + GE);
+                for (int e = e0; e < e1; ++e) {
+                    const uint8_t* blob = ec_blob(il, e);
+                    wg[(size_t) (e - e0)] = blob ? blob : B + (size_t) e * gb;
+                    wu[(size_t) (e - e0)] = blob ? blob + gb : B + (size_t) ne * gb + (size_t) e * ub;
+                    wd[(size_t) (e - e0)] = blob ? blob + gb + ub : B + (size_t) ne * (gb + ub) + (size_t) e * db;
+                }
+                pf_moe_group(l, e0, e1, wg.data(), wu.data(), wd.data());
+            }
+        } else {
+            for (int ei = 0; ei < ne; ++ei) {
+                const int e = rev ? ne - 1 - ei : ei;
+                if (pf.h_cnt[e] == 0) continue;
+                const uint8_t* blob = ec_blob(il, e);
+                experts(e, blob ? blob : B + (size_t) e * gb, blob ? blob + gb : B + (size_t) ne * gb + (size_t) e * ub,
+                        blob ? blob + gb + ub : B + (size_t) ne * (gb + ub) + (size_t) e * db);
+            }
         }
         CK(cudaEventRecord(pre.freed[b], s));
         {
@@ -3746,7 +3914,23 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
             if (flush) (void) cudaStreamQuery(pf.cs);
             CK(cudaStreamWaitEvent(s, pf.gready[bi], 0));
         }
-        for (int e = e0; e < e1; ++e) {
+        if (pf.grouped) {   // (8e)
+            const uint8_t* wg[256];
+            const uint8_t* wu[256];
+            const uint8_t* wd[256];
+            for (int e = e0; e < e1; ++e) {
+                const uint8_t* blob = ec_blob(il, e);
+                const size_t at = (size_t) (e - e0);
+                wg[at] = blob ? blob : B + at * gb;
+                wu[at] = blob ? blob + gb : B + GE * gb + at * ub;
+                wd[at] = blob ? blob + gb + ub : B + GE * (gb + ub) + at * db;
+            }
+            pf_moe_group(l, e0, e1, wg, wu, wd);
+            if (bi >= 0) CK(cudaEventRecord(pf.gfreed[bi], s));
+            continue;
+        }
+        for (int ei = e0; ei < e1; ++ei) {
+            const int e = rev ? e1 - 1 - (ei - e0) : ei;
             const int rows = pf.h_cnt[e], o0 = pf.h_off[e];
             if (rows == 0) continue;
             const uint8_t* blob = ec_blob(il, e);

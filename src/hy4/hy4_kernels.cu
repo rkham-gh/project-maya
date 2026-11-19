@@ -2316,6 +2316,23 @@ void argmax_prob(const float* l, int n, int* tok, float* prob, float* scratch, c
     argmax_part_kernel<<<kAmB, 256, 0, s>>>(l, n, pm, pi, ps);
     argmax_join_kernel<<<1, kAmB, 0, s>>>(pm, pi, ps, tok, prob);
 }
+// grid R, block 128: the prompt path's grouped experts' input rows - dst[r] = x[list[map[r]]] (k F16 values, x ldx
+// apart), zeros where map[r] < 0 (a bucket's padding)
+__global__ void gather_map_f16_kernel(const __half* __restrict__ x, int ldx, const int* __restrict__ list,
+                                      const int* __restrict__ map, int k, __half* __restrict__ dst) {
+    const int r = blockIdx.x, m = map[r];
+    __half* d = dst + (size_t) r * k;
+    if (m < 0) {
+        for (int c = threadIdx.x; c < k; c += blockDim.x) d[c] = __float2half(0.0f);
+        return;
+    }
+    const __half* sr = x + (size_t) list[m] * ldx;
+    for (int c = threadIdx.x; c < k; c += blockDim.x) d[c] = sr[c];
+}
+void gather_map_f16(const __half* x, int ldx, const int* list, const int* map, int R, int k, __half* dst,
+                    cudaStream_t s) {
+    if (R > 0) gather_map_f16_kernel<<<R, 128, 0, s>>>(x, ldx, list, map, k, dst);
+}
 void gate_add(float* x, const float* g, const float* y, int n, cudaStream_t s) {
     gate_add_kernel<<<blocks(n, 256), 256, 0, s>>>(x, g, y, n);
 }

@@ -308,6 +308,10 @@ void dfly_cells(const int* src, const int* src_n, size_t src_ld, int nl, const i
 /// *tok = the first index of the largest of n logits, *prob its softmax probability; scratch: 3 x 128 floats (two
 /// stages; null: one block).
 void argmax_prob(const float* l, int n, int* tok, float* prob, float* scratch, cudaStream_t s);
+/// The prompt path's grouped experts: dst[r] = x[list[map[r]]] for r < R (rows of k F16 values, x ldx apart), zeros
+/// where map[r] < 0.
+void gather_map_f16(const __half* x, int ldx, const int* list, const int* map, int R, int k, __half* dst,
+                    cudaStream_t s);
 /// x += g y (elementwise, n values): mtp_fusion's gated add.
 void gate_add(float* x, const float* g, const float* y, int n, cudaStream_t s);
 
