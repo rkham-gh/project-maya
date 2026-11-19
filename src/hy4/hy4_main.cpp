@@ -32,7 +32,7 @@
 //
 // The prompt goes through the prompt path (Engine::prefill: chunks of --chunk tokens, default 8192, on the GPU with the
 // routed experts streamed to it through --stage VRAM slots); --step reads it a token at a time instead (and prompts
-// under HY4_MIN_CHUNK tokens, 256, take the token path anyway).
+// under HY4_MIN_CHUNK tokens, 512, take the token path anyway - in windows).
 //
 // --ids: comma- or whitespace-separated token ids, or @FILE holding them.  --gen: greedy tokens after the prompt, each
 // printed with the top --top (default 5) as id:log-probability (for a comparison with llama.cpp's).  --follow: the
@@ -339,7 +339,9 @@ int main(int argc, char** argv) {
         //  window, a line a token (" d" after one that was a kept draft), the drafts' acceptance by position at the
         //  end)
         static const bool rdfly = std::getenv("HY4_RUNS_DFLY") && std::atoi(std::getenv("HY4_RUNS_DFLY")) != 0;
-        if (rdfly && follow.empty() && eng.dfly() && eng.window_max() >= 2) {
+        // (HY4_RUNS_DFLY_T=1 runs it without a drafter too: plain steps, the same accounting)
+        static const bool rplain = std::getenv("HY4_RUNS_DFLY_T") && std::atoi(std::getenv("HY4_RUNS_DFLY_T")) == 1;
+        if (rdfly && follow.empty() && ((eng.dfly() && eng.window_max() >= 2) || rplain)) {
             int n = 1;
             long rounds = 0, wins = 0, off[8] = {}, acc[8] = {};
             long cb_n[10] = {}, cb_a[10] = {}, c2_n[10] = {}, c2_a[10] = {};   // (held by confidence tenths)
@@ -603,12 +605,15 @@ int main(int argc, char** argv) {
     strata::spec::DraftPolicy dcost(std::max(1, wmax));
     int ddr[8];
     float dconf[8];
-    // DFly2's rest: the tokens a millisecond of the rounds that drafted and of plain rounds (decayed sums, over the
-    // engine's life); when drafting does worse over kDfJudge rounds, kDfRest rounds without it, then it is tried again.
-    // Plain rounds come from the rest, the first token after a prompt, and a probe every kDfProbe rounds
+    // DFly2's rest: the tokens a millisecond of the rounds that drafted and of plain rounds (decayed sums over the
+    // engine's life, by DraftPolicy's depth bands: < 8K, < 64K, longer - a token costs more deep, and a plain rate from
+    // another depth would judge drafting wrongly for hundreds of rounds); when drafting does worse over kDfJudge rounds,
+    // kDfRest rounds without it, then it is tried again.  Plain rounds come from the rest, the first token after a
+    // prompt, and a probe every kDfProbe rounds
     constexpr int kDfJudge = 16, kDfRest = 48, kDfProbe = 32;
-    double df_tok = 0, df_ms = 0, pl_tok = 0, pl_ms = 0;
-    int df_n = 0, df_tlast = 1;
+    double df_tok[3] = {}, df_ms[3] = {}, pl_tok[3] = {}, pl_ms[3] = {};
+    int df_n[3] = {}, df_tlast = 1;
+    auto band_of = [](size_t pos) { return pos < 8192 ? 0 : pos < 65536 ? 1 : 2; };
     long long df_rests = 0;
     std::vector<int32_t> dbuf((size_t) std::max(1, wmax));
     std::vector<int> wtoks((size_t) std::max(1, wmax));
@@ -627,7 +632,8 @@ int main(int argc, char** argv) {
         int lk_on = lk_min > 0 && wmax >= 2 ? 1 : 0, wcap = wmax;
         int df_on = df_have ? 1 : 0;   // (dfly=0|1; spec=1: no drafting at all, spec=N: windows of N at most)
         // (lookup_trust=0|1, server.py's strata_tune key: a long trusted lookup match verified without DFly2's draft;
-        //  HY4_LOOKUP_TRUST, 0: on code edits DFly2's own windows held as well and longer - 90.4 vs 83.9 tok/s)
+        //  HY4_LOOKUP_TRUST, 0: on code edits trusted lookups took the place of DFly2's longer windows - a first
+        //  measurement, its order not rotated; see test-results/2026-11-18-hy4/NOTES.md)
         static const int trust_env = std::getenv("HY4_LOOKUP_TRUST") ? std::atoi(std::getenv("HY4_LOOKUP_TRUST")) : 0;
         int lk_trust = trust_env != 0;
         std::vector<std::string> fields;
@@ -749,18 +755,19 @@ int main(int argc, char** argv) {
         // count for neither); drafting worse over kDfJudge rounds - a rest
         auto df_judge = [&](bool drafted, int tok_n, double ms) {
             if (!df_on) return;
+            const int b = band_of(hist.size());
             if (drafted) {
-                df_tok = 0.95 * df_tok + tok_n;
-                df_ms = 0.95 * df_ms + ms;
-                if (++df_n >= kDfJudge && pl_ms > 0 && df_tok / df_ms < pl_tok / pl_ms) {
+                df_tok[b] = 0.95 * df_tok[b] + tok_n;
+                df_ms[b] = 0.95 * df_ms[b] + ms;
+                if (++df_n[b] >= kDfJudge && pl_ms[b] > 0 && df_tok[b] / df_ms[b] < pl_tok[b] / pl_ms[b]) {
                     df_rest = kDfRest;
-                    df_n = 0;
-                    df_tok = df_ms = 0;
+                    df_n[b] = 0;
+                    df_tok[b] = df_ms[b] = 0;
                     ++df_rests;
                 }
             } else if (tok_n == 1) {
-                pl_tok = 0.9 * pl_tok + 1;
-                pl_ms = 0.9 * pl_ms + ms;
+                pl_tok[b] = 0.9 * pl_tok[b] + 1;
+                pl_ms[b] = 0.9 * pl_ms[b] + ms;
             }
         };
         int end = finish == "cancel" || max_new <= 0 || !lg ? 1 : 0;

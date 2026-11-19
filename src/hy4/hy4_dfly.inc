@@ -324,9 +324,12 @@ bool Engine::Impl::dfly_load(const std::string& path, std::string& err) {
         dfl_embd = embd.w;
     }
     if (o.verbose)
-        std::fprintf(stderr, "maya-hy4: DFly2 drafter (%s): %d layers over target layers %d..%d, %s, loaded in %.1f s\n",
+        std::fprintf(stderr,
+                     "maya-hy4: DFly2 drafter (%s): %d layers over target layers %d..%d, %s, loaded in %.1f s; the "
+                     "embedding table %s (%.0f MiB)\n",
                      path.c_str(), kDflL, kDflTgt0, kDflTgt0 + kDflTgtStep * (kDflL - 1),
-                     dfl[0].q_a.type == 8 ? "Q8_0" : "BF16", (now_ms() - t0) / 1000.0);
+                     dfl[0].q_a.type == 8 ? "Q8_0" : "BF16", (now_ms() - t0) / 1000.0,
+                     embd_host ? "pinned and mapped" : "in VRAM already", (double) g.vocab * embd.rb / 1048576.0);
     return true;
 }
 

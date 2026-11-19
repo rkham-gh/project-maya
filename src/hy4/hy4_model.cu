@@ -3537,11 +3537,35 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     const double t0 = now_ms();
     const float* lg = nullptr;
     // a short prompt (a turn's few new tokens): the token path's experts on the CPU beat copying the ones it chooses
-    // (HY4_MIN_CHUNK)
-    int min_chunk = 256;
+    // (HY4_MIN_CHUNK, 512: in windows a turn - its first token and 100 answer tokens - beats the prompt path's up to
+    // ~550-600 new tokens fresh and after 32K alike: no refill after it, and the answer drafts from its first token)
+    int min_chunk = 512;
     if (const char* v = std::getenv("HY4_MIN_CHUNK")) min_chunk = std::max(1, std::atoi(v));
     if (n < min_chunk) {
-        for (int i = 0; i < n && (i == 0 || lg); ++i) lg = step(ids[i]);   // (nullptr: failed())
+        // in windows of wTm, every row kept (a prompt's tokens are known): the dense set read once a window, the CPU
+        // lane a window's experts at once; a last single token a step.  The arena stays lent (no refill after it) and
+        // the last row is DFly2's source.  HY4_PROMPT_WINDOWS=0: token by token, as before
+        static const bool pw = !(std::getenv("HY4_PROMPT_WINDOWS") && std::atoi(std::getenv("HY4_PROMPT_WINDOWS")) == 0);
+        for (int i = 0; i < n;) {
+            const int T = pw ? std::min(wTm, n - i) : 1;
+            if (T >= 2) {
+                const float* lw = step_window(ids + i, T);
+                if (!lw) {
+                    if (fault) return nullptr;
+                    lg = step(ids[i]);   // (a window that does not fit: the token path)
+                    if (!lg) return nullptr;
+                    ++i;
+                    continue;
+                }
+                window_keep(T);
+                lg = lw + (size_t) (T - 1) * g.vocab;
+                i += T;
+            } else {
+                lg = step(ids[i]);
+                if (!lg) return nullptr;   // (failed())
+                ++i;
+            }
+        }
         if (progress) progress(ctx, n);
         return lg;
     }
