@@ -1027,6 +1027,29 @@ struct Engine::Impl {
             th.join();
         }
     } hp;
+    // (8b, a check - off by default) The helper card held busy while a prompt-path read runs, so its share is not
+    // computed at its idle clocks (after 10 s idle its first layers' jobs ran ~5x slower: item8f/setW): a thread keeps
+    // two short keep-alive kernels (one warp asleep, KA_MS each) queued on a lowest-priority stream of the helper from
+    // the read's start to its end - the first token - or on any return from prefill.  HY4_PF_KEEPALIVE=1 turns it on;
+    // HY4_PF_KEEPALIVE_LINGER_S=N keeps it going N s past each written token too (through the writing and the gaps
+    // between turns: in effect HY4_HELPER_KEEPALIVE with a time limit).
+    struct HKA {
+        bool on = false;
+        double linger_ms = 0;
+        cudaStream_t s = nullptr;
+        cudaEvent_t ev[2] = {nullptr, nullptr};
+        std::atomic<bool> reading{false};
+        std::atomic<double> until{0.0};   // (now_ms() up to which the linger holds it)
+        std::thread th;
+        std::atomic<bool> quit{false};
+        long launched = 0;
+        ~HKA() {
+            if (!th.joinable()) return;
+            quit = true;
+            th.join();
+        }
+    } ka;
+    void ka_loop();
     void hp_alloc();
     void hp_worker();
     void hp_collect(int b);
@@ -2802,6 +2825,21 @@ void Engine::Impl::hp_alloc() {
     }
     hp.on = hpv != 2;
     hp.th = std::thread([this] { hp_worker(); });
+    if (const char* v = std::getenv("HY4_PF_KEEPALIVE"); v && std::atoi(v) != 0) {
+        int lo = 0, hi = 0;
+        if (const char* w = std::getenv("HY4_PF_KEEPALIVE_LINGER_S")) ka.linger_ms = std::max(0.0, std::atof(w)) * 1000.0;
+        if (cudaDeviceGetStreamPriorityRange(&lo, &hi) == cudaSuccess &&
+            cudaStreamCreateWithPriority(&ka.s, cudaStreamNonBlocking, lo) == cudaSuccess) {
+            CK(cudaEventCreateWithFlags(&ka.ev[0], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&ka.ev[1], cudaEventDisableTiming));
+            ka.on = true;
+            ka.th = std::thread([this] { ka_loop(); });
+            std::fprintf(stderr, "maya-hy4: HY4_PF_KEEPALIVE: the helper card held busy through prompt-path reads%s\n",
+                         ka.linger_ms > 0 ? " and a linger past each written token" : "");
+        } else {
+            cudaGetLastError();
+        }
+    }
     std::fprintf(stderr, "maya-hy4: %sthe helper card computes the prompt path's experts it holds (%.0f MiB of its "
                  "VRAM, %.0f MiB pinned)\n", hp.on ? "" : "(HY4_PF_HELPER=2: not used) ", dev / 1048576.0, 2.0 * C * (NL * 6 + nu * 8) / 1048576.0);
 }
@@ -2897,6 +2935,33 @@ void Engine::Impl::hp_collect(int b) {
     std::fprintf(hp.log, "%ld,%d,%d,%d,%d,%ld,%d,%ld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", m.seq, m.il, m.T, m.pos, m.n3,
                  m.R3, m.n5, m.R5, d2h, in3, comp3, out3, own, stall, h2d);
     std::fflush(hp.log);
+}
+
+// (HY4_PF_KEEPALIVE) while a read runs, or the linger holds: two keep-alive kernels of 5 ms kept queued on the helper
+void Engine::Impl::ka_loop() {
+    CK(cudaSetDevice(hc.dev));
+    const unsigned long long ns = 5000000ull;
+    bool rec[2] = {false, false};
+    int k = 0;
+    while (!ka.quit) {
+        const bool want = ka.reading || (ka.linger_ms > 0 && now_ms() < ka.until.load());
+        if (!want) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+        for (int i = 0; i < 2; ++i) {   // (each slot whose kernel has ended: the next one)
+            const int b = (k + i) & 1;
+            if (rec[b] && cudaEventQuery(ka.ev[b]) != cudaSuccess) continue;
+            cudaGetLastError();
+            k::keepalive(ns, ka.s);
+            CK(cudaEventRecord(ka.ev[b], ka.s));
+            rec[b] = true;
+            ++ka.launched;
+        }
+        (void) cudaStreamQuery(ka.s);   // (submitted now)
+        k ^= 1;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }
 
 void Engine::Impl::hc_alloc() {
@@ -4497,6 +4562,12 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     const double cb0 = pf.copy_bytes;
     hp.experts = 0;
     hp.saved = hp.xfer = 0;
+    // (HY4_PF_KEEPALIVE: the helper held busy until this returns, whichever way)
+    struct KaGuard {
+        HKA& k;
+        explicit KaGuard(HKA& k0) : k(k0) { if (k.on) k.reading = true; }
+        ~KaGuard() { k.reading = false; }
+    } ka_guard(ka);
     pf_layout(n);   // (8c: a read under the prefetch's min_T takes only the arena's start)
     {
         const int lf0 = ec.lent_from;
@@ -5265,6 +5336,7 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
 // The work before a token (rows 1) or a window (rows T): the cache rows they write reserved, the first one after a
 // prompt's refills, the token path's graphs, the helper's keep-alive
 void Engine::Impl::pre_step(int rows) {
+    if (ka.on && ka.linger_ms > 0) ka.until = now_ms() + ka.linger_ms;   // (HY4_PF_KEEPALIVE_LINGER_S)
     ec_kv_reserve(pos + rows);   // (before the first token's fill: it takes no slot about to be reserved)
     if (pf_open) {   // the first token after a prompt: the prompt path's buffers lent to the cache again, and filled
         pf_open = false;
