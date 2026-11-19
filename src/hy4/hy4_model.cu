@@ -3936,6 +3936,8 @@ bool Engine::Impl::pf_alloc(std::string& err) {
     }
     pf.h_ids = halloc<int>(Cn);
     pf.h_cnt = halloc<int>(ne);
+    // (HY4_PF_QMAX, a check: its two counters here - a device allocation after the load is refused)
+    if (std::getenv("HY4_PF_QMAX") && std::atoi(std::getenv("HY4_PF_QMAX")) != 0) pf.qmax = dalloc<unsigned>(2);
     pf.h_off = halloc<int>(ne + 1);
     if (cd) pf.h_egr = halloc<float>((size_t) Ca * cd);
     const char* pg = std::getenv("HY4_PF_PAGEABLE");
@@ -4287,13 +4289,7 @@ void Engine::Impl::pf_attn(Layer& l, const float* A_, const __half* Ah_, int T, 
     // (HY4_PF_QMAX=1, a check - the review's finding 9: the prompt path's queries go to F16 unscaled, so their largest
     //  |q| against F16's 65,504 - before the conversion, and in Qcat after k_b - printed after each read)
     static const bool qmx = std::getenv("HY4_PF_QMAX") && std::atoi(std::getenv("HY4_PF_QMAX")) != 0;
-    if (qmx) {
-        if (!pf.qmax) {
-            pf.qmax = dalloc<unsigned>(2);
-            CK(cudaMemsetAsync(pf.qmax, 0, 2 * sizeof(unsigned), s));
-        }
-        k::absmax(pf.Q, (size_t) T * H * QK, pf.qmax, s);
-    }
+    if (qmx && pf.qmax) k::absmax(pf.Q, (size_t) T * H * QK, pf.qmax, s);   // (pf.qmax: at the load, pf_alloc)
     k::to_f16(pf.Q, pf.QH, (size_t) T * H * QK, s);
     // q's nope part through k_b a head: Qcat[t][h][0:512] (F16), its rope part after it
     f16w(l.k_b, pf.W1);   // [H][512][nope]
@@ -4302,7 +4298,7 @@ void Engine::Impl::pf_attn(Layer& l, const float* A_, const __half* Ah_, int T, 
                                          CUDA_R_16F, H * 576, 576, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
               "k_b batch");
     k::qpe_f16(pf.Q, pf.Qcat, T, H, QK, nope, p0, l.theta_scale, s);
-    if (qmx) k::absmax(pf.Qcat, (size_t) T * H * 576, pf.qmax + 1, s);
+    if (qmx && pf.qmax) k::absmax(pf.Qcat, (size_t) T * H * 576, pf.qmax + 1, s);
     if (l.idx) pf_index(l, A_, Ah_, T, p0);
     // the keys: a sliding-window layer's from its ring (the window before the piece) and the piece's own, in one
     // buffer from position kb0; a sparse layer's its cache
