@@ -992,6 +992,7 @@ struct Engine::Impl {
             long seq = 0;
             std::vector<int> e, cnt, off;
             std::vector<const uint8_t*> blob;
+            bool steal = false;   // (8b+: a region to take - hp.rg)
         };
         std::thread th;
         std::mutex mu;
@@ -1010,6 +1011,37 @@ struct Engine::Impl {
         // 7.09 / 10.53 gated).  gated: this chunk's.
         int depth = 16384, depth_T = 8192;
         bool gated = false;
+        // 8b+ (HY4_PF_SPLIT: 1 on, 2 fixed, 0 off) - a read under min_T is copy-bound on the 5090's link while the
+        // 3090's carries only its job's rows; host memory feeds both at once (28.9 + 13.4 GB/s, item8/bw.cu).  So the
+        // 3090 also takes part of the used experts in neither cache: at the job's start a region - the top
+        // HY4_PF_SPLIT_FRAC (0.15) of them by id, at most the staging's (HY4_PF_SPLIT_MB, 192) - is its; a thread of
+        // its own copies the region's experts top down from the job's start, two batches in flight, each sized from
+        // the last one's time (~1.5 ms, at most 8), from the pinned experts into the staging on a stream of its own
+        // while the residents' launches go up; the worker computes them after the residents, in descending id order.
+        // The 5090 claims its groups paced by its copies (a host wait on the group buffer two back) and takes back,
+        // from the region's bottom, experts the 3090 has not claimed yet when it gets there; the 3090 stops claiming
+        // once the 5090 is within one of its batches.  Warm, the 3090 is mostly through its region first (7-55
+        // take-backs a read of ~1,000-1,270 at 0.15; item8f/setS3), but a run does not repeat bit for bit.  2: the
+        // whole region the 3090's from the start, no take-backs, bit-reproducible (the numerics' reference - not
+        // the route: a cold 3090 would hold the 5090 up).
+        int split = 1, bmax = 8;
+        double split_frac = 0.15, tb_ms = 1.5, rate3 = 13.0e9, last_tb = 1.5e-3;
+        size_t stage_bytes = (size_t) 192 << 20;
+        uint8_t* stage = nullptr;
+        cudaStream_t cs = nullptr;    // (the 3090's: the region's copies)
+        cudaEvent_t bev = nullptr, cev = nullptr, bev2[2] = {nullptr, nullptr};
+        struct Region {
+            std::mutex mu;
+            bool on = false, fixed = false;
+            int il = -1, n = 0, r_lo = 0, lo = 0, next = 0, takebacks = 0;
+            size_t eb = 0;
+            std::vector<int> e, cnt, off, idx;   // (the layer's used experts in neither cache, by id; idx: e -> index)
+            std::atomic<int> p5{0};              // (the 5090's next index in e)
+        } rg;
+        // (a read's) the region's experts and bytes, the 3090's claimed ones, take-backs, its copies' bytes / ms, the
+        // 5090's claim lead (groups whose copy was not done yet when it claimed the next), layers split
+        long sp_region = 0, sp_claimed = 0, sp_tb = 0, sp_layers = 0, lead_n = 0, lead_busy = 0;
+        double sp_bytes = 0, sp_ms = 0;
         // (HY4_PF_HELPER_LOG=<file>: a CSV line a job - its rows on each card and its times by phase, from timing
         //  events made and recorded only then)
         FILE* log = nullptr;
@@ -1019,6 +1051,8 @@ struct Engine::Impl {
             long seq = 0;
             int il = 0, T = 0, pos = 0, n3 = 0, n5 = 0;
             long R3 = 0, R5 = 0;
+            int ns = 0, ntb = 0;   // (8b+: the region's experts the 3090 computed, take-backs)
+            double cms = 0;        // (its copies' ms)
         } meta[2];
         ~HPF() {
             if (!th.joinable()) return;
@@ -2771,6 +2805,11 @@ void Engine::Impl::hp_alloc() {
     if (hpv == 0) return;
     if (const char* v = std::getenv("HY4_PF_HELPER_DEPTH")) hp.depth = std::max(0, std::atoi(v));
     if (const char* v = std::getenv("HY4_PF_HELPER_DEPTH_T")) hp.depth_T = std::max(0, std::atoi(v));
+    if (const char* v = std::getenv("HY4_PF_SPLIT")) hp.split = std::max(0, std::min(2, std::atoi(v)));
+    if (const char* v = std::getenv("HY4_PF_SPLIT_FRAC")) hp.split_frac = std::max(0.0, std::min(1.0, std::atof(v)));
+    if (const char* v = std::getenv("HY4_PF_SPLIT_MB")) hp.stage_bytes = (size_t) std::max(8, std::atoi(v)) << 20;
+    if (const char* v = std::getenv("HY4_PF_SPLIT_B")) hp.bmax = std::max(1, std::atoi(v));
+    if (!xp_on) hp.split = 0;   // (the region's copies come straight from the pinned experts)
     if (const char* v = std::getenv("HY4_PF_HELPER_LOG")) hp.log = std::fopen(v, "a");
     const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used;
     hp.Cmax = std::max(64, o.chunk);
@@ -2798,6 +2837,14 @@ void Engine::Impl::hp_alloc() {
     hp.GU = (float*) da(RT * 2 * ff * sizeof(float));
     hp.He = (__half*) da(RT * ff * sizeof(__half));
     hp.Ye = (float*) da(RT * NL * sizeof(float));
+    if (hp.split) {
+        hp.stage = (uint8_t*) da(hp.stage_bytes);
+        CK(cudaStreamCreateWithFlags(&hp.cs, cudaStreamNonBlocking));
+        CK(cudaEventCreateWithFlags(&hp.bev, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&hp.bev2[0], cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&hp.bev2[1], cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&hp.cev, cudaEventDisableTiming));
+    }
     hc.bytes += dev;
     bool ok = true;
     for (int b = 0; b < 2 && ok; ++b)
@@ -2903,6 +2950,91 @@ void Engine::Impl::hp_worker() {
         CK(cudaMemcpyAsync(hp.wl, hp.wl_h[b], (size_t) T * nu * sizeof(float), cudaMemcpyHostToDevice, hp.s));
         CK(cudaEventRecord(hp.in_used[b], hp.s));
         CK(cudaMemsetAsync(hp.YL, 0, (size_t) T * NL * sizeof(float), hp.s));
+        // (8b+) the region's claims and copies on a thread of their own from the job's start - the residents' ~1,200
+        //  launches take the host ~5 ms, and the copies would wait for them (item8f/s1: 22 of ~38 claimed a layer)
+        std::vector<std::pair<int, size_t>> mine;   // (index in R.e, staging offset), in claim order
+        double cms = 0;
+        std::thread stealer;
+        if (j.steal)
+            stealer = std::thread([&, il = j.il] {
+                CK(cudaSetDevice(hc.dev));
+                HPF::Region& R = hp.rg;
+                const size_t eb = R.eb, ea = (eb + 255) & ~(size_t) 255;
+                size_t at = 0;
+                std::vector<std::pair<const uint8_t*, size_t>> parts;
+                CK(cudaStreamWaitEvent(hp.cs, hp.cev, 0));   // (the last region's compute through with the staging)
+                // two batches in flight: the next one claimed and issued before the last is waited for, so the
+                // copy engine does not idle while this thread's launches queue behind the worker's (one batch, ~1.5 ms,
+                // of lead); the rate from the times between completions
+                struct Bt {
+                    int s0 = 0, s1 = 0;
+                    size_t from = 0;
+                    bool on = false;
+                } bt[2];
+                int nx = 0;
+                double t_done = now_ms();
+                auto issue = [&]() -> bool {
+                    int s0, s1;
+                    {
+                        std::lock_guard<std::mutex> lk(R.mu);
+                        if (R.next <= R.lo) return false;
+                        if (!R.fixed && (double) (R.lo - R.p5.load()) * (double) eb < 28.9e9 * hp.last_tb) return false;
+                        const int B = std::max(1, std::min(hp.bmax, (int) (hp.tb_ms * 1e-3 * hp.rate3 / (double) eb)));
+                        s1 = R.next;
+                        s0 = std::max(R.lo, s1 - B);
+                        R.next = s0;
+                    }
+                    Bt& x = bt[nx];
+                    x.s0 = s0;
+                    x.s1 = s1;
+                    x.from = mine.size();
+                    x.on = true;
+                    for (int i = s1 - 1; i >= s0; --i) {
+                        const int key = il * g.n_expert + R.e[(size_t) i];
+                        parts.clear();
+                        ec_src_parts(key, 0, eb, parts);
+                        size_t o0 = 0;
+                        for (const auto& pr : parts) {
+                            CK(cudaMemcpyAsync(hp.stage + at + o0, pr.first, pr.second, cudaMemcpyHostToDevice, hp.cs));
+                            o0 += pr.second;
+                        }
+                        mine.push_back({i, at});
+                        at += ea;
+                    }
+                    CK(cudaEventRecord(hp.bev2[nx], hp.cs));
+                    (void) cudaStreamQuery(hp.cs);   // (submitted now)
+                    nx ^= 1;
+                    return true;
+                };
+                auto retire = [&](int k) {
+                    Bt& x = bt[k];
+                    CK(cudaEventSynchronize(hp.bev2[k]));
+                    const double t = now_ms(), dt = std::max(0.05, t - t_done);
+                    t_done = t;
+                    cms += dt;
+                    const double bytes = (double) (x.s1 - x.s0) * (double) eb;
+                    hp.last_tb = dt * 1e-3;
+                    hp.rate3 = 0.7 * hp.rate3 + 0.3 * bytes / hp.last_tb;
+                    if (verify_fills())
+                        for (size_t q = x.from; q < x.from + (size_t) (x.s1 - x.s0); ++q) {
+                            const int key = il * g.n_expert + R.e[(size_t) mine[q].first];
+                            if (!verify_slot(key, hp.stage + mine[q].second)) {
+                                std::fprintf(stderr, "maya-hy4: HY4_VERIFY_FILLS: expert %d of layer %d differs in the 3090's "
+                                             "staging\n", key % g.n_expert, il);
+                                std::abort();
+                            }
+                            ++verified_helper;
+                        }
+                    x.on = false;
+                };
+                bool more = issue();
+                if (more) more = issue();
+                while (bt[nx].on || bt[nx ^ 1].on) {
+                    const int k = bt[nx].on ? nx : nx ^ 1;   // (the older of those on their way: issued first)
+                    retire(k);
+                    if (more) more = issue();
+                }
+            });
         for (size_t i = 0; i < j.e.size(); ++i) {
             const uint8_t* w = j.blob[i];
             if (!iq::f16_rows(c.tg, w, NL, ff, (uint16_t*) hp.W1, NL, hp.s) ||
@@ -2920,6 +3052,41 @@ void Engine::Impl::hp_worker() {
                 gemm_h(hp.He, ff, hp.W2, ff, hp.Ye, NL, n, NL, ff);
                 k::scatter_add(hp.Ye, hp.list + o0 + r0, hp.wl + o0 + r0, n, NL, hp.YL, hp.s);
             }
+        }
+        if (j.steal) {   // (8b+) the region: claimed top down in batches, copied while the residents compute
+            HPF::Region& R = hp.rg;
+            const size_t eb = R.eb;
+            int ntb0 = 0;
+            if (stealer.joinable()) stealer.join();
+            {
+                std::lock_guard<std::mutex> lk(R.mu);
+                ntb0 = R.takebacks;
+            }
+            for (const auto& mo : mine) {   // (in claim order: descending id)
+                const uint8_t* w = hp.stage + mo.second;
+                if (!iq::f16_rows(c.tg, w, NL, ff, (uint16_t*) hp.W1, NL, hp.s) ||
+                    !iq::f16_rows(c.tu, w + gb, NL, ff, (uint16_t*) (hp.W1 + (size_t) ff * NL), NL, hp.s) ||
+                    !iq::f16_rows(c.td, w + gb + ub, ff, NL, (uint16_t*) hp.W2, ff, hp.s)) {
+                    std::fprintf(stderr, "maya-hy4: no F16 rows for the experts' types %d / %d / %d\n", c.tg, c.tu, c.td);
+                    std::abort();
+                }
+                const int m = R.cnt[(size_t) mo.first], o0 = R.off[(size_t) mo.first];
+                for (int r0 = 0; r0 < m; r0 += hp.RT) {
+                    const int n = std::min(hp.RT, m - r0);
+                    iq::gather_f16((const uint16_t*) hp.lat, NL, hp.list + o0 + r0, n, NL, (uint16_t*) hp.Xe, hp.s);
+                    gemm_h(hp.Xe, NL, hp.W1, NL, hp.GU, 2 * ff, n, 2 * ff, NL);
+                    k::swiglu_rows(hp.GU, n, ff, l.clamp_exp, hp.He, hp.s);
+                    gemm_h(hp.He, ff, hp.W2, ff, hp.Ye, NL, n, NL, ff);
+                    k::scatter_add(hp.Ye, hp.list + o0 + r0, hp.wl + o0 + r0, n, NL, hp.YL, hp.s);
+                }
+            }
+            CK(cudaEventRecord(hp.cev, hp.s));   // (the staging free again once these are through)
+            hp.sp_claimed += (long) mine.size();
+            hp.sp_bytes += (double) mine.size() * (double) eb;
+            hp.sp_ms += cms;
+            hp.meta[(size_t) b].ns = (int) mine.size();
+            hp.meta[(size_t) b].ntb = ntb0;
+            hp.meta[(size_t) b].cms = cms;
         }
         if (hp.log) CK(cudaEventRecord(hp.e_c1[b], hp.s));
         CK(cudaMemcpyAsync(hp.yl_h[b], hp.YL, (size_t) T * NL * sizeof(float), cudaMemcpyDeviceToHost, hp.s));
@@ -2952,8 +3119,8 @@ void Engine::Impl::hp_collect(int b) {
         CK(cudaEventElapsedTime(&comp3, hp.in_used[b], hp.e_c1[b]));
         CK(cudaEventElapsedTime(&out3, hp.e_c1[b], hp.out_ready[b]));
     }
-    std::fprintf(hp.log, "%ld,%d,%d,%d,%d,%ld,%d,%ld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", m.seq, m.il, m.T, m.pos, m.n3,
-                 m.R3, m.n5, m.R5, d2h, in3, comp3, out3, own, stall, h2d);
+    std::fprintf(hp.log, "%ld,%d,%d,%d,%d,%ld,%d,%ld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.3f\n", m.seq, m.il, m.T,
+                 m.pos, m.n3, m.R3, m.n5, m.R5, d2h, in3, comp3, out3, own, stall, h2d, m.ns, m.ntb, m.cms);
     std::fflush(hp.log);
 }
 
@@ -4230,7 +4397,40 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
                     j.off.push_back(pf.h_off[e]);
                     j.blob.push_back(hc.ptr[(size_t) hc.where[(size_t) il * ne + e]]);
                 }
-        if (!j.e.empty()) {
+        if (hp.on && !hp.gated && hp.split && !pre.active && hp.stage) {   // (8b+) the region
+            HPF::Region& R = hp.rg;
+            std::lock_guard<std::mutex> lk(R.mu);
+            R.e.clear();
+            R.cnt.clear();
+            R.off.clear();
+            R.idx.assign((size_t) ne, -1);
+            for (int e = 0; e < ne; ++e)
+                if (pf.h_cnt[e] && !ec_blob(il, e) && !hp_has(il, e)) {
+                    R.idx[(size_t) e] = (int) R.e.size();
+                    R.e.push_back(e);
+                    R.cnt.push_back(pf.h_cnt[e]);
+                    R.off.push_back(pf.h_off[e]);
+                }
+            R.eb = gb + ub + db;
+            const size_t ea = (R.eb + 255) & ~(size_t) 255;
+            R.n = (int) R.e.size();
+            const int k = std::min((int) std::lround(hp.split_frac * R.n), (int) (hp.stage_bytes / ea));
+            R.r_lo = R.lo = R.n - k;
+            R.next = R.n;
+            R.p5 = 0;
+            R.takebacks = 0;
+            R.il = il;
+            R.fixed = hp.split == 2;
+            R.on = k > 0;
+            if (R.on) {
+                j.steal = true;
+                ++hp.sp_layers;
+                hp.sp_region += k;
+                if (R.fixed)   // (2: all of it the 3090's)
+                    for (int i = R.r_lo; i < R.n; ++i) pf.h_cnt[R.e[(size_t) i]] = 0;
+            }
+        }
+        if (!j.e.empty() || j.steal) {
             hjob = true;
             hb = (int) (hp.seq & 1);
             if (hp.seq >= 2) CK(cudaStreamWaitEvent(s, hp.in_used[hb], 0));   // (the helper's copy of that set in)
@@ -4329,6 +4529,30 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
     // (each run of consecutive ones in one copy a tensor), laid out as [the gates | the ups | the downs] of the group.
     for (int e0 = 0; e0 < ne && !pre.active; e0 += GE) {
         const int e1 = std::min(ne, e0 + GE);
+        if (hjob && hp.rg.on && !hp.rg.fixed && hp.rg.il == il) {   // (8b+) this group's claims, paced by its copies
+            HPF::Region& R = hp.rg;
+            if (pf.group_ctr >= 1) {
+                ++hp.lead_n;
+                hp.lead_busy += cudaEventQuery(pf.gready[(pf.group_ctr - 1) & 1]) != cudaSuccess;
+            }
+            if (pf.group_ctr >= 2) CK(cudaEventSynchronize(pf.gfreed[pf.group_ctr & 1]));
+            int last = -1;
+            for (int e = e0; e < e1; ++e) {
+                const int i = R.idx[(size_t) e];
+                if (i < 0) continue;
+                last = i;
+                if (i < R.r_lo) continue;
+                std::lock_guard<std::mutex> lk(R.mu);
+                if (i >= R.lo && i < R.next) {   // (not claimed yet: the 5090's after all)
+                    R.lo = i + 1;
+                    ++R.takebacks;
+                    ++hp.sp_tb;
+                } else if (i >= R.next) {
+                    pf.h_cnt[e] = 0;             // (the 3090's)
+                }
+            }
+            if (last >= 0) R.p5 = last + 1;
+        }
         bool any = false, copy = false;
         for (int e = e0; e < e1; ++e)
             if (pf.h_cnt[e]) {
@@ -4415,6 +4639,7 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
         CK(cudaMemcpyAsync(pf.Ye, hp.yl_h[hb], (size_t) T * NL * sizeof(float), cudaMemcpyHostToDevice, s));
         CK(cudaEventRecord(hp.out_used[hb], s));
         k::add(pf.YL, pf.Ye, T * NL, s);
+        if (hp.rg.il == il) hp.rg.on = false;
     }
     // routed_up, and the shared expert on every token (no clamp)
     k::to_f16(pf.YL, pf.YLh, (size_t) T * NL, s);
@@ -4595,6 +4820,8 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     const double cb0 = pf.copy_bytes;
     hp.experts = 0;
     hp.saved = hp.xfer = 0;
+    hp.sp_region = hp.sp_claimed = hp.sp_tb = hp.sp_layers = hp.lead_n = hp.lead_busy = 0;
+    hp.sp_bytes = hp.sp_ms = 0;
     // (HY4_PF_KEEPALIVE: the helper held busy until this returns, whichever way)
     struct KaGuard {
         HKA& k;
@@ -4642,6 +4869,12 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
         hp_collect(0);
         hp_collect(1);
     }
+    if (o.verbose && hp.sp_layers > 0)
+        std::fprintf(stderr, "maya-hy4: 8b+ (HY4_PF_SPLIT=%d): %ld layers split, %ld of their %ld region experts on the "
+                     "3090 (%.2f GB, its copies %.2f GB/s), %ld take-backs; the 5090's claims with a copy still on its way "
+                     "%.0f%%\n", hp.split, hp.sp_layers, hp.sp_claimed, hp.sp_region, hp.sp_bytes / 1e9,
+                     hp.sp_ms > 0 ? hp.sp_bytes / 1e6 / hp.sp_ms : 0.0, hp.sp_tb,
+                     hp.lead_n ? 100.0 * hp.lead_busy / hp.lead_n : 0.0);
     if (o.verbose && hp.experts > 0)
         std::fprintf(stderr, "maya-hy4: the read's %ld expert-layers on the helper card (%.2f GB of them not copied to the "
                      "main card; %.2f GB of rows across); %.2f GB of experts copied to the main card\n", hp.experts,
