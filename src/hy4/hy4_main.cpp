@@ -550,6 +550,66 @@ int main(int argc, char** argv) {
         return !failed;
     };
 
+    // (--runs' turn2, the cache after a read: turn 1's prompt p1 read and its answer a1 written in plain steps (a
+    //  decode-adapted cache), then turn 2's new tokens p2 read as the server would (one prefill: the prompt path, or
+    //  windows under HY4_MIN_CHUNK), then its answer a2 written in plain steps, teacher-forced - the same tokens in
+    //  every variant.  A line every 10 of a2's tokens: the ms a token (wall), the CPU lane's experts a token, the
+    //  experts found in the main card's / the helper card's cache, the forced token's agreement with the argmax)
+    auto turn2 = [&](const std::vector<int>& p1, const std::vector<int>& a1, const std::vector<int>& p2,
+                     const std::vector<int>& a2) -> bool {
+        if (p1.empty() || p2.empty() || a2.empty()) return false;
+        const float* lg = nullptr;
+        double t0 = now_ms();
+        for (size_t i = 0; i < p1.size() && (i == 0 || lg); i += (size_t) opt.chunk)
+            lg = eng.prefill(p1.data() + i, (int) std::min(p1.size() - i, (size_t) opt.chunk));
+        if (!lg) return false;
+        const double t1 = now_ms();
+        for (size_t i = 0; i < a1.size() && lg; ++i) lg = eng.step(a1[i]);
+        if (!lg) return false;
+        const double t2 = now_ms();
+        lg = eng.prefill(p2.data(), (int) p2.size());
+        if (!lg) return false;
+        const double t3 = now_ms();
+        std::fprintf(stderr, "turn2: p1 %zu tok %.2f s, a1 %zu tok %.2f s (%.1f tok/s), p2 %zu tok %.3f s\n", p1.size(),
+                     (t1 - t0) / 1000.0, a1.size(), (t2 - t1) / 1000.0, a1.size() * 1000.0 / (t2 - t1), p2.size(),
+                     (t3 - t2) / 1000.0);
+        int agree = argmax(lg, V) == a2[0];
+        double sum_ms[2] = {}, sum_lane[2] = {};
+        long sum_n[2] = {};
+        eng.clear_stats();
+        double b0 = now_ms();
+        int nb = 0;
+        for (size_t i = 0; i + 1 < a2.size(); ++i) {
+            lg = eng.step(a2[i]);
+            if (!lg) return false;
+            agree += argmax(lg, V) == a2[i + 1];
+            ++nb;
+            if (nb == 10 || i + 2 == a2.size()) {
+                const double ms = now_ms() - b0;
+                const auto st = eng.stats();
+                const long lane = st.lookups - st.hits - st.hits_helper;
+                std::fprintf(stderr, "turn2 %4zu: %6.2f ms/tok, lane %6.1f experts/tok, main %5.1f%%, helper %5.1f%%, "
+                             "lane layers/tok %4.1f, lane %.2f ms/tok (%.1f us an expert), helper wait %.2f ms/tok, "
+                             "agree %d/%zu\n", i + 1, ms / nb, (double) lane / nb,
+                             st.lookups ? 100.0 * st.hits / st.lookups : 0.0,
+                             st.lookups ? 100.0 * st.hits_helper / st.lookups : 0.0, (double) st.lane_layers / nb,
+                             st.ms_lane / nb, lane ? 1000.0 * st.ms_lane / lane : 0.0, st.ms_helper / nb, agree, i + 2);
+                const int h = i + 1 <= 100 ? 0 : 1;
+                sum_ms[h] += ms;
+                sum_lane[h] += (double) lane;
+                sum_n[h] += nb;
+                eng.clear_stats();
+                nb = 0;
+                b0 = now_ms();
+            }
+        }
+        std::fprintf(stderr, "turn2 sum: tokens 1-100 %.1f tok/s (lane %.1f experts/tok), 101-%zu %.1f tok/s (lane %.1f); "
+                     "agree %d/%zu\n", sum_n[0] * 1000.0 / std::max(1.0, sum_ms[0]), sum_lane[0] / std::max(1L, sum_n[0]),
+                     a2.size() - 1, sum_n[1] * 1000.0 / std::max(1.0, sum_ms[1]), sum_lane[1] / std::max(1L, sum_n[1]),
+                     agree, a2.size());
+        return !eng.failed();
+    };
+
     if (!runs_arg.empty()) {
         // --runs FILE: a line a run, "NAME pf|step @ids.txt (@follow.txt | N)" - the model loaded once, the state reset
         // before each; the runs' lines between "RUN NAME" and "END NAME"
@@ -559,6 +619,17 @@ int main(int argc, char** argv) {
             std::stringstream ls(ln);
             std::string name, mode, ids_f, last_f;
             if (!(ls >> name >> mode >> ids_f >> last_f)) continue;
+            if (mode == "turn2") {   // NAME turn2 @p1 @a1 @p2 @a2
+                std::string f3, f4;
+                if (!(ls >> f3 >> f4)) continue;
+                eng.reset();
+                std::printf("RUN %s\n", name.c_str());
+                std::fprintf(stderr, "RUN %s\n", name.c_str());
+                const bool ok = turn2(parse_ids(ids_f), parse_ids(last_f), parse_ids(f3), parse_ids(f4));
+                std::printf("END %s %s\n", name.c_str(), ok ? "ok" : "failed");
+                std::fflush(stdout);
+                continue;
+            }
             const std::vector<int> ids = parse_ids(ids_f);
             const bool fol = !last_f.empty() && last_f[0] == '@';
             const std::vector<int> follow = fol ? parse_ids(last_f) : std::vector<int>();

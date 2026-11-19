@@ -2267,10 +2267,14 @@ void Engine::Impl::ec_fill(bool defer) {
                    (ec.score[(size_t) a1] == ec.score[(size_t) b1] && a1 < b1);
         });
         for (size_t i = 0; i < top; ++i) want[(size_t) keys[i]] = 1;
+        // (HY4_FILL_EMPTY, on: the fill takes only the empty slots - the arena's after a prompt, any dropped - and
+        //  leaves the experts still in the others to the swaps (ec_adapt): the answer's first 100 tokens after a
+        //  prompt-path read 2-6 tok/s faster than with every slot re-ranked by the prompt's scores; 0: re-ranked)
+        static const bool fill_empty = !(std::getenv("HY4_FILL_EMPTY") && std::atoi(std::getenv("HY4_FILL_EMPTY")) == 0);
         std::vector<int> spare;
         for (int sl = ec.slots - 1; sl >= 0; --sl)
             if (ec.cls[(size_t) sl] == c && ec_usable(sl) &&
-                (ec.owner[(size_t) sl] < 0 || !want[(size_t) ec.owner[(size_t) sl]]))
+                (ec.owner[(size_t) sl] < 0 || (!fill_empty && !want[(size_t) ec.owner[(size_t) sl]])))
                 spare.push_back(sl);
         for (size_t i = 0; i < top && !spare.empty(); ++i)
             if (ec.where[(size_t) keys[i]] < 0) {
