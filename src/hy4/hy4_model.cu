@@ -1001,6 +1001,22 @@ struct Engine::Impl {
         bool quit = false;
         long experts = 0;           // (a read's: the experts computed there, their bytes not copied, the rows across)
         double saved = 0, xfer = 0;
+        // The depth gate (HY4_PF_HELPER_DEPTH, 16384): a prefetched chunk (T >= min_T) that starts this deep gets no
+        // share - deep in a long prompt each layer's attention runs ~1 s, the 3090 idles through it and drops its
+        // clocks (22-49% of its jobs 2.6x slower past 48K), and its share then stalls the 5090 longer than it saves.
+        // The copier copies every expert for such a chunk.  gated: this chunk's.
+        int depth = 16384;
+        bool gated = false;
+        // (HY4_PF_HELPER_LOG=<file>: a CSV line a job - its rows on each card and its times by phase, from timing
+        //  events made and recorded only then)
+        FILE* log = nullptr;
+        cudaEvent_t e_d0[2] = {}, e_own0[2] = {}, e_own1[2] = {}, e_w1[2] = {}, e_in0[2] = {}, e_c1[2] = {};
+        struct Meta {
+            bool on = false;
+            long seq = 0;
+            int il = 0, T = 0, pos = 0, n3 = 0, n5 = 0;
+            long R3 = 0, R5 = 0;
+        } meta[2];
         ~HPF() {
             if (!th.joinable()) return;
             {
@@ -1013,6 +1029,7 @@ struct Engine::Impl {
     } hp;
     void hp_alloc();
     void hp_worker();
+    void hp_collect(int b);
     bool hp_has(int il, int e) const {   // (an expert the helper computes: settled there, not in the main card's cache)
         if (!hp.on || ec_blob(il, e)) return false;
         const int sl = hc.where[(size_t) il * ec.ne + e];
@@ -2720,6 +2737,8 @@ void Engine::Impl::hp_alloc() {
     //  helper's slots the same)
     const int hpv = std::getenv("HY4_PF_HELPER") ? std::atoi(std::getenv("HY4_PF_HELPER")) : 1;
     if (hpv == 0) return;
+    if (const char* v = std::getenv("HY4_PF_HELPER_DEPTH")) hp.depth = std::max(0, std::atoi(v));
+    if (const char* v = std::getenv("HY4_PF_HELPER_LOG")) hp.log = std::fopen(v, "a");
     const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used;
     hp.Cmax = std::max(64, o.chunk);
     const size_t C = (size_t) hp.Cmax, RT = (size_t) hp.RT;
@@ -2759,14 +2778,26 @@ void Engine::Impl::hp_alloc() {
         return;
     }
     for (int b = 0; b < 2; ++b) {
-        CK(cudaEventCreateWithFlags(&hp.in_used[b], cudaEventDisableTiming));
-        CK(cudaEventCreateWithFlags(&hp.out_ready[b], cudaEventDisableTiming));
+        const unsigned fl = hp.log ? cudaEventDefault : cudaEventDisableTiming;   // (timing only for the log)
+        CK(cudaEventCreateWithFlags(&hp.in_used[b], fl));
+        CK(cudaEventCreateWithFlags(&hp.out_ready[b], fl));
+        if (hp.log) {
+            CK(cudaEventCreate(&hp.e_in0[b]));
+            CK(cudaEventCreate(&hp.e_c1[b]));
+        }
     }
     {
         OnDev om(o.gpu);
         for (int b = 0; b < 2; ++b) {
-            CK(cudaEventCreateWithFlags(&hp.in_ready[b], cudaEventDisableTiming));
-            CK(cudaEventCreateWithFlags(&hp.out_used[b], cudaEventDisableTiming));
+            const unsigned fl = hp.log ? cudaEventDefault : cudaEventDisableTiming;
+            CK(cudaEventCreateWithFlags(&hp.in_ready[b], fl));
+            CK(cudaEventCreateWithFlags(&hp.out_used[b], fl));
+            if (hp.log) {
+                CK(cudaEventCreate(&hp.e_d0[b]));
+                CK(cudaEventCreate(&hp.e_own0[b]));
+                CK(cudaEventCreate(&hp.e_own1[b]));
+                CK(cudaEventCreate(&hp.e_w1[b]));
+            }
         }
     }
     hp.on = hpv != 2;
@@ -2805,6 +2836,7 @@ void Engine::Impl::hp_worker() {
         const int b = j.b, T = j.T;
         CK(cudaStreamWaitEvent(hp.s, hp.in_ready[b], 0));
         if (j.seq >= 2) CK(cudaStreamWaitEvent(hp.s, hp.out_used[b], 0));   // (the main card's copy of that set's sum)
+        if (hp.log) CK(cudaEventRecord(hp.e_in0[b], hp.s));
         CK(cudaMemcpyAsync(hp.lat, hp.lat_h[b], (size_t) T * NL * sizeof(__half), cudaMemcpyHostToDevice, hp.s));
         CK(cudaMemcpyAsync(hp.list, hp.list_h[b], (size_t) T * nu * sizeof(int), cudaMemcpyHostToDevice, hp.s));
         CK(cudaMemcpyAsync(hp.wl, hp.wl_h[b], (size_t) T * nu * sizeof(float), cudaMemcpyHostToDevice, hp.s));
@@ -2828,6 +2860,7 @@ void Engine::Impl::hp_worker() {
                 k::scatter_add(hp.Ye, hp.list + o0 + r0, hp.wl + o0 + r0, n, NL, hp.YL, hp.s);
             }
         }
+        if (hp.log) CK(cudaEventRecord(hp.e_c1[b], hp.s));
         CK(cudaMemcpyAsync(hp.yl_h[b], hp.YL, (size_t) T * NL * sizeof(float), cudaMemcpyDeviceToHost, hp.s));
         CK(cudaEventRecord(hp.out_ready[b], hp.s));
         (void) cudaStreamQuery(hp.s);   // (submitted now - WDDM holds a stream's work until something flushes it)
@@ -2837,6 +2870,33 @@ void Engine::Impl::hp_worker() {
         }
         hp.cv_done.notify_all();
     }
+}
+
+// (HY4_PF_HELPER_LOG) set b's last job, if not written yet and done: a line of its rows and its times by phase (ms):
+// the 5090's copy of the rows out, the 3090's copies in, its compute, its copy out, the 5090's own experts, its stall
+// for the 3090, its copy of the sum in
+void Engine::Impl::hp_collect(int b) {
+    HPF::Meta& m = hp.meta[(size_t) b];
+    if (!hp.log || !m.on) return;
+    if (cudaEventQuery(hp.out_used[b]) != cudaSuccess) {
+        cudaGetLastError();
+        return;
+    }
+    m.on = false;
+    float d2h = 0, own = 0, stall = 0, h2d = 0, in3 = 0, comp3 = 0, out3 = 0;
+    CK(cudaEventElapsedTime(&d2h, hp.e_d0[b], hp.in_ready[b]));
+    CK(cudaEventElapsedTime(&own, hp.e_own0[b], hp.e_own1[b]));
+    CK(cudaEventElapsedTime(&stall, hp.e_own1[b], hp.e_w1[b]));
+    CK(cudaEventElapsedTime(&h2d, hp.e_w1[b], hp.out_used[b]));
+    {
+        OnDev od(hc.dev);
+        CK(cudaEventElapsedTime(&in3, hp.e_in0[b], hp.in_used[b]));
+        CK(cudaEventElapsedTime(&comp3, hp.in_used[b], hp.e_c1[b]));
+        CK(cudaEventElapsedTime(&out3, hp.e_c1[b], hp.out_ready[b]));
+    }
+    std::fprintf(hp.log, "%ld,%d,%d,%d,%d,%ld,%d,%ld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", m.seq, m.il, m.T, m.pos, m.n3,
+                 m.R3, m.n5, m.R5, d2h, in3, comp3, out3, own, stall, h2d);
+    std::fflush(hp.log);
 }
 
 void Engine::Impl::hc_alloc() {
@@ -3692,12 +3752,13 @@ void Engine::Impl::pre_run() {
         const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru, db = (size_t) E * c.rd;
         uint8_t* B = pre.buf[b];
         for (int e = 0; e < ne;) {
-            if (ec_blob(il, e) || hp_has(il, e)) {   // (in VRAM, or computed on the helper card: 8b)
+            // (in VRAM, or computed on the helper card: 8b - not in a chunk past the depth gate)
+            if (ec_blob(il, e) || (!hp.gated && hp_has(il, e))) {
                 ++e;
                 continue;
             }
             int r = e;
-            while (r < ne && !ec_blob(il, r) && !hp_has(il, r)) ++r;
+            while (r < ne && !ec_blob(il, r) && !(!hp.gated && hp_has(il, r))) ++r;
             const size_t n = (size_t) (r - e);
             pre_stage(B + (size_t) e * gb, c.gate + (size_t) e * gb, n * gb);
             pre_stage(B + (size_t) ne * gb + (size_t) e * ub, c.up + (size_t) e * ub, n * ub);
@@ -4052,7 +4113,18 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
     int hb = 0;
     {
         HPF::Job j;
-        if (hp.on)
+        int nused = 0;
+        long rused = 0;
+        if (hp.log) {
+            hp_collect(0);
+            hp_collect(1);
+            for (int e = 0; e < ne; ++e)
+                if (pf.h_cnt[e]) {
+                    ++nused;
+                    rused += pf.h_cnt[e];
+                }
+        }
+        if (hp.on && !hp.gated)
             for (int e = 0; e < ne; ++e)
                 if (pf.h_cnt[e] && hp_has(il, e)) {
                     j.e.push_back(e);
@@ -4064,10 +4136,25 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
             hjob = true;
             hb = (int) (hp.seq & 1);
             if (hp.seq >= 2) CK(cudaStreamWaitEvent(s, hp.in_used[hb], 0));   // (the helper's copy of that set in)
+            if (hp.log) {
+                HPF::Meta& mt = hp.meta[(size_t) hb];
+                mt.on = true;
+                mt.seq = hp.seq;
+                mt.il = il;
+                mt.T = T;
+                mt.pos = pos;
+                mt.n3 = (int) j.e.size();
+                mt.R3 = 0;
+                for (int c0 : j.cnt) mt.R3 += c0;
+                mt.n5 = nused - mt.n3;
+                mt.R5 = rused - mt.R3;
+                CK(cudaEventRecord(hp.e_d0[hb], s));
+            }
             CK(cudaMemcpyAsync(hp.lat_h[hb], pf.LATh, (size_t) T * NL * sizeof(__half), cudaMemcpyDeviceToHost, s));
             CK(cudaMemcpyAsync(hp.list_h[hb], pf.list, (size_t) T * nu * sizeof(int), cudaMemcpyDeviceToHost, s));
             CK(cudaMemcpyAsync(hp.wl_h[hb], pf.wl, (size_t) T * nu * sizeof(float), cudaMemcpyDeviceToHost, s));
             CK(cudaEventRecord(hp.in_ready[hb], s));
+            if (hp.log) CK(cudaEventRecord(hp.e_own0[hb], s));
             (void) cudaStreamQuery(s);
             j.il = il;
             j.T = T;
@@ -4224,7 +4311,9 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
             std::unique_lock<std::mutex> lk(hp.mu);
             hp.cv_done.wait(lk, [&] { return hp.issued >= want; });
         }
+        if (hp.log) CK(cudaEventRecord(hp.e_own1[hb], s));
         CK(cudaStreamWaitEvent(s, hp.out_ready[hb], 0));
+        if (hp.log) CK(cudaEventRecord(hp.e_w1[hb], s));
         CK(cudaMemcpyAsync(pf.Ye, hp.yl_h[hb], (size_t) T * NL * sizeof(float), cudaMemcpyHostToDevice, s));
         CK(cudaEventRecord(hp.out_used[hb], s));
         k::add(pf.YL, pf.Ye, T * NL, s);
@@ -4281,6 +4370,8 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
     k::hc_init_rows(pf.X, HC, E, pf.R, T, s);
     static const bool times = std::getenv("HY4_PF_TIMES") != nullptr;
     if (times) CK(cudaStreamSynchronize(s));
+    // (8b's depth gate: a prefetched chunk this deep gets no helper share - decided before the copier starts)
+    hp.gated = hp.on && pre.on && T >= pre.min_T && pos0 >= hp.depth;
     if (pre.on && T >= pre.min_T) pre_start();   // (the copier: every MoE layer's experts, while the GPU computes)
     double tl0 = now_ms();
     const int cd = g.eg_cols * g.eg_dim;
@@ -4443,6 +4534,10 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     st.pf_tokens += n;
     st.pf_copy_gb = pf.copy_bytes / 1e9;
     st.pf_copy_last_gb = (pf.copy_bytes - cb0) / 1e9;
+    if (hp.log) {   // (the last jobs' lines, now that the stream is done)
+        hp_collect(0);
+        hp_collect(1);
+    }
     if (o.verbose && hp.experts > 0)
         std::fprintf(stderr, "maya-hy4: the read's %ld expert-layers on the helper card (%.2f GB of them not copied to the "
                      "main card; %.2f GB of rows across); %.2f GB of experts copied to the main card\n", hp.experts,
