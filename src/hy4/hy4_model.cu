@@ -1004,8 +1004,11 @@ struct Engine::Impl {
         // The depth gate (HY4_PF_HELPER_DEPTH, 16384): a prefetched chunk (T >= min_T) that starts this deep gets no
         // share - deep in a long prompt each layer's attention runs ~1 s, the 3090 idles through it and drops its
         // clocks (22-49% of its jobs 2.6x slower past 48K), and its share then stalls the 5090 longer than it saves.
-        // The copier copies every expert for such a chunk.  gated: this chunk's.
-        int depth = 16384;
+        // The copier copies every expert for such a chunk.  Only for chunks of HY4_PF_HELPER_DEPTH_T (8192) tokens or
+        // more: a smaller one is copier-bound, and the helper's share saves its copies (item8f/setZ: 5,000 new tokens
+        // at 32K / 64K read 4.13 / 5.89 s with the share, 4.55 / 6.13 gated; 10,209 tokens 7.21-7.36 / 10.85 with it,
+        // 7.09 / 10.53 gated).  gated: this chunk's.
+        int depth = 16384, depth_T = 8192;
         bool gated = false;
         // (HY4_PF_HELPER_LOG=<file>: a CSV line a job - its rows on each card and its times by phase, from timing
         //  events made and recorded only then)
@@ -2761,6 +2764,7 @@ void Engine::Impl::hp_alloc() {
     const int hpv = std::getenv("HY4_PF_HELPER") ? std::atoi(std::getenv("HY4_PF_HELPER")) : 1;
     if (hpv == 0) return;
     if (const char* v = std::getenv("HY4_PF_HELPER_DEPTH")) hp.depth = std::max(0, std::atoi(v));
+    if (const char* v = std::getenv("HY4_PF_HELPER_DEPTH_T")) hp.depth_T = std::max(0, std::atoi(v));
     if (const char* v = std::getenv("HY4_PF_HELPER_LOG")) hp.log = std::fopen(v, "a");
     const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used;
     hp.Cmax = std::max(64, o.chunk);
@@ -2916,10 +2920,7 @@ void Engine::Impl::hp_worker() {
 void Engine::Impl::hp_collect(int b) {
     HPF::Meta& m = hp.meta[(size_t) b];
     if (!hp.log || !m.on) return;
-    if (cudaEventQuery(hp.out_used[b]) != cudaSuccess) {
-        cudaGetLastError();
-        return;
-    }
+    if (cudaEventQuery(hp.out_used[b]) != cudaSuccess) return;   // (not done yet: cudaErrorNotReady, not recorded)
     m.on = false;
     float d2h = 0, own = 0, stall = 0, h2d = 0, in3 = 0, comp3 = 0, out3 = 0;
     CK(cudaEventElapsedTime(&d2h, hp.e_d0[b], hp.in_ready[b]));
@@ -4436,7 +4437,7 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
     static const bool times = std::getenv("HY4_PF_TIMES") != nullptr;
     if (times) CK(cudaStreamSynchronize(s));
     // (8b's depth gate: a prefetched chunk this deep gets no helper share - decided before the copier starts)
-    hp.gated = hp.on && pre.on && T >= pre.min_T && pos0 >= hp.depth;
+    hp.gated = hp.on && pre.on && T >= pre.min_T && T >= hp.depth_T && pos0 >= hp.depth;
     if (pre.on && T >= pre.min_T) pre_start();   // (the copier: every MoE layer's experts, while the GPU computes)
     double tl0 = now_ms();
     const int cd = g.eg_cols * g.eg_dim;
