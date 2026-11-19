@@ -3225,7 +3225,7 @@ bool Engine::Impl::pf_alloc(std::string& err) {
     if (router_f32 && !router_f32_buf) router_f32_buf = dalloc<float>(router_f32);
     const int Cn = pf.C = std::max(64, o.chunk);
     pf.Ca = std::max(16, std::min(o.sub, Cn));
-    const int Ca = pf.Ca, E = g.n_embd, HC = g.hc, NL = g.n_lat, ne = g.n_expert, nu = g.n_used;
+    const int Ca = pf.Ca, E = g.n_embd, HC = g.hc, NL = g.n_lat, ne = g.n_expert;
     const int ffe = g.n_ff_exp, ffd = g.n_ff, ffs = g.n_ff_sh, ql = g.q_lora, QK = g.qk_head, V = g.v_head;
     const int Hm = *std::max_element(g.n_head.begin(), g.n_head.end()), nope = QK - g.rope_dim;
     const int cd = g.eg_cols * g.eg_dim, D = g.idx_dim, NH = g.idx_heads, KP = std::max(1, g.idx_kpool);
@@ -3235,7 +3235,6 @@ bool Engine::Impl::pf_alloc(std::string& err) {
     }
     cublasSetStream(pf.cb, s);
     CK(cudaStreamCreateWithFlags(&pf.cs, cudaStreamNonBlocking));
-    const size_t CE = (size_t) Cn * E;
     size_t mib = 768;
     if (const char* v = std::getenv("HY4_SCORES_MIB")) mib = (size_t) std::max(64, std::atoi(v));
     pf.s_elems = (mib << 20) / 6;   // S F32 and P F16
@@ -3435,7 +3434,8 @@ void Engine::Impl::pf_layout(int n) {
     int Cn = pf.C_full, Ca = pf.Ca_full;
     const bool small = small_on && n < pf.C_full && (!pre.on || n < pre.min_T);
     if (small) {
-        Cn = std::min(pf.C_full, std::max(64, (n + 255) / 256 * 256));        Ca = std::max(16, std::min(pf.Ca_full, Cn));
+        Cn = std::min(pf.C_full, std::max(64, (n + 255) / 256 * 256));
+        Ca = std::max(16, std::min(pf.Ca_full, Cn));
     }
     if (Cn == pf.C && Ca == pf.Ca && small == pf.small) return;
     pf.C = Cn;
