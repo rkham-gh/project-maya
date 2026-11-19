@@ -1044,30 +1044,22 @@ struct Engine::Impl {
         // 5090's claim lead (groups whose copy was not done yet when it claimed the next), layers split
         long sp_region = 0, sp_claimed = 0, sp_tb = 0, sp_layers = 0, lead_n = 0, lead_busy = 0;
         double sp_bytes = 0, sp_ms = 0;
-        // The projection: a batch is claimed only while the 3090's projected compute end - its job's start plus its
-        // residents', claimed and this batch's experts at the last job's measured rate (f3 times the fit's shape:
-        // 0.048 ms an expert, 0.449 us a row-expert) - is no later than the 5090's (its copies up to the region at
-        // 28.9 GB/s, and a group's compute).  f3 from the last job alone (two events around its compute), and only if
-        // the last merge was under 1 s ago: a cold 3090 claims nothing in a read's first layers and more as it warms.
-        // (HY4_PF_SPLIT_PROJ=0: off, the copy-time rule alone.)
-        // HY4_PF_SPLIT_PROJ: 2 (the route) the cold guard - the copy-time rule, and no claims in a layer whose last
-        // job's rate is unknown (no merge in the last 1 s) or f3 > HY4_PF_SPLIT_COLD (3.0: warm layers run 1.4-2.0, a
-        // read's first layers after a pause 4.4+); 1 the full projection; 0 the copy-time rule alone
+        // The cold guard (HY4_PF_SPLIT_PROJ, 2; 0: the copy-time rule alone): the copy-time rule, and no claims in a
+        // layer whose last job's compute rate is unknown (no merge in the last 1 s) or runs at f3 > HY4_PF_SPLIT_COLD
+        // (3.0) times the fit's shape (0.048 ms an expert, 0.449 us a row-expert) - warm layers run 1.4-2.0, a read's
+        // first layers after a pause 4.4+.  f3 from the last job alone (events around its compute).  (A projection of
+        // both cards' ends was tried and dropped: the 5090's own time runs 17-27 GB/s of its copies layer to layer, and
+        // the 3090 then took nothing in 5-22 of 41 layers warm - 15e827b's message.)
         int proj = 2;
         bool f3_ok = false;
         double f3_cold = 3.0;
-        double f3 = 1.0, job_t0 = 0, last_merge = -1e18, b3m = 0.048, c3m = 4.49e-4;
+        double f3 = 1.0, job_t0 = 0, b3m = 0.048, c3m = 4.49e-4;
+        std::atomic<double> last_merge{-1e18};   // (the main thread's, read by the worker)
         long prev_n = 0, prev_r = 0;
         bool k_rec[2] = {false, false}, m_pend[2] = {false, false};
         // (the job's compute: k0 .. kr the residents, ks .. k1 the region's - ks recorded as the region's compute is
         //  enqueued, so the stream's idle wait for the region's copies is not counted)
         cudaEvent_t e_k0[2] = {}, e_k1[2] = {}, e_kr[2] = {}, e_ks[2] = {}, e_m0[2] = {}, e_m1[2] = {};
-        // (the 5090's side: o0 .. o1 its own experts in a split layer, cb5 its copies' bytes there; eff5 bytes a ms -
-        //  its own time over its copies, the last split layer's, ~2x under the link's 28.9 GB/s with its residents'
-        //  compute and the pacing in it)
-        cudaEvent_t e_o0[2] = {}, e_o1[2] = {};
-        double cb5[2] = {0, 0}, cb_start = 0, eff5 = 15e6;
-        bool o_rec[2] = {false, false};
         double sp_wait = 0;          // (a read's: the 5090's waits at the merges, ms)
         long sp_noclaim = 0;         // (the jobs whose region the 3090 took nothing of)
         // the stealer: one thread, a task at a time
@@ -1121,7 +1113,6 @@ struct Engine::Impl {
         std::atomic<double> until{0.0};   // (now_ms() up to which the linger holds it)
         std::thread th;
         std::atomic<bool> quit{false};
-        long launched = 0;
         // (HY4_PF_KEEPALIVE_MAIN=1, with the linger: the main card held busy too, in the gaps only - not while a read
         //  runs or tokens are written (the last token over 100 ms ago): its own stream, its own two kernels)
         bool main = false;
@@ -2886,7 +2877,7 @@ void Engine::Impl::hp_alloc() {
         CK(cudaEventCreateWithFlags(&hp.bev, cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&hp.bev2[0], cudaEventDisableTiming));
         CK(cudaEventCreateWithFlags(&hp.bev2[1], cudaEventDisableTiming));
-        if (const char* v = std::getenv("HY4_PF_SPLIT_PROJ")) hp.proj = std::max(0, std::min(2, std::atoi(v)));
+        if (const char* v = std::getenv("HY4_PF_SPLIT_PROJ")) hp.proj = std::atoi(v) != 0 ? 2 : 0;
         if (const char* v = std::getenv("HY4_PF_SPLIT_COLD")) hp.f3_cold = std::atof(v);
         for (int q = 0; q < 2; ++q) {
             CK(cudaEventCreate(&hp.e_k0[q]));   // (timing on: the projection's rate)
@@ -2899,8 +2890,6 @@ void Engine::Impl::hp_alloc() {
             for (int q = 0; q < 2; ++q) {
                 CK(cudaEventCreate(&hp.e_m0[q]));   // (the merges' waits)
                 CK(cudaEventCreate(&hp.e_m1[q]));
-                CK(cudaEventCreate(&hp.e_o0[q]));   // (the 5090's own experts)
-                CK(cudaEventCreate(&hp.e_o1[q]));
             }
         }
         hp.sth = std::thread([this] {
@@ -3024,7 +3013,7 @@ void Engine::Impl::hp_worker() {
         // (8b+'s projection) the last job's compute rate: f3 against the fit's shape, if that job was recent
         hp.job_t0 = now_ms();
         hp.f3_ok = false;
-        if (j.steal && hp.k_rec[b ^ 1] && hp.job_t0 - hp.last_merge < 1000.0 &&
+        if (j.steal && hp.k_rec[b ^ 1] && hp.job_t0 - hp.last_merge.load() < 1000.0 &&
             cudaEventQuery(hp.e_k1[b ^ 1]) == cudaSuccess) {
             float k1 = 0, k2 = 0;
             CK(cudaEventElapsedTime(&k1, hp.e_k0[b ^ 1], hp.e_kr[b ^ 1]));
@@ -3084,15 +3073,6 @@ void Engine::Impl::hp_worker() {
                         if (!R.fixed && hp.proj == 2) {   // (the cold guard)
                             if (!hp.f3_ok || hp.f3 > hp.f3_cold) return false;
                             for (int i = s0; i < s1; ++i) rcl += R.cnt[(size_t) i];
-                        } else if (!R.fixed && hp.proj == 1) {   // (the projection: the 3090's end against the 5090's)
-                            if (!hp.f3_ok) return false;
-                            long rb = 0;
-                            for (int i = s0; i < s1; ++i) rb += R.cnt[(size_t) i];
-                            const double t3 = hp.job_t0 + hp.f3 * (hp.b3m * (double) (nres + ncl + (s1 - s0)) +
-                                                                    hp.c3m * (double) (rres + rcl + rb));
-                            const double t5 = now_ms() + (double) (R.lo - R.p5.load()) * (double) eb / hp.eff5 + 1.0;
-                            if (t3 > t5) return false;
-                            rcl += rb;
                         } else {
                             for (int i = s0; i < s1; ++i) rcl += R.cnt[(size_t) i];
                         }
@@ -3292,7 +3272,6 @@ void Engine::Impl::ka_loop() {
             k::keepalive(ns, ka.s);
             CK(cudaEventRecord(ka.ev[b], ka.s));
             rec[b] = true;
-            ++ka.launched;
         }
         (void) cudaStreamQuery(ka.s);   // (submitted now)
         k ^= 1;
@@ -4545,15 +4524,6 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
                     j.blob.push_back(hc.ptr[(size_t) hc.where[(size_t) il * ne + e]]);
                 }
         if (hp.e_m1[0]) hp_waits();
-        if (hp.e_o1[0]) {   // (8b+) the 5090's effective rate from the last split layer
-            const int pq = (int) ((hp.seq & 1) ^ 1);
-            if (hp.o_rec[pq] && cudaEventQuery(hp.e_o1[pq]) == cudaSuccess) {
-                float om = 0;
-                CK(cudaEventElapsedTime(&om, hp.e_o0[pq], hp.e_o1[pq]));
-                if (om > 0.5f && hp.cb5[pq] > 1e6) hp.eff5 = hp.cb5[pq] / (double) om;
-                hp.o_rec[pq] = false;
-            }
-        }
         if (hp.on && !hp.gated && hp.split && !pre.active && hp.stage) {   // (8b+) the region
             HPF::Region& R = hp.rg;
             std::lock_guard<std::mutex> lk(R.mu);
@@ -4611,10 +4581,6 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
             CK(cudaMemcpyAsync(hp.wl_h[hb], pf.wl, (size_t) T * nu * sizeof(float), cudaMemcpyDeviceToHost, s));
             CK(cudaEventRecord(hp.in_ready[hb], s));
             if (hp.log) CK(cudaEventRecord(hp.e_own0[hb], s));
-            if (hp.e_o0[hb] && j.steal) {
-                CK(cudaEventRecord(hp.e_o0[hb], s));
-                hp.cb_start = pf.copy_bytes;
-            }
             (void) cudaStreamQuery(s);
             j.il = il;
             j.T = T;
@@ -4796,11 +4762,6 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
             hp.cv_done.wait(lk, [&] { return hp.issued >= want; });
         }
         if (hp.log) CK(cudaEventRecord(hp.e_own1[hb], s));
-        if (hp.e_o1[hb] && hp.rg.il == il && hp.rg.on) {   // (8b+) the 5090's own experts' end, its copies' bytes
-            CK(cudaEventRecord(hp.e_o1[hb], s));
-            hp.cb5[hb] = pf.copy_bytes - hp.cb_start;
-            hp.o_rec[hb] = true;
-        }
         if (hp.e_m0[hb]) CK(cudaEventRecord(hp.e_m0[hb], s));
         CK(cudaStreamWaitEvent(s, hp.out_ready[hb], 0));
         if (hp.e_m1[hb]) {
