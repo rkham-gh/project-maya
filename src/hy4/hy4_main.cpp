@@ -47,6 +47,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -57,6 +58,7 @@
 #include <iostream>
 #include <mutex>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -110,7 +112,16 @@ int argmax(const float* l, int n) {
 // keeps those at least min_p x the most likely one, top_p the most likely ones until their sum reaches it.  With
 // neither (temperature alone) the token is drawn from the whole distribution in one pass, in id order - nothing
 // sorted; otherwise only as many of the most likely ones are sorted as the cut needs.
+// -1: the row holds a NaN or +inf, or nothing finite - the request fails (the caller: ERR, DONE, the conversation
+// dropped), never a token drawn from it (the review's finding 4)
 int sample(const float* logits, int V, const Sampling& sp, std::mt19937_64& rng) {
+    bool any = false;
+    for (int i = 0; i < V; ++i) {
+        const float x = logits[i];
+        if (std::isnan(x) || x == INFINITY) return -1;
+        any |= x > -INFINITY;
+    }
+    if (!any) return -1;
     if (sp.temperature <= 0.0f) return argmax(logits, V);
     const double inv_t = 1.0 / sp.temperature;
     const int mxi = argmax(logits, V);
@@ -200,14 +211,32 @@ struct Input {
     std::condition_variable cv;
     std::deque<std::string> lines;
     bool eof = false;
-    std::atomic<bool> stop{false};
+    std::atomic<bool> stop{false};   // (a STOP without an id: the request that runs, as ever)
+    // STOP <rid>: that request's, kept (the last 64) until it is the one that runs - a STOP that arrives before its
+    // GEN is taken is not lost, and one for a request already done stops nothing else (the review's finding 2)
+    std::mutex smu;
+    std::deque<std::string> stopped;
+    bool stopped_rid(const std::string& r) {
+        if (r.empty()) return false;
+        std::lock_guard<std::mutex> lk(smu);
+        return std::find(stopped.begin(), stopped.end(), r) != stopped.end();
+    }
     void start() {
         std::thread([this] {
             std::string l;
             while (std::getline(std::cin, l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
-                    stop.store(true);
+                    std::string r = l.size() > 5 ? l.substr(5) : std::string();
+                    while (!r.empty() && r.back() == ' ') r.pop_back();
+                    while (!r.empty() && r.front() == ' ') r.erase(r.begin());
+                    if (r.empty()) {
+                        stop.store(true);
+                    } else {
+                        std::lock_guard<std::mutex> lk(smu);
+                        stopped.push_back(r);
+                        if (stopped.size() > 64) stopped.pop_front();
+                    }
                     continue;
                 }
                 std::lock_guard<std::mutex> lk(mu);
@@ -259,7 +288,7 @@ int main(int argc, char** argv) {
         else if (a == "--follow") follow_arg = val();
         else if (a == "--runs") runs_arg = val();
         else if (a == "--step") by_step = true;
-        else if (a == "--chunk") opt.chunk = std::max(64, std::atoi(val().c_str()));
+        else if (a == "--chunk") opt.chunk = (std::max(64, std::atoi(val().c_str())) + 15) / 16 * 16;   // (x 16)
         else if (a == "--sub") opt.sub = std::max(16, std::atoi(val().c_str()));
         else if (a == "--stage") opt.stage = std::atoi(val().c_str());
         else if (a == "--cache-gb") opt.cache_gb = std::atof(val().c_str());
@@ -659,7 +688,7 @@ int main(int argc, char** argv) {
     // --serve
     std::printf("INFO engine=maya-hy4-%s model=Hy4-flash layers=%d experts=%d vocab=%d\n", kVersion, g.n_layer,
                 g.n_expert, V);
-    std::printf("READY %d stop\n", eng.max_ctx());
+    std::printf("READY %d stop rid\n", eng.max_ctx());   // (rid: GEN ... rid=<id>, STOP <rid> for that request)
     std::fflush(stdout);
     Input in;
     in.start();
@@ -697,13 +726,30 @@ int main(int argc, char** argv) {
     std::string line;
     while (in.next(line)) {
         if (line == "QUIT") break;
-        if (line.rfind("GEN ", 0) != 0) continue;
+        // a request the engine cannot take is still answered - ERR, then DONE, so the caller is not left waiting
+        auto refuse = [&](const std::string& why, size_t n) {
+            std::printf("ERR %s\n", why.c_str());
+            std::printf("DONE 0 %zu 0 0 length 0 0 0\n", n);
+            std::fflush(stdout);
+        };
+        if (line.rfind("GENI", 0) == 0) {
+            refuse("maya-hy4 takes no images (GENI)", 0);
+            continue;
+        }
+        if (line.rfind("GEN ", 0) != 0) {
+            if (!line.empty()) std::fprintf(stderr, "maya-hy4: a line it does not know, ignored: %.60s\n", line.c_str());
+            continue;
+        }
         in.stop.store(false);
         std::stringstream ss(line);
         std::string w;
         ss >> w;
         int max_new = 0;
-        ss >> max_new;
+        if (!(ss >> max_new)) {
+            refuse("a malformed GEN line (no token count)", 0);
+            continue;
+        }
+        std::string cur_rid;   // (rid=<id>: the request's own id, its STOP's)
         Sampling sp;
         int think_budget = 0, think_end = -1;   // (the server's thinking budget: </think> forced after that many)
         int lk_on = lk_min > 0 && wmax >= 2 ? 1 : 0, wcap = wmax;
@@ -715,31 +761,55 @@ int main(int argc, char** argv) {
         int lk_trust = trust_env != 0;
         std::vector<std::string> fields;
         while (ss >> w) fields.push_back(w);
-        if (fields.empty()) continue;
-        const std::vector<int> ids = parse_ids(fields.back());
+        // the ids: digits and commas only, at least one (a field the stream stops in would leave a prompt cut short)
+        bool ids_ok = !fields.empty() && !fields.back().empty() && fields.back()[0] != '@';
+        if (ids_ok)
+            for (char ch : fields.back())
+                if (!(std::isdigit((unsigned char) ch) || ch == ',')) ids_ok = false;
+        const std::vector<int> ids = ids_ok ? parse_ids(fields.back()) : std::vector<int>();
+        if (ids.empty()) {
+            refuse("a malformed GEN line (no prompt ids)", 0);
+            continue;
+        }
         fields.pop_back();
+        static std::set<std::string> unknown;   // (each key the engine does not know, said once)
+        std::string bad;
         for (const auto& kv : fields) {
             const size_t eq = kv.find('=');
             if (eq == std::string::npos) continue;
             const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
-            if (k == "temperature") sp.temperature = std::stof(v);
-            else if (k == "top_p") sp.top_p = std::stof(v);
-            else if (k == "top_k") sp.top_k = std::atoi(v.c_str());
-            else if (k == "min_p") sp.min_p = std::stof(v);
-            else if (k == "seed") sp.seed = std::atoll(v.c_str());
-            else if (k == "think_budget") think_budget = std::atoi(v.c_str());
-            else if (k == "think_end") think_end = std::atoi(v.c_str());
-            else if (k == "lookup" || k == "suffix_draft")   // (suffix_draft: server.py's strata_tune key)
-                lk_on = lk_min > 0 && wmax >= 2 && std::atoi(v.c_str()) != 0 ? 1 : 0;
-            else if (k == "window") wcap = std::max(1, std::min(wmax, std::atoi(v.c_str())));
-            else if (k == "dfly") df_on = df_have && std::atoi(v.c_str()) != 0 ? 1 : 0;
-            else if (k == "lookup_trust") lk_trust = std::atoi(v.c_str()) != 0;
-            else if (k == "spec") {   // (server.py's strata_tune spec: 1 the plain loop, N a window's rows at most)
-                const int n = std::atoi(v.c_str());
-                if (n == 1) df_on = lk_on = 0;
-                else if (n >= 2) wcap = std::min(wmax, n);
+            try {
+                if (k == "rid") cur_rid = v;
+                else if (k == "temperature") sp.temperature = std::stof(v);
+                else if (k == "top_p") sp.top_p = std::stof(v);
+                else if (k == "top_k") sp.top_k = std::atoi(v.c_str());
+                else if (k == "min_p") sp.min_p = std::stof(v);
+                else if (k == "seed") sp.seed = std::atoll(v.c_str());
+                else if (k == "think_budget") think_budget = std::atoi(v.c_str());
+                else if (k == "think_end") think_end = std::atoi(v.c_str());
+                else if (k == "lookup" || k == "suffix_draft")   // (suffix_draft: server.py's strata_tune key)
+                    lk_on = lk_min > 0 && wmax >= 2 && std::atoi(v.c_str()) != 0 ? 1 : 0;
+                else if (k == "window") wcap = std::max(1, std::min(wmax, std::atoi(v.c_str())));
+                else if (k == "dfly") df_on = df_have && std::atoi(v.c_str()) != 0 ? 1 : 0;
+                else if (k == "lookup_trust") lk_trust = std::atoi(v.c_str()) != 0;
+                else if (k == "spec") {   // (server.py's strata_tune spec: 1 the plain loop, N a window's rows at most)
+                    const int n = std::atoi(v.c_str());
+                    if (n == 1) df_on = lk_on = 0;
+                    else if (n >= 2) wcap = std::min(wmax, n);
+                } else if (unknown.insert(k).second) {
+                    std::fprintf(stderr, "maya-hy4: a GEN key it does not know, ignored (said once): %s\n", k.c_str());
+                }
+            } catch (const std::exception&) {   // (std::stof on a value that is not a number)
+                bad = k + "=" + v;
+                break;
             }
         }
+        if (!bad.empty()) {
+            refuse("a malformed GEN value: " + bad, ids.size());
+            continue;
+        }
+        // (the STOP looked at: a STOP without an id, or one for this request's rid)
+        auto stopped = [&] { return in.stop.load() || in.stopped_rid(cur_rid); };
         bool in_think = think_budget > 0 && think_end >= 0 && think_end < V;
         if (sp.seed >= 0) rng.seed((uint64_t) sp.seed);
         // the prompt: what continues hist is read on from there, what continues the last prompt's end from there,
@@ -776,15 +846,26 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < todo; i += per) {
             const size_t m = std::min(per, todo - i);
             lg = eng.prefill(ids.data() + reuse + i, (int) m);
+            if (!lg) break;   // (not read: below)
             hist.insert(hist.end(), ids.begin() + (long) (reuse + i), ids.begin() + (long) (reuse + i + m));
             const double ms = now_ms() - p0;
             std::printf("PP %zu %zu %.0f %.1f %zu\n", i + m, todo, ms, (i + m) * 1000.0 / std::max(ms, 1.0), reuse);
             std::fflush(stdout);
-            if (!lg || in.stop.load()) break;
+            if (stopped()) break;
+        }
+        if (!lg && todo > 0 && !eng.failed()) {   // (the engine did not take the prompt: a token outside the vocabulary
+            refuse("maya-hy4 could not read the prompt (a token id outside the vocabulary); the conversation was "
+                   "dropped", ids.size());          //  - the review's finding 3: the next turn reads its prompt anew)
+            eng.reset();
+            hist.clear();
+            last.clear();
+            have_snap = false;
+            eng.clear_stats();
+            continue;
         }
         // the prompt read whole: its end kept (the next turn's prompt holds this one and the answer, perhaps rendered
         // apart from the tokens written now)
-        if (lg && hist.size() == ids.size() && !in.stop.load() && eng.snapshot()) {
+        if (lg && hist.size() == ids.size() && !stopped() && eng.snapshot()) {
             snap_hist = hist;
             snap_last.assign(lg, lg + V);
             have_snap = true;
@@ -792,7 +873,8 @@ int main(int argc, char** argv) {
         const double p1 = now_ms();
         int generated = 0;
         std::string finish = "length";
-        if (in.stop.load()) finish = "cancel";
+        if (stopped()) finish = "cancel";
+        bool bad_row = false;   // (a row of non-finite logits: the request fails, the conversation dropped)
         // the tokens: each sampled from the logits after the ones before it (lg: after hist), printed, then fed - a
         // round feeds the last one and, where the policy takes them, the lookup's drafts after it in one window, and
         // keeps the drafts while the rows sampled equal them
@@ -805,6 +887,11 @@ int main(int argc, char** argv) {
         // a token sampled: the thinking budget's forcing, printed, counted; then whether the request ends at it - 1
         // unfed (its end token, STOP, the context full), 2 fed (max_new: fed as the plain loop did), 0 goes on
         auto emit = [&](int t, int& end) -> int {
+            if (t < 0) {   // (sample(): a non-finite row)
+                bad_row = true;
+                end = 1;
+                return t;
+            }
             if (in_think) {   // (the reasoning closed by the model, or at the budget by the engine)
                 if (t != think_end && generated >= think_budget) t = think_end;
                 if (t == think_end) in_think = false;
@@ -817,7 +904,7 @@ int main(int argc, char** argv) {
             if (t == eos) {
                 finish = "stop";
                 end = 1;
-            } else if (in.stop.load()) {
+            } else if (stopped()) {
                 finish = "cancel";
                 end = 1;
             } else if ((int) hist.size() + 1 >= eng.max_ctx()) {   // (hist: the fed tokens, pos() but in a window)
@@ -946,6 +1033,20 @@ int main(int argc, char** argv) {
         if (end == 2 && !eng.failed()) {   // (max_new's token fed, as the plain loop did: the logits after it kept)
             lg = eng.step(t);
             hist.push_back(t);
+        }
+        if (bad_row) {   // (non-finite logits: this conversation's state cannot be trusted)
+            std::fprintf(stderr, "maya-hy4: a row of non-finite logits after %zu tokens - the request failed\n",
+                         hist.size());
+            std::printf("ERR maya-hy4: non-finite logits; the conversation was dropped\n");
+            std::printf("DONE %d %zu %.1f %.1f length %lld %lld %zu\n", generated, ids.size(), p1 - p0, now_ms() - p1,
+                        accepted, offered, reuse);
+            std::fflush(stdout);
+            eng.reset();
+            hist.clear();
+            last.clear();
+            have_snap = false;
+            eng.clear_stats();
+            continue;
         }
         if (eng.failed()) {   // (a card gave up waiting for the other: this conversation's state is gone)
             // (serve/server.py keys on "the conversation was dropped" - DROPPED, dropped_state(): keep the phrase)

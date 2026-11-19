@@ -991,6 +991,7 @@ class StrataEngine:
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_pause = False           # ... and PAUSE: a STOP that keeps the state with what was written (fair slices)
+        self.can_rid = False             # ... and rid=<id> on GEN, STOP <rid> for that request (READY ... rid)
         self.multi = 0                   # READY ... multi=<n>: n conversations at once (requests tagged rid=<id>)
         self._routes: dict[int, queue.Queue] = {}       # rid -> its lines (multi)
         self._routes_lock = threading.Lock()
@@ -1021,6 +1022,8 @@ class StrataEngine:
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
                 self.can_pause = "pause" in f[2:]
+                # (READY ... rid: a one-conversation engine that takes rid=<id> on GEN and STOP <rid> for that request)
+                self.can_rid = "rid" in f[2:]
                 self.multi = next((int(x[6:]) for x in f[2:] if x.startswith("multi=") and x[6:].isdigit()), 0)
                 break
         loading.set()
@@ -1479,9 +1482,12 @@ class StrataEngine:
         self.__dict__.setdefault("_paused", set()).discard(None)
         self.progress = None
         self.prefill_tok_s_mean = None
-        # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
-        head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
-            f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked).
+        # An engine that says READY ... rid (maya-hy4) gets rid=<id> and its STOP below as STOP <rid>, so a STOP reaches
+        # this request and no other; the others get the forms they always had
+        rid = next(self._rids) if getattr(self, "can_rid", False) else None
+        keys = self.sampling_keys(sampling or {}) + (f" rid={rid}" if rid is not None else "")
+        head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         try:
             turn_mark("gen_start")
             if prompt_memo_on():
@@ -1569,7 +1575,7 @@ class StrataEngine:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
                     try:
-                        self.proc.stdin.write("STOP\n")
+                        self.proc.stdin.write(f"STOP {rid}\n" if rid is not None else "STOP\n")
                         self.proc.stdin.flush()
                     except OSError:
                         pass
