@@ -271,7 +271,7 @@ struct Engine::Impl {
     void dr_where();
     void tok_moe(const Layer& l, int il);
     // A sublayer's post-norm write held back (nw) until the next read of the streams, which takes it in one launch
-    // (k::hc_step: HY4_HC_FUSE, on); nw_flush writes it on its own (something else reads R first: Engram)
+    // (k::hc_step); nw_flush writes it on its own (something else reads R first: Engram)
     struct NW {
         const float *a = nullptr, *b = nullptr, *w = nullptr;
         bool on = false;
@@ -685,7 +685,7 @@ struct Engine::Impl {
     struct PF {
         int C = 0, Ca = 0, GE = 0;
         // (8c) C / Ca / tqi are the current layout's; the load's (the full one) here.  `used`: the arena's bytes the
-        // current layout takes from its start - a read under the prefetch's min_T carves a small one (HY4_PF_SMALL)
+        // current layout takes from its start - a read under the prefetch's min_T carves a small one
         int C_full = 0, Ca_full = 0, tqi_full = 1;
         size_t used = 0;
         bool small = false;
@@ -737,7 +737,7 @@ struct Engine::Impl {
     } pf;
     // The experts' copies to the GPU: the CPU lane's threads copy into two pinned buffers in turn and the DMA takes each
     // from there (the driver's own staging of pageable memory moved 4-15 GB/s on this machine; this held ~14 for
-    // maya-ink).  HY4_PF_PAGEABLE=1: the driver's staging.
+    // maya-ink); the driver's staging only if the pinned buffers can't be had.
     struct Stage {
         uint8_t* pin[2] = {nullptr, nullptr};
         cudaEvent_t ev[2] = {nullptr, nullptr};
@@ -1597,9 +1597,8 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
                 return false;
         } else {
             const int ne = g.n_expert, NL = g.n_lat;
-            // (the router F32 in the GGUF with every value BF16-exact: BF16 in VRAM, HY4_ROUTER_BF16=0 F32)
-            static const bool rbf = !(std::getenv("HY4_ROUTER_BF16") && std::atoi(std::getenv("HY4_ROUTER_BF16")) == 0);
-            if (!mat(b + "ffn_gate_inp.weight", E, ne, l.gate_inp, err, 0, rbf)) return false;
+            // (the router F32 in the GGUF with every value BF16-exact: BF16 in VRAM, lossless)
+            if (!mat(b + "ffn_gate_inp.weight", E, ne, l.gate_inp, err, 0, true)) return false;
             if (l.gate_inp.bf16_of_f32) router_f32 = std::max(router_f32, (size_t) l.gate_inp.n * l.gate_inp.k);
             if (!(l.exp_bias_d = f32(b + "exp_probs_b.bias", (size_t) ne, err, &l.exp_bias))) return false;
             if (!mat(b + "ffn_routed_down.weight", E, NL, l.lat_down, err) ||
@@ -2478,7 +2477,6 @@ void Engine::Impl::ec_fill(bool defer) {
     if (ec.slots == 0) return;
     ec_flush();
     std::vector<std::pair<int, int>> todo;
-    std::vector<char> want(ec.where.size(), 0);
     for (int c = 0; c < (int) ec.cls_bytes.size(); ++c) {
         std::vector<int> keys;
         for (int il = g.n_dense; il < g.n_layer; ++il)
@@ -2492,17 +2490,15 @@ void Engine::Impl::ec_fill(bool defer) {
             return ec.score[(size_t) a1] > ec.score[(size_t) b1] ||
                    (ec.score[(size_t) a1] == ec.score[(size_t) b1] && a1 < b1);
         });
-        for (size_t i = 0; i < top; ++i) want[(size_t) keys[i]] = 1;
-        // (HY4_FILL_EMPTY, on: the fill takes only the empty slots - the arena's after a prompt, any dropped - and
-        //  leaves the experts still in the others to the swaps (ec_adapt): the answer's first 100 tokens after a
-        //  prompt-path read 2-6 tok/s faster than with every slot re-ranked by the prompt's scores; 0: re-ranked)
-        static const bool fill_empty = !(std::getenv("HY4_FILL_EMPTY") && std::atoi(std::getenv("HY4_FILL_EMPTY")) == 0);
+        // (the fill takes only the empty slots - the arena's after a prompt, any dropped - and leaves the experts
+        //  still in the others to the swaps (ec_adapt): the answer's first 100 tokens after a prompt-path read 2-6
+        //  tok/s faster than with every slot re-ranked by the prompt's scores, f7282f3)
         std::vector<int> spare;
         for (int sl = ec.slots - 1; sl >= 0; --sl)
             if (ec.cls[(size_t) sl] == c && ec_usable(sl) &&
-                (ec.owner[(size_t) sl] < 0 || (!fill_empty && !want[(size_t) ec.owner[(size_t) sl]])))
+                ec.owner[(size_t) sl] < 0)
                 spare.push_back(sl);
-        if (ec.restore && fill_empty && !ec.snap.empty()) {   // (HY4_PF_RESTORE) the taken-back experts, then the scores'
+        if (ec.restore && !ec.snap.empty()) {   // (HY4_PF_RESTORE) the taken-back experts, then the scores'
             std::vector<int> ord;
             std::vector<char> seen(ec.where.size(), 0);
             auto add = [&](int k) {
@@ -2912,10 +2908,8 @@ struct OnDev {
 // expert lists, an expert's F16 weights and RT of its rows' intermediates; the pinned sets; the events; its cuBLAS; the
 // worker
 void Engine::Impl::hp_alloc() {
-    // (HY4_PF_HELPER: 1, on; 0: off; 2: off with its buffers allocated all the same - an A/B against 1 with the
-    //  helper's slots the same)
-    const int hpv = std::getenv("HY4_PF_HELPER") ? std::atoi(std::getenv("HY4_PF_HELPER")) : 1;
-    if (hpv == 0) return;
+    // (HY4_PF_HELPER: 1, on; 0: off)
+    if (const char* v = std::getenv("HY4_PF_HELPER"); v && std::atoi(v) == 0) return;
     if (const char* v = std::getenv("HY4_PF_HELPER_DEPTH")) hp.depth = std::max(0, std::atoi(v));
     if (const char* v = std::getenv("HY4_PF_HELPER_DEPTH_T")) hp.depth_T = std::max(0, std::atoi(v));
     if (const char* v = std::getenv("HY4_PF_SPLIT")) hp.split = std::max(0, std::min(2, std::atoi(v)));
@@ -3027,7 +3021,7 @@ void Engine::Impl::hp_alloc() {
             }
         }
     }
-    hp.on = hpv != 2;
+    hp.on = true;
     hp.th = std::thread([this] { hp_worker(); });
     if (const char* v = std::getenv("HY4_PF_KEEPALIVE"); v && std::atoi(v) != 0) {
         int lo = 0, hi = 0;
@@ -3057,8 +3051,8 @@ void Engine::Impl::hp_alloc() {
             cudaGetLastError();
         }
     }
-    std::fprintf(stderr, "maya-hy4: %sthe helper card computes the prompt path's experts it holds (%.0f MiB of its "
-                 "VRAM, %.0f MiB pinned)\n", hp.on ? "" : "(HY4_PF_HELPER=2: not used) ", dev / 1048576.0, 2.0 * C * (NL * 6 + nu * 8) / 1048576.0);
+    std::fprintf(stderr, "maya-hy4: the helper card computes the prompt path's experts it holds (%.0f MiB of its "
+                 "VRAM, %.0f MiB pinned)\n", dev / 1048576.0, 2.0 * C * (NL * 6 + nu * 8) / 1048576.0);
 }
 
 // (8b) The helper's worker: each job's inputs in once the main card's copies are out, each of its experts' GEMMs (an
@@ -4054,8 +4048,7 @@ bool Engine::Impl::pf_alloc(std::string& err) {
     if (std::getenv("HY4_PF_QMAX") && std::atoi(std::getenv("HY4_PF_QMAX")) != 0) pf.qmax = dalloc<unsigned>(2);
     pf.h_off = halloc<int>(ne + 1);
     if (cd) pf.h_egr = halloc<float>((size_t) Ca * cd);
-    const char* pg = std::getenv("HY4_PF_PAGEABLE");
-    if (!pg || std::atoi(pg) == 0) {
+    {
         stg.cap = (size_t) 64 << 20;
         stg.on = cudaHostAlloc((void**) &stg.pin[0], stg.cap, cudaHostAllocPortable) == cudaSuccess &&
                  cudaHostAlloc((void**) &stg.pin[1], stg.cap, cudaHostAllocPortable) == cudaSuccess;
@@ -4180,11 +4173,10 @@ size_t Engine::Impl::pf_carve(int Cn, int Ca, bool with_pre, bool assign) {
 // (8c) The layout for a read of n tokens: under the prefetch's min_T (a single chunk, no prefetch) the chunk's rows
 // and the attention's piece clamped to the read, no prefetch buffers - ~2.4-3 GB of the arena's ~8.8 for 663-3,840
 // tokens, so the expert cache keeps the rest lent (its experts, the decode's) through the read; otherwise the full
-// layout.  HY4_PF_SMALL=0: always the full one.
+// layout.
 void Engine::Impl::pf_layout(int n) {
-    static const bool small_on = !(std::getenv("HY4_PF_SMALL") && std::atoi(std::getenv("HY4_PF_SMALL")) == 0);
     int Cn = pf.C_full, Ca = pf.Ca_full;
-    const bool small = small_on && n < pf.C_full && (!pre.on || n < pre.min_T);
+    const bool small = n < pf.C_full && (!pre.on || n < pre.min_T);
     if (small) {
         Cn = std::min(pf.C_full, std::max(64, (n + 255) / 256 * 256));
         Ca = std::max(16, std::min(pf.Ca_full, Cn));
@@ -4838,9 +4830,8 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
             pf.copy_ms += now_ms() - tc;
             CK(cudaEventRecord(pf.gready[bi], pf.cs));
             // (submitted now: WDDM holds a stream's work until something flushes it - the group's copies would wait for
-            //  the next sync, behind the compute they were meant to overlap; HY4_PF_FLUSH=0: not)
-            static const bool flush = !(std::getenv("HY4_PF_FLUSH") && std::atoi(std::getenv("HY4_PF_FLUSH")) == 0);
-            if (flush) (void) cudaStreamQuery(pf.cs);
+            //  the next sync, behind the compute they were meant to overlap)
+            (void) cudaStreamQuery(pf.cs);
             CK(cudaStreamWaitEvent(s, pf.gready[bi], 0));
         }
         if (pf.grouped) {   // (8e)
@@ -5050,10 +5041,9 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     if (n < min_chunk) {
         // in windows of wTm, every row kept (a prompt's tokens are known): the dense set read once a window, the CPU
         // lane a window's experts at once; a last single token a step.  The arena stays lent (no refill after it) and
-        // the last row is DFly2's source.  HY4_PROMPT_WINDOWS=0: token by token, as before
-        static const bool pw = !(std::getenv("HY4_PROMPT_WINDOWS") && std::atoi(std::getenv("HY4_PROMPT_WINDOWS")) == 0);
+        // the last row is DFly2's source
         for (int i = 0; i < n;) {
-            const int T = pw ? std::min(wTm, n - i) : 1;
+            const int T = std::min(wTm, n - i);
             if (T >= 2) {
                 const float* lw = step_window(ids + i, T);
                 if (!lw) {
@@ -5117,11 +5107,10 @@ const float* Engine::Impl::prefill(const int* ids, int n, void (*progress)(void*
     // The cache filled by the prompt's scores - here, before the first token, only when nothing fills it after: with
     // HY4_BG_REFILL on and an arena to lend, the first token's pre_step fills every usable slot (its own, the cache
     // rows', the arena's) by the same scores, best first, in the background, so this one (~2,700 copies, ~0.35 s with
-    // no kernel running, all before the first token) would only be undone and redone.  HY4_PF_SYNC_FILL=1: always
+    // no kernel running, all before the first token) would only be undone and redone
     {
         static const bool bg = !(std::getenv("HY4_BG_REFILL") && std::atoi(std::getenv("HY4_BG_REFILL")) == 0);
-        static const bool sync_fill = std::getenv("HY4_PF_SYNC_FILL") && std::atoi(std::getenv("HY4_PF_SYNC_FILL")) != 0;
-        if (sync_fill || !bg || ec.arena_end <= ec.own) ec_fill();
+        if (!bg || ec.arena_end <= ec.own) ec_fill();
     }
     CK(cudaStreamSynchronize(s));
     st.pf_ms += now_ms() - t0;
@@ -5234,9 +5223,8 @@ void Engine::Impl::tok_attn(Layer& l) {
         }
     }
     k::q8(qf, 1, H * g.qk_head, xq_m, xd_m, s);   // (q_nope's int8 rows: head h's at qk_head h, 32-value blocks)
-    // k_b a head (q_nope -> the cache's 512): every head in one launch (HY4_HEADS_ONE=0: 8 heads a launch, as before)
-    static const bool heads_one = !(std::getenv("HY4_HEADS_ONE") && std::atoi(std::getenv("HY4_HEADS_ONE")) == 0);
-    if (!heads_one || !iq::mv_strided(l.k_b.type, l.k_b.w, (size_t) g.kv_lora * l.k_b.rb, l.k_b.rb, l.k_b.k, g.kv_lora,
+    // k_b a head (q_nope -> the cache's 512): every head in one launch (jobs a head where the type has no strided GEMV)
+    if (!iq::mv_strided(l.k_b.type, l.k_b.w, (size_t) g.kv_lora * l.k_b.rb, l.k_b.rb, l.k_b.k, g.kv_lora,
                                       H, xq_m, xd_m, (size_t) g.qk_head, qabs, (size_t) g.kv_lora, s)) {
         iq::MvJob j[64];
         for (int h0 = 0; h0 < H; h0 += 64) {
@@ -5257,7 +5245,7 @@ void Engine::Impl::tok_attn(Layer& l) {
     k::mla_decode(qabs, qf, g.qk_head, nope, l.kv, dpos, l.swa ? g.swa_window : 0, sel ? cells : nullptr,
                   sel ? ncell : nullptr, l.sinks, H, mla_scale, attn_nsp, attn_scr, mo, xq_m, xd_m, s, l.ring);
     // v_b a head (the 512 -> v_head): every head in one launch
-    if (!heads_one || !iq::mv_strided(l.v_b.type, l.v_b.w, (size_t) g.v_head * l.v_b.rb, l.v_b.rb, l.v_b.k, g.v_head,
+    if (!iq::mv_strided(l.v_b.type, l.v_b.w, (size_t) g.v_head * l.v_b.rb, l.v_b.rb, l.v_b.k, g.v_head,
                                       H, xq_m, xd_m, (size_t) g.kv_lora, mob, (size_t) g.v_head, s)) {
         iq::MvJob j[64];
         for (int h0 = 0; h0 < H; h0 += 64) {
@@ -5276,11 +5264,6 @@ void Engine::Impl::tok_attn(Layer& l) {
 }
 
 void Engine::Impl::nw_defer(const float* a_, const float* b_, const float* w_) {
-    static const bool fuse = !(std::getenv("HY4_HC_FUSE") && std::atoi(std::getenv("HY4_HC_FUSE")) == 0);
-    if (!fuse) {
-        k::norm_write(a_, b_, w_, g.eps, hpost, g.hc, g.n_embd, R, s);
-        return;
-    }
     nw_flush();
     nw.a = a_;
     nw.b = b_;
@@ -5700,19 +5683,11 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
         std::fflush(stderr);
     };
     dr_where();
-    // HY4_DR_LAZY=0: every segment's graph launched at once; else each the moment the layer before has its plan (the
-    // stream then holds a segment or two: work on the other streams - the swaps' copies - is not queued behind a token)
-    static const bool lazy = [] {
-        const char* v = std::getenv("HY4_DR_LAZY");
-        return !(v && std::atoi(v) == 0);
-    }();
+    // each segment's graph launched the moment the layer before has its plan (the stream then holds a segment or two:
+    // work on the other streams - the swaps' copies - is not queued behind a token)
     if (hd) hd_start();
     if (graphs > 0) {
         CK(cudaGraphLaunch(gx[0], s));
-        if (!lazy) {
-            for (int il = g.n_dense + 1; il < g.n_layer; ++il) CK(cudaGraphLaunch(gx[(size_t) il], s));
-            CK(cudaGraphLaunch(gx[(size_t) g.n_layer], s));
-        }
         (void) cudaStreamQuery(s);   // (submitted now: WDDM holds launches until something does)
     }
     bool staging = false;
@@ -5743,7 +5718,7 @@ void Engine::Impl::step_dr(double& cpu_ms, double& tp) {
         auto launch_next = [&] {
             if (launched) return;
             launched = true;
-            if (graphs > 0 && lazy) {
+            if (graphs > 0) {
                 CK(cudaGraphLaunch(gx[(size_t) (il + 1)], s));
                 (void) cudaStreamQuery(s);
             }

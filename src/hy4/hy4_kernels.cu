@@ -876,9 +876,8 @@ void head_gate_rows(const float* x, const float* g, int T, int H, int hd, __half
 void route(const float* RL, int ld, const float* bias, int T, int ne, int ng, int ngu, int nu, float scale, int* sel,
            float* w, cudaStream_t s) {
     const int wpb = 4;
-    // (one token: route1_kernel; HY4_ROUTE1=0 the warp kernel, as before)
-    static const bool one = !(std::getenv("HY4_ROUTE1") && std::atoi(std::getenv("HY4_ROUTE1")) == 0);
-    if (T == 1 && ng == 1 && one && ne <= kRoute1Max && nu <= 16) {
+    // (one token: route1_kernel, a block for its top-16)
+    if (T == 1 && ng == 1 && ne <= kRoute1Max && nu <= 16) {
         route1_kernel<<<1, (unsigned) ((ne + 31) / 32 * 32), 0, s>>>(RL, bias, ne, nu, scale, sel, w);
         return;
     }
@@ -2017,7 +2016,7 @@ __global__ void __launch_bounds__(kAmB) argmax_join_kernel(const float* __restri
         *prob = 1.0f / sv[0];
     }
 }
-// (the one-block version, kept for a check: HY4_ARGMAX1=1)
+// (the one-block version: without a scratch)
 __global__ void __launch_bounds__(1024) argmax_prob_kernel(const float* __restrict__ l, int n, int* __restrict__ tok,
                                                            float* __restrict__ prob) {
     __shared__ float sv[1024];
@@ -2065,8 +2064,7 @@ void dfly_cells(const int* src, const int* src_n, size_t src_ld, int nl, const i
     dfly_cells_kernel<<<dim3(T, nl), 256, 0, s>>>(src, src_n, src_ld, dP, T, out, out_n, out_ld);
 }
 void argmax_prob(const float* l, int n, int* tok, float* prob, float* scratch, cudaStream_t s) {
-    static const bool one = std::getenv("HY4_ARGMAX1") && std::atoi(std::getenv("HY4_ARGMAX1")) != 0;
-    if (one || !scratch) {
+    if (!scratch) {
         argmax_prob_kernel<<<1, 1024, 0, s>>>(l, n, tok, prob);
         return;
     }
