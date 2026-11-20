@@ -602,6 +602,19 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "turn2: p1 %zu tok %.2f s, a1 %zu tok %.2f s (%.1f tok/s), p2 %zu tok %.3f s (%.2f GB of "
                      "experts copied)\n", p1.size(), (t1 - t0) / 1000.0, a1.size(), (t2 - t1) / 1000.0,
                      a1.size() * 1000.0 / (t2 - t1), p2.size(), (t3 - t2) / 1000.0, eng.stats().pf_copy_last_gb);
+        // (HY4_TURN2_LP=<file>, a check: each forced answer token's natural log-prob and whether it is the argmax, a
+        //  line each, "# turn2" before each conversation - for a paired quality test of cache settings)
+        static FILE* lpf = std::getenv("HY4_TURN2_LP") ? std::fopen(std::getenv("HY4_TURN2_LP"), "w") : nullptr;
+        auto lp_line = [&](size_t i, const float* x, int tok) {
+            if (!lpf) return;
+            float mx = x[0];
+            for (int v = 1; v < V; ++v) mx = std::max(mx, x[v]);
+            double se = 0.0;
+            for (int v = 0; v < V; ++v) se += std::exp((double) x[v] - mx);
+            std::fprintf(lpf, "%zu,%d,%.6f,%d\n", i, tok, (double) x[tok] - mx - std::log(se), argmax(x, V) == tok);
+        };
+        if (lpf) std::fprintf(lpf, "# turn2\n");
+        lp_line(0, lg, a2[0]);
         int agree = argmax(lg, V) == a2[0];
         double sum_ms[2] = {}, sum_lane[2] = {};
         long sum_n[2] = {};
@@ -615,6 +628,7 @@ int main(int argc, char** argv) {
             lg = eng.step(a2[i]);
             if (!lg) return false;
             agree += argmax(lg, V) == a2[i + 1];
+            lp_line(i + 1, lg, a2[i + 1]);
             ++nb;
             if (nb == (tok1 && i < 20 ? 1 : 10) || i + 2 == a2.size()) {
                 const double ms = now_ms() - b0;
@@ -636,6 +650,7 @@ int main(int argc, char** argv) {
                 b0 = now_ms();
             }
         }
+        if (lpf) std::fflush(lpf);
         std::fprintf(stderr, "turn2 sum: tokens 1-100 %.1f tok/s (lane %.1f experts/tok), 101-%zu %.1f tok/s (lane %.1f); "
                      "agree %d/%zu\n", sum_n[0] * 1000.0 / std::max(1.0, sum_ms[0]), sum_lane[0] / std::max(1L, sum_n[0]),
                      a2.size() - 1, sum_n[1] * 1000.0 / std::max(1.0, sum_ms[1]), sum_lane[1] / std::max(1L, sum_n[1]),
