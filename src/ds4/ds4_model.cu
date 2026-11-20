@@ -5464,7 +5464,11 @@ struct Model::Impl {
         if (cudaHostAlloc(&h, nb, cudaHostAllocPortable) == cudaSuccess && cudaMalloc(&v, nb) == cudaSuccess &&
             cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess) {
             std::memset(h, 0, nb);
-            for (int rep = 0; rep < 4; ++rep) {
+            // (a GPU idle until now copies at a fraction of its link at first - an RTX 5090 on PCIe 5 x8 read 1.8 GB/s
+            // here, 28.8 once busy - and that reading took one expert a batch below, a ring of 4 slots where the link
+            // gives 40: while the best is under kRingSlowBps the copies go on, for up to 0.6 s)
+            const double tl0 = now_ms();
+            for (int rep = 0; rep < 4 || (best < kRingSlowBps && rep < 64 && now_ms() - tl0 < 600.0); ++rep) {
                 float ms = 0;
                 if (cudaEventRecord(e0, s) != cudaSuccess || cudaMemcpyAsync(v, h, nb, cudaMemcpyHostToDevice, s) != cudaSuccess ||
                     cudaEventRecord(e1, s) != cudaSuccess || cudaEventSynchronize(e1) != cudaSuccess ||
@@ -6353,7 +6357,8 @@ struct Model::Impl {
         // (a pinned copy in one part, any format - cp_pin's: DMA'd from where it lies, as above; the readers' memcpy
         // into staging first was the 4-GPU prompt's limit on the IQ quants, ~2.7 GB/s a GPU; DS4_FLOW_COPY_DMA=1; unset: not)
         static const bool copy_dma = std::getenv("DS4_FLOW_COPY_DMA") != nullptr && std::atoi(std::getenv("DS4_FLOW_COPY_DMA")) != 0;
-        if (in_ram && copy_mode && cp_dma && copy_dma && NH == 1) {
+        if (in_ram && copy_mode && copy_dma && NH == 1 &&
+            (cp_dma || (cp_part && (size_t) l.ram[(size_t) e] < cp_slot.size() && cp_slot[(size_t) l.ram[(size_t) e]]))) {
             const uint8_t* p = ram_part[(size_t) l.ram[(size_t) e]][0];
             for (int r = 0; r < 3; ++r) it.src[r] = p + cp_lay[(size_t) l.il][(size_t) r] + mx_read_off(l, mi, r);
             ++c.it_ram;
@@ -8959,7 +8964,7 @@ struct Model::Impl {
         gg::iq_cpu_iq1s_rows(false);
         double gb = 0;
         if (ln_zc && env_tri("DS4_STREAM_ZC") < 0) {   // (nothing pulls them: the RAM unlocked again)
-            if (!cp_dma) {   // (#920: pins the prompt path DMAs from stay, as on v1.1.27's path)
+            if (!cp_dma && !cp_part) {   // (#920: pins the prompt path DMAs from stay, as on v1.1.27's path)
                 for (size_t c = 0; c < zc_chunk.size() && c < ram_chunks.size(); ++c)
                     if (zc_chunk[c]) {
                         cudaHostUnregister(ram_chunks[c]);
@@ -9110,8 +9115,11 @@ struct Model::Impl {
     // copy_ahead DMAs a streamed expert straight from its copy (copy_in_place) - the CPU gathers only a group member's
     // blocks of the down - where the readers staged every byte of it before: ~490 GB of copies for a 16K prompt at
     // tp 8 (orcarouter's Mix-256G), the 72 readers ~33 GB/s together, the prompt's limit (nsys: each member's thread
-    // staging ~20 of 38 s).  All or none (DS4_COPY_PIN=0: none - the staging, as before); zc_pin's chunks count
+    // staging ~20 of 38 s).  All or none (DS4_COPY_PIN=0: none - the staging, as before); zc_pin's chunks count.
+    // DS4_COPY_PIN_GB=N: the first chunks up to N GB (cp_part; cp_slot: ram_part slot -> its copy is pinned)
     bool cp_dma = false;
+    bool cp_part = false;
+    std::vector<char> cp_slot;
 #if defined(_WIN32) && !defined(STRATA_USE_HIP)
     // #794 (Windows, NVIDIA): every GPU's free VRAM in MiB now (-1: the driver's read failed), the current device kept
     std::vector<long long> free_mib_all() const {
@@ -9161,19 +9169,41 @@ struct Model::Impl {
         const size_t nc = ram_chunks.size();
         zc_chunk.resize(nc, 0);
         std::vector<char> mine(nc, 0);   // (1: this call pinned it, 2: it failed)
+        // DS4_COPY_PIN_GB=N: at most N GB of the copies pinned - whole chunks (a layer's copies each), in layer order -
+        // where the system cannot lock them all: Windows (WDDM) beside a helper GPU ran with 50 GB of registered copies
+        // and broke the layer GPU with 90 and with 98 GB (#794's out of memory at the first request, the pins given
+        // back or not).  The prompt path DMAs the pinned copies in place and stages the others (flow_push, cp_slot)
+        const double cap_gb = [] {
+            const char* v = ds4_env("DS4_COPY_PIN_GB");
+            return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
+        }();
+        std::vector<char> want(nc, 1);   // (the chunks to pin)
+        if (cap_gb > 0) {
+            double acc = 0;
+            for (size_t c = 0; c < nc; ++c) {
+                const double b = (double) ram_chunk_bytes[c] / 1e9;
+                if (!zc_chunk[c] && acc + b > cap_gb) want[c] = 0;
+                else acc += b;
+            }
+        }
         const unsigned pin_fl = copy_pin_flags(cudaHostRegisterPortable);
         std::atomic<size_t> next{0};
         std::vector<std::thread> th;
         for (int t = 0; t < 8; ++t)   // (pinning is the kernel's walk of the pages, ~0.6 GB/s a thread)
             th.emplace_back([&] {
                 for (size_t c; (c = next.fetch_add(1)) < nc;)
-                    if (!zc_chunk[c])
+                    if (!zc_chunk[c] && want[c])
                         mine[c] = cudaHostRegister(ram_chunks[c], ram_chunk_bytes[c], pin_fl) == cudaSuccess ? 1 : 2;
             });
         for (auto& t : th) t.join();
-        double gb = 0;
-        bool all = true;
+        double gb = 0, gb_all = 0;
+        bool all = true, whole = true;   // (all: every chunk asked for is pinned; whole: every chunk there is)
         for (size_t c = 0; c < nc; ++c) {
+            gb_all += (double) ram_chunk_bytes[c] / 1e9;
+            if (!want[c]) {
+                whole = false;
+                continue;
+            }
             all = all && (zc_chunk[c] || mine[c] == 1);
             gb += (double) ram_chunk_bytes[c] / 1e9;
         }
@@ -9229,6 +9259,20 @@ struct Model::Impl {
 #endif
         for (size_t c = 0; c < nc; ++c)
             if (mine[c] == 1) zc_chunk[c] = 1;
+        if (!whole) {   // (DS4_COPY_PIN_GB: the copies whose chunk is pinned, by their slot)
+            cp_slot.assign(ram_part.size(), 0);
+            for (size_t sl = 0; sl < ram_part.size(); ++sl)
+                for (size_t c = 0; c < nc; ++c)
+                    if (zc_chunk[c] && ram_part[sl][0] >= ram_chunks[c] &&
+                        ram_part[sl][0] < ram_chunks[c] + ram_chunk_bytes[c]) {
+                        cp_slot[sl] = 1;
+                        break;
+                    }
+            cp_part = gb > 0;
+            std::fprintf(stderr, "ds4: %.1f of the copied experts' %.1f GB pinned (DS4_COPY_PIN_GB, in %.1f s): the prompt "
+                                 "path DMAs those in place and stages the others\n", gb, gb_all, (now_ms() - t0) / 1000.0);
+            return;
+        }
         cp_dma = true;
         std::fprintf(stderr, "ds4: the copied experts pinned (%.1f GB in %.1f s): the prompt path DMAs them in place\n", gb,
                      (now_ms() - t0) / 1000.0);
