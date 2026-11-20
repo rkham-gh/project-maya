@@ -695,6 +695,7 @@ struct Engine::Impl {
         cublasHandle_t cb = nullptr;
         cudaStream_t cs = nullptr;   // the experts' copies
         int *ids = nullptr, *sel = nullptr, *cnt = nullptr, *off = nullptr, *list = nullptr;
+        int* h_sel = nullptr;   // (HY4_PF_RECENT: a chunk's choices, on the host)
         float *X = nullptr, *A = nullptr, *Y = nullptr, *Ye = nullptr, *GU = nullptr, *RL = nullptr, *wts = nullptr,
               *wl = nullptr, *S = nullptr;
         __half *Ah = nullptr, *Xe = nullptr, *He = nullptr, *P = nullptr, *W1 = nullptr, *W2 = nullptr;
@@ -839,6 +840,17 @@ struct Engine::Impl {
         // scores decayed as T tokens would - raw counts (0) leave ~1,000 an expert after 32K against decode's ~1 a token,
         // and the cache cannot swap for hundreds of tokens (the review's meas-v4: 32K 20.0 -> 18.0 ms a token)
         int prompt = 2;
+        // The refill after a read (a check of three, the review's A / B / blend):
+        //  HY4_PF_RECENT=1 (A): a prompt chunk's choices scored as T written tokens would leave them - token t's
+        //   weighing decay^(T - t), the old scores times decay^T - instead of every token alike (HY4_CACHE_PROMPT's), so
+        //   the fill puts first the experts the message's end used;
+        //  HY4_PF_RESTORE=1 (B): the slots a read takes back refilled with the experts they held before it, best by
+        //   their scores then first; 2 (blend): the top HY4_PF_BLEND (0.25) of the empty slots by the scores first,
+        //   then B's, then the rest by the scores
+        bool recent = false;
+        int restore = 0;
+        double blend = 0.25;
+        std::vector<std::pair<int, float>> snap;   // (the taken-back slots' experts, their scores then)
         float *gu = nullptr, *h = nullptr, *y = nullptr, *routed = nullptr, *hd = nullptr;
         int8_t* hq = nullptr;
         cudaEvent_t copied = nullptr;
@@ -1855,6 +1867,9 @@ void Engine::Impl::ec_alloc() {
     if (const char* v = std::getenv("HY4_CACHE_MARGIN")) ec.margin = (float) std::atof(v);
     if (const char* v = std::getenv("HY4_CACHE_PROMPT")) ec.prompt = std::max(0, std::min(2, std::atoi(v)));
     if (const char* v = std::getenv("HY4_KV_SLACK")) kv_slack = std::max(8, std::min(kKvSlack, std::atoi(v)));
+    if (const char* v = std::getenv("HY4_PF_RECENT")) ec.recent = std::atoi(v) != 0;
+    if (const char* v = std::getenv("HY4_PF_RESTORE")) ec.restore = std::max(0, std::min(2, std::atoi(v)));
+    if (const char* v = std::getenv("HY4_PF_BLEND")) ec.blend = std::max(0.0, std::min(1.0, std::atof(v)));
     if (const char* v = std::getenv("HY4_CACHE_DEFER")) ec.defer = std::atoi(v) != 0;
     if (const char* v = std::getenv("HY4_CACHE_STAGE_KB")) ec.piece = (size_t) std::max(64, std::atoi(v)) << 10;
     if (ec.defer) {
@@ -2479,12 +2494,47 @@ void Engine::Impl::ec_fill(bool defer) {
             if (ec.cls[(size_t) sl] == c && ec_usable(sl) &&
                 (ec.owner[(size_t) sl] < 0 || (!fill_empty && !want[(size_t) ec.owner[(size_t) sl]])))
                 spare.push_back(sl);
-        for (size_t i = 0; i < top && !spare.empty(); ++i)
-            if (ec.where[(size_t) keys[i]] < 0) {
-                todo.push_back({keys[i], spare.back()});
-                spare.pop_back();
+        if (ec.restore && fill_empty && !ec.snap.empty()) {   // (HY4_PF_RESTORE) the order: blend's, B's, the scores'
+            std::vector<int> ord;
+            std::vector<char> seen(ec.where.size(), 0);
+            auto add = [&](int k) {
+                if (!seen[(size_t) k]) {
+                    seen[(size_t) k] = 1;
+                    ord.push_back(k);
+                }
+            };
+            if (ec.restore == 2) {
+                const size_t K = (size_t) (ec.blend * (double) spare.size());
+                for (size_t i = 0, n0 = 0; i < top && n0 < K; ++i)
+                    if (ec.where[(size_t) keys[i]] < 0) {
+                        add(keys[i]);
+                        ++n0;
+                    }
             }
+            std::vector<std::pair<int, float>> sn;
+            for (const auto& kv : ec.snap)
+                if (ec.layer_cls[(size_t) (kv.first / ec.ne)] == c) sn.push_back(kv);
+            std::stable_sort(sn.begin(), sn.end(), [](const std::pair<int, float>& x, const std::pair<int, float>& y) {
+                return x.second > y.second;
+            });
+            for (const auto& kv : sn) add(kv.first);
+            for (size_t i = 0; i < top; ++i) add(keys[i]);
+            for (int k : ord) {
+                if (spare.empty()) break;
+                if (ec.where[(size_t) k] < 0) {
+                    todo.push_back({k, spare.back()});
+                    spare.pop_back();
+                }
+            }
+        } else {
+            for (size_t i = 0; i < top && !spare.empty(); ++i)
+                if (ec.where[(size_t) keys[i]] < 0) {
+                    todo.push_back({keys[i], spare.back()});
+                    spare.pop_back();
+                }
+        }
     }
+    ec.snap.clear();
     if (defer && ec.fth.joinable()) {   // (the fill's worker: whole experts, apart from the swaps' staging)
         for (const auto& kv : todo) {
             const int key = kv.first, sl = kv.second;
@@ -2618,7 +2668,9 @@ void Engine::Impl::ec_reclaim(size_t bytes) {
     CK(cudaStreamSynchronize(s));
     for (int sl = ec.lent_from; sl < to; ++sl)
         if (ec.owner[(size_t) sl] >= 0) {
-            ec.where[(size_t) ec.owner[(size_t) sl]] = -1;
+            const int ow = ec.owner[(size_t) sl];
+            if (ec.restore && ec.where[(size_t) ow] == sl) ec.snap.push_back({ow, ec.score[(size_t) ow]});
+            ec.where[(size_t) ow] = -1;
             ec.owner[(size_t) sl] = -1;
         }
     ec.lent_from = to;
@@ -2655,6 +2707,20 @@ void Engine::Impl::ec_kv_reserve(int rows) {
 void Engine::Impl::pf_score(int il, const int* cnt, int T) {
     const int ne = g.n_expert;
     float* sc = ec.score.data() + (size_t) il * ne;
+    if (ec.recent && T > 0) {   // (HY4_PF_RECENT) as T written tokens: token t's choices decay^(T - t), in t's order
+        const double d = std::min(std::max((double) ec.decay, 0.0), 1.0);
+        std::vector<double> acc((size_t) ne, 0.0);
+        double w = 1.0;
+        for (int t = T - 1; t >= 0; --t) {
+            w *= d;
+            const int* sr = pf.h_sel + (size_t) t * g.n_used;
+            for (int q = 0; q < g.n_used; ++q)
+                if (sr[q] >= 0 && sr[q] < ne) acc[(size_t) sr[q]] += w;
+        }
+        const float keep = (float) std::pow(d, (double) T);
+        for (int e = 0; e < ne; ++e) sc[e] = sc[e] * keep + (float) acc[(size_t) e];
+        return;
+    }
     if (ec.prompt == 0 || T <= 0) {
         for (int e = 0; e < ne; ++e)
             if (cnt[e]) sc[e] += (float) cnt[e];
@@ -2907,7 +2973,7 @@ void Engine::Impl::hp_alloc() {
         if (const char* v = std::getenv("HY4_PF_SPLIT_PROJ")) hp.proj = std::atoi(v) != 0 ? 2 : 0;
         if (const char* v = std::getenv("HY4_PF_SPLIT_COLD")) hp.f3_cold = std::atof(v);
         for (int q = 0; q < 2; ++q) {
-            CK(cudaEventCreate(&hp.e_k0[q]));   // (timing on: the projection's rate)
+            CK(cudaEventCreate(&hp.e_k0[q]));   // (timing on: the cold guard's rate)
             CK(cudaEventCreate(&hp.e_k1[q]));
             CK(cudaEventCreate(&hp.e_kr[q]));
             CK(cudaEventCreate(&hp.e_ks[q]));
@@ -3037,7 +3103,7 @@ void Engine::Impl::hp_worker() {
         const CpuLayer& c = l.cl;
         const size_t gb = (size_t) ff * c.rg, ub = (size_t) ff * c.ru;
         const int b = j.b, T = j.T;
-        // (8b+'s projection) the last job's compute rate: f3 against the fit's shape, if that job was recent
+        // (8b+'s cold guard) the last job's compute rate: f3 against the fit's shape, if that job was recent
         hp.job_t0 = now_ms();
         hp.f3_ok = false;
         if (j.steal && hp.k_rec[b ^ 1] && hp.job_t0 - hp.last_merge.load() < 1000.0 &&
@@ -3960,6 +4026,7 @@ bool Engine::Impl::pf_alloc(std::string& err) {
     }
     pf.h_ids = halloc<int>(Cn);
     pf.h_cnt = halloc<int>(ne);
+    pf.h_sel = halloc<int>((size_t) Cn * g.n_used);
     // (HY4_PF_QMAX, a check: its two counters here - a device allocation after the load is refused)
     if (std::getenv("HY4_PF_QMAX") && std::atoi(std::getenv("HY4_PF_QMAX")) != 0) pf.qmax = dalloc<unsigned>(2);
     pf.h_off = halloc<int>(ne + 1);
@@ -4518,6 +4585,7 @@ void Engine::Impl::pf_moe(const Layer& l, int T) {
     CK(cudaMemsetAsync(pf.cnt, 0, (size_t) ne * sizeof(int), s));
     k::expert_count(pf.sel, T * nu, pf.cnt, s);
     CK(cudaMemcpyAsync(pf.h_cnt, pf.cnt, (size_t) ne * sizeof(int), cudaMemcpyDeviceToHost, s));
+    if (ec.recent) CK(cudaMemcpyAsync(pf.h_sel, pf.sel, (size_t) T * nu * sizeof(int), cudaMemcpyDeviceToHost, s));
     CK(cudaStreamSynchronize(s));
     pf.h_off[0] = 0;
     for (int e = 0; e < ne; ++e) pf.h_off[e + 1] = pf.h_off[e] + pf.h_cnt[e];

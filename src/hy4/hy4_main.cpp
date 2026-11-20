@@ -606,6 +606,9 @@ int main(int argc, char** argv) {
         double sum_ms[2] = {}, sum_lane[2] = {};
         long sum_n[2] = {};
         eng.clear_stats();
+        // (HY4_TURN2_TOK=1: tokens 1-20 a line each, with the refill's copies so far - main / helper - since the read)
+        static const bool tok1 = std::getenv("HY4_TURN2_TOK") && std::atoi(std::getenv("HY4_TURN2_TOK")) != 0;
+        const long cm0 = eng.stats().cache_copies, ch0 = eng.stats().helper_copies;
         double b0 = now_ms();
         int nb = 0;
         for (size_t i = 0; i + 1 < a2.size(); ++i) {
@@ -613,16 +616,17 @@ int main(int argc, char** argv) {
             if (!lg) return false;
             agree += argmax(lg, V) == a2[i + 1];
             ++nb;
-            if (nb == 10 || i + 2 == a2.size()) {
+            if (nb == (tok1 && i < 20 ? 1 : 10) || i + 2 == a2.size()) {
                 const double ms = now_ms() - b0;
                 const auto st = eng.stats();
                 const long lane = st.lookups - st.hits - st.hits_helper;
                 std::fprintf(stderr, "turn2 %4zu: %6.2f ms/tok, lane %6.1f experts/tok, main %5.1f%%, helper %5.1f%%, "
                              "lane layers/tok %4.1f, lane %.2f ms/tok (%.1f us an expert), helper wait %.2f ms/tok, "
-                             "agree %d/%zu\n", i + 1, ms / nb, (double) lane / nb,
+                             "agree %d/%zu, copies %ld / %ld\n", i + 1, ms / nb, (double) lane / nb,
                              st.lookups ? 100.0 * st.hits / st.lookups : 0.0,
                              st.lookups ? 100.0 * st.hits_helper / st.lookups : 0.0, (double) st.lane_layers / nb,
-                             st.ms_lane / nb, lane ? 1000.0 * st.ms_lane / lane : 0.0, st.ms_helper / nb, agree, i + 2);
+                             st.ms_lane / nb, lane ? 1000.0 * st.ms_lane / lane : 0.0, st.ms_helper / nb, agree, i + 2,
+                             st.cache_copies - cm0, st.helper_copies - ch0);
                 const int h = i + 1 <= 100 ? 0 : 1;
                 sum_ms[h] += ms;
                 sum_lane[h] += (double) lane;
