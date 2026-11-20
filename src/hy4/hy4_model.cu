@@ -424,7 +424,11 @@ struct Engine::Impl {
         double pre = 0, eg = 0;           // (in embed: pre_step's part, Engram's rows' part)
         unsigned long long faults = 0;    // (the process's page faults over the block)
         long cpu_experts = 0, tokens = 0;
+        double collect = 0;               // (in adapt: ec_arrive + ec_fcollect, the copies that came in)
+        long long wcalls0 = 0, wbytes0 = 0;   // (the fill worker's counters at the block's start)
     } pt;
+    // (HY4_STEP_TIMES) the fill worker's cudaMemcpyAsync calls and bytes so far
+    std::atomic<long long> wcalls{0}, wbytes{0};   // (64-bit: Windows' long is 32, and a token can copy > 2 GiB)
     // (HY4_ROUTE_LOG=FILE) the routing as it goes, for replaying the expert cache's choices offline: 'T' + a token's
     // n_used experts a MoE layer (uint16 each); 'P' + layer + a prompt chunk's counts an expert (uint16); 'E' a
     // prompt's end (the cache refilled there)
@@ -2331,9 +2335,13 @@ void Engine::Impl::ec_fworker() {
                     CK(cudaMemcpyAsync(ec.ptr[(size_t) kv.second] + o0, pr.first, pr.second, cudaMemcpyHostToDevice,
                                        ec.fcs));
                     o0 += pr.second;
+                    wcalls.fetch_add(1, std::memory_order_relaxed);
                 }
+                wbytes.fetch_add((long long) eb, std::memory_order_relaxed);
                 continue;
             }
+            wcalls.fetch_add(1, std::memory_order_relaxed);
+            wbytes.fetch_add((long long) eb, std::memory_order_relaxed);
             size_t o0 = at;
             for (const auto& pr : parts) {
                 std::memcpy(pin + o0, pr.first, pr.second);
@@ -6765,8 +6773,10 @@ const float* Engine::Impl::step(int token) {
     // the scores decay as tokens are written; a few swaps every few tokens (the copies that went up during this token
     // in use from the next)
     if (ec.slots) {
+        const double tcol = ptimes ? now_ms() : 0.0;
         ec_arrive();
         ec_fcollect(false, false);   // (the fill's experts that came in: usable from the next token)
+        if (ptimes) pt.collect += now_ms() - tcol;
         for (float& v : ec.score) v *= ec.decay;
         if (++ec.tok % ec.every == 0) ec_adapt();
     }
@@ -6818,7 +6828,12 @@ const float* Engine::Impl::step(int token) {
                      "fill to release, %ld copies so far)\n",
                      ec.pend.size() - ec.pend_head + (size_t) ec.finflight, ec.copies, hc.inflight, hc.fill_left,
                      hc.copies);
+        const long long wc = wcalls.load(), wb = wbytes.load();
+        std::fprintf(stderr, "maya-hy4:   (collect %.2f ms of adapt; the fill worker %lld cudaMemcpyAsync calls, %.1f MB)\n",
+                     pt.collect / n, wc - pt.wcalls0, (double) (wb - pt.wbytes0) / 1048576.0);
         pt = PhaseTimes{};
+        pt.wcalls0 = wc;
+        pt.wbytes0 = wb;
     }
     return h_logits;
 }
