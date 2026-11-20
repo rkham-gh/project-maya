@@ -1351,7 +1351,7 @@ __global__ void eg_rows_kernel(const float* __restrict__ rows, const float* __re
 // R_s += rms(value) gamma (g + hs[s])   (llama.cpp#32517's build_engram; eps the fp32 machine epsilon)
 __global__ void __launch_bounds__(1024) eg_update_kernel(const float* __restrict__ kv, const float* __restrict__ kb,
                                                          const float* __restrict__ gw, const float* __restrict__ hs,
-                                                         const float* __restrict__ gamma, int hc, int n, float eps,
+                                                         const float* __restrict__ gamma, int hc, int n, float eps, float geps,
                                                          float* __restrict__ R) {
     const int st = blockIdx.x;
     float* Rs = R + (size_t) st * n;
@@ -1371,7 +1371,7 @@ __global__ void __launch_bounds__(1024) eg_update_kernel(const float* __restrict
     sk = block_sum(sk);
     sv = block_sum(sv);
     dt = block_sum(dt);
-    const float ir = rsqrtf(sr / (float) n + eps), ik = rsqrtf(sk / (float) n + eps), iv = rsqrtf(sv / (float) n + eps);
+    const float ir = rsqrtf(sr / (float) n + geps), ik = rsqrtf(sk / (float) n + geps), iv = rsqrtf(sv / (float) n + eps);
     const float dot = dt * ir * ik / sqrtf((float) n);
     const float mag = sqrtf(fmaxf(fabsf(dot), 1e-6f));
     const float gt = sigmoidf_(dot < 0.0f ? -mag : mag);
@@ -1422,8 +1422,8 @@ void eg_rows(const float* rows, const float* w, int cols, int dim, float eps, fl
     eg_rows_kernel<<<cols, dim, 0, s>>>(rows, w, dim, wcols > 0 ? wcols : cols, eps, y, q, d);
 }
 void eg_update(const float* kv, const float* kb, const float* gw, const float* hs, const float* gamma, int hc, int n,
-               float eps, float* R, cudaStream_t s) {
-    eg_update_kernel<<<hc, 1024, 0, s>>>(kv, kb, gw, hs, gamma, hc, n, eps, R);
+               float eps, float* R, cudaStream_t s, float geps) {
+    eg_update_kernel<<<hc, 1024, 0, s>>>(kv, kb, gw, hs, gamma, hc, n, eps, geps < 0.0f ? eps : geps, R);
 }
 void lat_sum_q8(const float* cpu, const float* gpu, const int* flags, int n, float* y, int8_t* q, float* d,
                 cudaStream_t s) {
@@ -1603,7 +1603,7 @@ __global__ void hc_init_rows_kernel(const float* __restrict__ x, int hc, int n, 
 // grid (hc, T), block 1024: eg_update_kernel a row (kv [T][(hc + 1) n], R [T][hc][n])
 __global__ void __launch_bounds__(1024) eg_update_rows_kernel(const float* __restrict__ kv, const float* __restrict__ kb,
                                                               const float* __restrict__ gw, const float* __restrict__ hs,
-                                                              const float* __restrict__ gamma, int hc, int n, float eps,
+                                                              const float* __restrict__ gamma, int hc, int n, float eps, float geps,
                                                               float* __restrict__ R) {
     const int st = blockIdx.x;
     const size_t t = blockIdx.y;
@@ -1624,7 +1624,7 @@ __global__ void __launch_bounds__(1024) eg_update_rows_kernel(const float* __res
     sk = block_sum(sk);
     sv = block_sum(sv);
     dt = block_sum(dt);
-    const float ir = rsqrtf(sr / (float) n + eps), ik = rsqrtf(sk / (float) n + eps), iv = rsqrtf(sv / (float) n + eps);
+    const float ir = rsqrtf(sr / (float) n + geps), ik = rsqrtf(sk / (float) n + geps), iv = rsqrtf(sv / (float) n + eps);
     const float dot = dt * ir * ik / sqrtf((float) n);
     const float mg = sqrtf(fmaxf(fabsf(dot), 1e-6f));
     const float gt = sigmoidf_(dot < 0.0f ? -mg : mg);
@@ -1789,8 +1789,9 @@ void hc_init_rows(const float* x, int hc, int n, float* R, int T, cudaStream_t s
     if (T > 0) hc_init_rows_kernel<<<dim3(blocks(n, 256), T), 256, 0, s>>>(x, hc, n, R);
 }
 void eg_update_rows(const float* kv, const float* kb, const float* gw, const float* hs, const float* gamma, int hc, int n,
-                    float eps, float* R, int T, cudaStream_t s) {
-    if (T > 0) eg_update_rows_kernel<<<dim3(hc, T), 1024, 0, s>>>(kv, kb, gw, hs, gamma, hc, n, eps, R);
+                    float eps, float* R, int T, cudaStream_t s, float geps) {
+    if (T > 0) eg_update_rows_kernel<<<dim3(hc, T), 1024, 0, s>>>(kv, kb, gw, hs, gamma, hc, n, eps,
+                                                                  geps < 0.0f ? eps : geps, R);
 }
 void qpe_f16(const float* q, __half* qcat, int T, int H, int qk, int nope, int pos0, float theta_scale, cudaStream_t s) {
     if (T > 0) qpe_f16_kernel<<<T * H, 32, 0, s>>>(q, qcat, H, qk, nope, pos0, theta_scale);

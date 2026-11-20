@@ -182,6 +182,19 @@ struct Layer {
 };
 
 constexpr float kEgEps = 1.1920929e-07f;
+// (HY4_EG_GATE_EPS, a check: the Engram gate's two norms - the stream and the key - with their own eps; the BF16
+//  reference and Basalt use bf16's machine epsilon 0.0078125 there. HF's unset RMSNorm eps gives that on a bf16 input
+//  only in torch 2.4-2.6; from 2.7 it is float32's 1.19e-7 for bf16 too, the default here)
+static float eg_gate_eps() {
+    static const float e = std::getenv("HY4_EG_GATE_EPS") ? (float) std::atof(std::getenv("HY4_EG_GATE_EPS")) : kEgEps;
+    return e;
+}
+// (HY4_EG_EPS, a check: the per-head row norms' and the value norm's eps - all four of Engram's norms with
+//  HY4_EG_GATE_EPS)
+static float eg_eps() {
+    static const float e = std::getenv("HY4_EG_EPS") ? (float) std::atof(std::getenv("HY4_EG_EPS")) : kEgEps;
+    return e;
+}
 // the sliding-window layers' cache rows: the window and room past it (the prompt path's chunks will need more)
 constexpr int kSwaRing = 1024;   // (Engram's norms: the fp32 machine epsilon, as the reference)
 
@@ -4868,11 +4881,11 @@ void Engine::Impl::chunk(const int* ids, int T, bool want_logits) {
                         eg_row(l.eg, ids[s0 + t], pos0 + s0 + t, pf.h_egr + (size_t) t * cd);
                 });
                 CK(cudaMemcpyAsync(pf.EGR, pf.h_egr, (size_t) Ts * cd * sizeof(float), cudaMemcpyHostToDevice, s));
-                k::eg_rows(pf.EGR, l.eg_lnorm, Ts * g.eg_cols, g.eg_dim, kEgEps, pf.EGY, nullptr, nullptr, s, g.eg_cols);
+                k::eg_rows(pf.EGR, l.eg_lnorm, Ts * g.eg_cols, g.eg_dim, eg_eps(), pf.EGY, nullptr, nullptr, s, g.eg_cols);
                 k::to_f16(pf.EGY, pf.EGYh, (size_t) Ts * cd, s);
                 lin(l.eg_kv, pf.EGYh, pf.EGY, Ts, pf.KVO);
-                k::eg_update_rows(pf.KVO, l.eg_kv_b, l.eg_gate, l.eg_hs, l.eg_gamma, HC, E, kEgEps,
-                                  pf.R + (size_t) s0 * HC * E, Ts, s);
+                k::eg_update_rows(pf.KVO, l.eg_kv_b, l.eg_gate, l.eg_hs, l.eg_gamma, HC, E, eg_eps(),
+                                  pf.R + (size_t) s0 * HC * E, Ts, s, eg_gate_eps());
             }
         }
         // the attention, `sub` tokens at a time
@@ -5092,9 +5105,9 @@ void Engine::Impl::tok_attn(Layer& l) {
     if (l.eg >= 0) {
         nw_flush();   // (Engram changes the streams before their read)
         const int cd = g.eg_cols * g.eg_dim;
-        k::eg_rows(eg_rows_d + (size_t) l.eg * cd, l.eg_lnorm, g.eg_cols, g.eg_dim, kEgEps, eg_y, xq_e, xd_e, s);
+        k::eg_rows(eg_rows_d + (size_t) l.eg * cd, l.eg_lnorm, g.eg_cols, g.eg_dim, eg_eps(), eg_y, xq_e, xd_e, s);
         mv(l.eg_kv, eg_y, xq_e, xd_e, eg_kvo);
-        k::eg_update(eg_kvo, l.eg_kv_b, l.eg_gate, l.eg_hs, l.eg_gamma, HC, E, kEgEps, R, s);
+        k::eg_update(eg_kvo, l.eg_kv_b, l.eg_gate, l.eg_hs, l.eg_gamma, HC, E, eg_eps(), R, s, eg_gate_eps());
     }
     read_norm(l.hca_fn, 2 * HC, l.hca_scale, l.hca_base, hpost, l.attn_norm, a, xq_a, xd_a);
     {
@@ -6038,10 +6051,10 @@ void Engine::Impl::tokw_attn(Layer& l, int T) {
     if (l.eg >= 0) {
         nww_flush(T);
         const int cd = g.eg_cols * g.eg_dim;
-        k::eg_rows(weg_rows + (size_t) l.eg * wTm * cd, l.eg_lnorm, g.eg_cols * T, g.eg_dim, kEgEps, weg_y, wxq_e,
+        k::eg_rows(weg_rows + (size_t) l.eg * wTm * cd, l.eg_lnorm, g.eg_cols * T, g.eg_dim, eg_eps(), weg_y, wxq_e,
                    wxd_e, s, g.eg_cols);
         mvw(l.eg_kv, weg_y, wxq_e, wxd_e, weg_kvo, T);
-        k::eg_update_rows(weg_kvo, l.eg_kv_b, l.eg_gate, l.eg_hs, l.eg_gamma, HC, E, kEgEps, wR, T, s);
+        k::eg_update_rows(weg_kvo, l.eg_kv_b, l.eg_gate, l.eg_hs, l.eg_gamma, HC, E, eg_eps(), wR, T, s, eg_gate_eps());
     }
     read_norm_w(l.hca_fn, 2 * HC, l.hca_scale, l.hca_base, whpost, l.attn_norm, wa, wxq_a, wxd_a, T);
     {

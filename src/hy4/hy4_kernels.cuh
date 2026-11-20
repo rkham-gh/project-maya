@@ -160,7 +160,7 @@ void eg_rows(const float* rows, const float* w, int cols, int dim, float eps, fl
 /// Engram's update of the hc streams R [hc][n] from the projected rows kv [hc + 1][n] and its bias kb (keys, then the
 /// value): gw [hc][n] the gate's weights, hs [hc][n] the per-stream offsets, gamma [n] the value's.
 void eg_update(const float* kv, const float* kb, const float* gw, const float* hs, const float* gamma, int hc, int n,
-               float eps, float* R, cudaStream_t s);
+               float eps, float* R, cudaStream_t s, float geps = -1.0f);   // (geps >= 0: the gate's two norms' eps)
 /// y = (flags[0] ? cpu : 0) + (flags[1] ? gpu : 0) (n values, a multiple of 32) and its int8 rows.
 void lat_sum_q8(const float* cpu, const float* gpu, const int* flags, int n, float* y, int8_t* q, float* d,
                 cudaStream_t s);
@@ -192,7 +192,7 @@ void norm_write_rows(const float* a, const float* b, const float* w, float eps, 
 void hc_init_rows(const float* x, int hc, int n, float* R, int T, cudaStream_t s);
 /// eg_update for T rows: kv [T][(hc + 1) n], R [T][hc][n].
 void eg_update_rows(const float* kv, const float* kb, const float* gw, const float* hs, const float* gamma, int hc, int n,
-                    float eps, float* R, int T, cudaStream_t s);
+                    float eps, float* R, int T, cudaStream_t s, float geps = -1.0f);
 /// Qcat [T][H][576]'s rope part, F16(rope(q [T][H][qk]'s 64 values from nope on)) at [512:576], pos = pos0 + t.
 void qpe_f16(const float* q, __half* qcat, int T, int H, int qk, int nope, int pos0, float theta_scale, cudaStream_t s);
 /// n rows of 576 for positions p0 .. p0 + n out of a ring (row p % ring) into dst, or from src into the ring.
