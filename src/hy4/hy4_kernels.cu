@@ -1,4 +1,4 @@
-// src/hy4/hy4_kernels.cu - maya-hy4's own device kernels (ling_kernels.cuh).
+// src/hy4/hy4_kernels.cu - maya-hy4's own device kernels (hy4_kernels.cuh).
 #include "hy4_kernels.cuh"
 #include "hy4_topk.cuh"
 
@@ -189,10 +189,6 @@ __global__ void to_f16_kernel(const float* __restrict__ x, __half* __restrict__ 
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = __float2half(x[i]);
 }
-__global__ void axpy_kernel(float* __restrict__ y, const float* __restrict__ x, const float* __restrict__ a, size_t n) {
-    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] += x[i] * (a ? a[0] : 1.0f);
-}
 
 // ------------------------------------------------------------------------------------------------ the FFNs
 __global__ void swiglu_kernel(const float* __restrict__ g, const float* __restrict__ u, float* __restrict__ h, int n,
@@ -218,183 +214,6 @@ __global__ void sum_rows_kernel(const float* __restrict__ y, int n, int m, float
     float s = 0.0f;
     for (int i = 0; i < n; ++i) s += y[(size_t) i * m + c];
     out[c] = s;
-}
-__global__ void moe_tail_kernel(float* __restrict__ x, const float* __restrict__ cpu, const float* __restrict__ gpu,
-                                const float* __restrict__ so, const int* __restrict__ flags, int n) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= n) return;
-    float v = 0.0f;
-    if (flags[0]) v = cpu[c];
-    if (flags[1]) v += gpu[c];
-    x[c] += v + so[c];
-}
-
-// ------------------------------------------------------------------------------------------------ KDA
-// grid (H, 3: q / k / v), block hd: thread i the head's channel c = h hd + i - its convolution with the state (slid in
-// place: this thread alone reads and writes it), SiLU, the head's L2 norm (q, k); the q blocks also the gate and beta
-__global__ void kda_prep1_kernel(const float* __restrict__ qr, const float* __restrict__ kr, const float* __restrict__ vr,
-                                 const float* __restrict__ fr, const float* __restrict__ br, float* __restrict__ st_q,
-                                 float* __restrict__ st_k, float* __restrict__ st_v, const float* __restrict__ wq,
-                                 const float* __restrict__ wk, const float* __restrict__ wv,
-                                 const float* __restrict__ dt_bias, const float* __restrict__ a, float lb, float eps,
-                                 int hd, int K, float* __restrict__ qn, float* __restrict__ kn, float* __restrict__ vc,
-                                 float* __restrict__ ge, float* __restrict__ beta) {
-    const int h = blockIdx.x, which = blockIdx.y, i = threadIdx.x, c = h * hd + i;
-    const float* in = which == 0 ? qr : which == 1 ? kr : vr;
-    float* st = which == 0 ? st_q : which == 1 ? st_k : st_v;
-    const float* w = which == 0 ? wq : which == 1 ? wk : wv;
-    float win[8];
-    for (int j = 0; j < K - 1; ++j) win[j] = st[(size_t) c * (K - 1) + j];
-    const float x = in[c];
-    win[K - 1] = x;
-    float acc = 0.0f;
-    for (int j = 0; j < K; ++j) acc += win[j] * w[(size_t) c * K + j];   // (ggml_ssm_conv's order: the oldest first)
-    for (int j = 0; j < K - 1; ++j) st[(size_t) c * (K - 1) + j] = win[j + 1];
-    float y = silu_(acc);
-    if (which < 2) {
-        const float ss = block_sum(y * y);
-        y *= rsqrtf(ss + eps);
-        (which == 0 ? qn : kn)[c] = y;
-    } else {
-        vc[c] = y;
-    }
-    if (which == 0) {
-        ge[c] = expf(lb * sigmoidf_(a[h] * (fr[c] + dt_bias[c])));
-        if (i == 0) beta[h] = sigmoidf_(br[h]);
-    }
-}
-
-// a thread a (token, channel) of one of q / k / v (grid.y): silu(conv) over the chunk, the state's inputs before it
-__global__ void kda_conv_kernel(const float* __restrict__ qr, const float* __restrict__ kr, const float* __restrict__ vr,
-                                const float* __restrict__ st_q, const float* __restrict__ st_k,
-                                const float* __restrict__ st_v, const float* __restrict__ wq,
-                                const float* __restrict__ wk, const float* __restrict__ wv, float* __restrict__ qc,
-                                float* __restrict__ kc, float* __restrict__ vc, int T, int C, int K) {
-    const size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= (size_t) T * C) return;
-    const int which = blockIdx.y, t = (int) (idx / C), c = (int) (idx % C);
-    const float* in = which == 0 ? qr : which == 1 ? kr : vr;
-    const float* st = which == 0 ? st_q : which == 1 ? st_k : st_v;
-    const float* w = which == 0 ? wq : which == 1 ? wk : wv;
-    float acc = 0.0f;
-    for (int j = 0; j < K; ++j) {
-        const int tt = t - (K - 1) + j;
-        const float v = tt >= 0 ? in[(size_t) tt * C + c] : st[(size_t) c * (K - 1) + (tt + K - 1)];
-        acc += v * w[(size_t) c * K + j];
-    }
-    (which == 0 ? qc : which == 1 ? kc : vc)[idx] = silu_(acc);
-}
-__global__ void kda_conv_state_kernel(const float* __restrict__ qr, const float* __restrict__ kr,
-                                      const float* __restrict__ vr, float* __restrict__ st_q, float* __restrict__ st_k,
-                                      float* __restrict__ st_v, int T, int C, int K) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= C) return;
-    const int which = blockIdx.y;
-    const float* in = which == 0 ? qr : which == 1 ? kr : vr;
-    float* st = which == 0 ? st_q : which == 1 ? st_k : st_v;
-    float nw[8];
-    for (int j = 0; j < K - 1; ++j) {
-        const int tt = T - (K - 1) + j;
-        nw[j] = tt >= 0 ? in[(size_t) tt * C + c] : st[(size_t) c * (K - 1) + (tt + K - 1)];
-    }
-    for (int j = 0; j < K - 1; ++j) st[(size_t) c * (K - 1) + j] = nw[j];
-}
-// grid (T, H), block hd: the head's q and k L2-normed, its gate channels, its beta
-__global__ void kda_norm_gate_kernel(float* __restrict__ qc, float* __restrict__ kc, float* __restrict__ fr,
-                                     const float* __restrict__ br, float* __restrict__ beta,
-                                     const float* __restrict__ dt_bias, const float* __restrict__ a, float lb,
-                                     float eps, int H, int hd) {
-    const int t = blockIdx.x, h = blockIdx.y, i = threadIdx.x, C = H * hd, c = h * hd + i;
-    const size_t at = (size_t) t * C + c;
-    const float q = qc[at], k = kc[at];
-    const float sq = block_sum(q * q);
-    const float sk = block_sum(k * k);
-    qc[at] = q * rsqrtf(sq + eps);
-    kc[at] = k * rsqrtf(sk + eps);
-    fr[at] = expf(lb * sigmoidf_(a[h] * (fr[at] + dt_bias[c])));
-    if (i == 0) beta[(size_t) t * H + h] = sigmoidf_(br[(size_t) t * H + h]);
-}
-
-// The recurrence, ggml-cuda's gated_delta_net layout (KDA): a warp 4 columns (values j) of a head, 8 lanes a column,
-// each lane 16 of its keys (i = r 8 + lane_in_col); a column's sums over its 8 lanes.  The tokens one after another
-// with the state in registers; grid (H, 128 / (4 warps x 4 columns)).
-constexpr int kScanWarps = 4, kScanCols = 4, kScanLanes = 8, kScanRows = 128 / kScanLanes;
-__device__ __forceinline__ float seg_sum(float v) {   // a column's 8 lanes
-#pragma unroll
-    for (int o = kScanLanes / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
-__global__ void __launch_bounds__(32 * kScanWarps) kda_scan_kernel(const float* __restrict__ q,
-                                                                   const float* __restrict__ k,
-                                                                   const float* __restrict__ v,
-                                                                   const float* __restrict__ ge,
-                                                                   const float* __restrict__ beta,
-                                                                   float* __restrict__ S, float* __restrict__ o, int T,
-                                                                   int H, float scale) {
-    const int h = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
-    const int cw = lane / kScanLanes, lic = lane % kScanLanes;
-    const int j = (blockIdx.y * kScanWarps + w) * kScanCols + cw;
-    const int C = H * 128;
-    float* sc = S + ((size_t) h * 128 + j) * 128;
-    float s[kScanRows];
-#pragma unroll
-    for (int r = 0; r < kScanRows; ++r) s[r] = sc[r * kScanLanes + lic];
-    for (int t = 0; t < T; ++t) {
-        const size_t base = (size_t) t * C + (size_t) h * 128;
-        float kr[kScanRows], qr[kScanRows], gr[kScanRows];
-#pragma unroll
-        for (int r = 0; r < kScanRows; ++r) {
-            const int i = r * kScanLanes + lic;
-            kr[r] = k[base + i];
-            qr[r] = q[base + i];
-            gr[r] = ge[base + i];
-        }
-        const float bv = beta[(size_t) t * H + h], vv = v[base + j];
-        float kv = 0.0f;
-#pragma unroll
-        for (int r = 0; r < kScanRows; ++r) {
-            s[r] *= gr[r];
-            kv = fmaf(s[r], kr[r], kv);
-        }
-        kv = seg_sum(kv);
-        const float dl = (vv - kv) * bv;
-        float at = 0.0f;
-#pragma unroll
-        for (int r = 0; r < kScanRows; ++r) {
-            s[r] = fmaf(kr[r], dl, s[r]);
-            at = fmaf(s[r], qr[r], at);
-        }
-        at = seg_sum(at);
-        if (lic == 0) o[base + j] = at * scale;
-    }
-#pragma unroll
-    for (int r = 0; r < kScanRows; ++r) sc[r * kScanLanes + lic] = s[r];
-}
-
-// a warp a (token, head) of 128: lane values i = lane + 32 m
-__global__ void kda_out_kernel(const float* __restrict__ o, const float* __restrict__ gr, const float* __restrict__ w,
-                               float eps, int T, int H, float* __restrict__ y, __half* __restrict__ yh,
-                               int8_t* __restrict__ q, float* __restrict__ d) {
-    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-    if (row >= T * H) return;
-    const int t = row / H, h = row % H, C = H * 128;
-    const size_t base = (size_t) t * C + (size_t) h * 128;
-    float v[4], ss = 0.0f;
-#pragma unroll
-    for (int m = 0; m < 4; ++m) {
-        v[m] = o[base + lane + 32 * m];
-        ss += v[m] * v[m];
-    }
-    ss = warp_sum(ss);
-    const float sc = rsqrtf(ss / 128.0f + eps);
-#pragma unroll
-    for (int m = 0; m < 4; ++m) {
-        const int i = lane + 32 * m;
-        const float val = v[m] * sc * w[i] * sigmoidf_(gr[base + i]);
-        if (y) y[base + i] = val;
-        if (yh) yh[base + i] = __float2half(val);
-        if (q) warp_q8(val, q + base + i, d + (base + 32 * m) / 32);
-    }
 }
 
 // ------------------------------------------------------------------------------------------------ MLA
@@ -762,44 +581,6 @@ __global__ void head_gate_rows_kernel(const float* __restrict__ x, const float* 
     y[i] = __float2half(x[i] * sigmoidf_(g[row]));
     (void) H;
 }
-__global__ void mla_qpe_f16_kernel(const float* __restrict__ q, __half* __restrict__ qcat, int H, int pos0,
-                                   float theta_scale) {
-    const int t = blockIdx.x / H, h = blockIdx.x % H, i = threadIdx.x;
-    const float* p = q + ((size_t) t * H + h) * 192 + 128 + 2 * i;
-    float y0, y1;
-    rope_pair(p[0], p[1], pos0 + t, i, theta_scale, y0, y1);
-    __half* dst = qcat + ((size_t) t * H + h) * kMlaD + kMlaV + 2 * i;
-    dst[0] = __float2half(y0);
-    dst[1] = __float2half(y1);
-}
-__global__ void mla_softmax_kernel(float* __restrict__ S, int lds, __half* __restrict__ P, int ldp, int nk, int H, int ta,
-                                   int pos0) {
-    const int r = blockIdx.x, p = pos0 + ta + r / H;
-    float* Sr = S + (size_t) r * lds;
-    __half* Pr = P + (size_t) r * ldp;
-    float mx = -INFINITY;
-    for (int c = threadIdx.x; c < nk; c += blockDim.x) {
-        const float v = c <= p ? Sr[c] : -INFINITY;
-        Sr[c] = v;
-        mx = fmaxf(mx, v);
-    }
-    mx = block_max(mx);
-    float sum = 0.0f;
-    for (int c = threadIdx.x; c < nk; c += blockDim.x) {
-        const float v = Sr[c];
-        if (v != -INFINITY) sum += expf(v - mx);
-    }
-    sum = block_sum(sum);
-    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-    for (int c = threadIdx.x; c < ldp; c += blockDim.x) {
-        float pv = 0.0f;
-        if (c < nk) {
-            const float v = Sr[c];
-            if (v != -INFINITY) pv = expf(v - mx) * inv;
-        }
-        Pr[c] = __float2half(pv);
-    }
-}
 
 // ------------------------------------------------------------------------------------------------ the routing
 constexpr int kRouteMaxPer = 16;   // ne / 32
@@ -1008,9 +789,6 @@ bool embed_rows(const uint8_t* w, int type, size_t rb, const int* ids, int T, in
 void to_f16(const float* x, __half* y, size_t n, cudaStream_t s) {
     if (n) to_f16_kernel<<<blocks_l(n, 256), 256, 0, s>>>(x, y, n);
 }
-void axpy(float* y, const float* x, const float* a, size_t n, cudaStream_t s) {
-    if (n) axpy_kernel<<<blocks_l(n, 256), 256, 0, s>>>(y, x, a, n);
-}
 void swiglu(const float* g, const float* u, float* h, int n, float limit, cudaStream_t s) {
     swiglu_kernel<<<blocks(n, 256), 256, 0, s>>>(g, u, h, n, limit);
 }
@@ -1024,43 +802,7 @@ void swiglu_rows(const float* gu, int n, int ff, float limit, __half* h, cudaStr
 void sum_rows(const float* y, int n, int m, float* out, cudaStream_t s) {
     sum_rows_kernel<<<blocks(m, 256), 256, 0, s>>>(y, n, m, out);
 }
-void moe_tail(float* x, const float* cpu, const float* gpu, const float* so, const int* flags, int n, cudaStream_t s) {
-    moe_tail_kernel<<<blocks(n, 256), 256, 0, s>>>(x, cpu, gpu, so, flags, n);
-}
 
-void kda_prep1(const Kda& w, const float* qr, const float* kr, const float* vr, const float* fr, const float* br,
-               float* st_q, float* st_k, float* st_v, float* qn, float* kn, float* vc, float* ge, float* beta,
-               cudaStream_t s) {
-    kda_prep1_kernel<<<dim3(w.H, 3), w.hd, 0, s>>>(qr, kr, vr, fr, br, st_q, st_k, st_v, w.wq, w.wk, w.wv, w.dt_bias,
-                                                   w.a, w.lb, w.eps, w.hd, w.K, qn, kn, vc, ge, beta);
-}
-void kda_conv(const Kda& w, const float* qr, const float* kr, const float* vr, const float* st_q, const float* st_k,
-              const float* st_v, float* qc, float* kc, float* vc, int T, cudaStream_t s) {
-    const int C = w.H * w.hd;
-    const size_t n = (size_t) T * C;
-    if (n) kda_conv_kernel<<<dim3(blocks_l(n, 256), 3), 256, 0, s>>>(qr, kr, vr, st_q, st_k, st_v, w.wq, w.wk, w.wv, qc,
-                                                                     kc, vc, T, C, w.K);
-}
-void kda_conv_state(const Kda& w, const float* qr, const float* kr, const float* vr, float* st_q, float* st_k,
-                    float* st_v, int T, cudaStream_t s) {
-    const int C = w.H * w.hd;
-    kda_conv_state_kernel<<<dim3(blocks(C, 256), 3), 256, 0, s>>>(qr, kr, vr, st_q, st_k, st_v, T, C, w.K);
-}
-void kda_norm_gate(const Kda& w, float* qc, float* kc, float* fr, const float* br, float* beta, int T, cudaStream_t s) {
-    if (T > 0)
-        kda_norm_gate_kernel<<<dim3(T, w.H), w.hd, 0, s>>>(qc, kc, fr, br, beta, w.dt_bias, w.a, w.lb, w.eps, w.H, w.hd);
-}
-void kda_scan(const float* q, const float* k, const float* v, const float* ge, const float* beta, float* S, float* o,
-              int T, int H, cudaStream_t s) {
-    if (T > 0)
-        kda_scan_kernel<<<dim3(H, 128 / (kScanWarps * kScanCols)), 32 * kScanWarps, 0, s>>>(
-            q, k, v, ge, beta, S, o, T, H, 1.0f / std::sqrt(128.0f));
-}
-void kda_out(const float* o, const float* gr, const float* w, float eps, int T, int H, float* y, __half* yh,
-             int8_t* q, float* d, cudaStream_t s) {
-    const int rows = T * H, wpb = 8;
-    if (rows > 0) kda_out_kernel<<<blocks(rows, wpb), 32 * wpb, 0, s>>>(o, gr, w, eps, T, H, y, yh, q, d);
-}
 
 void mla_rope_q(float* q, int T, int H, int qk, int nope, int pos0, const int* dpos, float theta_scale, cudaStream_t s) {
     if (T > 0) mla_rope_q_kernel<<<T * H, 32, 0, s>>>(q, H, qk, nope, pos0, dpos, theta_scale);
@@ -1129,12 +871,6 @@ void head_gate(const float* x, const float* g, int H, int hd, float* y, int8_t* 
 void head_gate_rows(const float* x, const float* g, int T, int H, int hd, __half* y, cudaStream_t s) {
     const size_t n = (size_t) T * H * hd;
     if (n) head_gate_rows_kernel<<<blocks_l(n, 256), 256, 0, s>>>(x, g, n, H, hd, y);
-}
-void mla_qpe_f16(const float* q, __half* qcat, int T, int H, int pos0, float theta_scale, cudaStream_t s) {
-    if (T > 0) mla_qpe_f16_kernel<<<T * H, 32, 0, s>>>(q, qcat, H, pos0, theta_scale);
-}
-void mla_softmax(float* S, int lds, __half* P, int ldp, int M, int nk, int H, int ta, int pos0, cudaStream_t s) {
-    if (M > 0) mla_softmax_kernel<<<M, 256, 0, s>>>(S, lds, P, ldp, nk, H, ta, pos0);
 }
 
 void route(const float* RL, int ld, const float* bias, int T, int ne, int ng, int ngu, int nu, float scale, int* sel,

@@ -1,6 +1,6 @@
 // src/hy4/hy4_cpu.hpp - maya-hy4's CPU lane: a token's routed experts that are not in VRAM, computed from host memory
 // (the GGUF's mapping) with maya-ds4's CPU rows (src/ds4/ds4_gguf_cpu.hpp: ggml-cpu's dots, or ds4's own rows where
-// they are their bits), Ling's SwiGLU between gate / up and down - clamped in the layers the GGUF names
+// they are their bits), the SwiGLU between gate / up and down - clamped in the layers the GGUF names
 // (swiglu_clamp_exp): min(silu(g), L) clamp(u, -L, L).  (maya-ink's lane, src/ink/ink_cpu.*, with that clamp.)
 #pragma once
 
