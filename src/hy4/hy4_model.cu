@@ -389,10 +389,10 @@ struct Engine::Impl {
         *dh_in = nullptr, *dd_seq = nullptr;
     const uint8_t* dfl_embd = nullptr;   // (the embedding table the device gathers rows from)
     DMat dfl_ch;                          // the confidence head (BF16) and its bias
-    DMat dfl_head;                        // (the drafts' head: the target's output, or its first HY4_DFLY_VOCAB rows)
+    DMat dfl_head;                        // (the drafts' head: the target's output)
     float* dd_amx = nullptr;              // (the argmax's two stages' scratch)
     float dfl_ch_b = 0.0f;
-    float dfl_conf2[8] = {};              // (the other confidence of the last drafts: the head's, or the probability)
+    float dfl_conf2[8] = {};              // (the last drafts' confidence-head values)
     cudaGraphExec_t dfl_graph = nullptr;
     void dfl_pass(bool dump);
     template <class F> void q8_upload(F value, int k, int n, DMat& m);
@@ -816,8 +816,8 @@ struct Engine::Impl {
     // start.  maya-ink's cache (src/ink/ink_model.cu, its measured settings), slots sized per class of layers' bytes,
     // the prompt path's arena lent between prompts and the MLA caches' rows past the position lent too.
     // A swap's copy is staged in pieces (HY4_CACHE_STAGE_KB, 2 MB) while the CPU waits for a layer's attention on the
-    // GPU, and the expert is used from the token after the one its last piece went up in.  HY4_CACHE_DEFER=0: copied
-    // at the swap.
+    // GPU, and the expert is used from the token after the one its last piece went up in (copied at the
+    // swap only when the pinned staging can't be had).
     // A prompt chunk's counts go on the written tokens' scale (HY4_CACHE_PROMPT=2, the default since cc69fc0; pf_score):
     // each expert gets its share of what T written tokens would leave, and the layer's scores first decay as those
     // tokens would.  0 is the old raw counts - thousands after a long prompt, where a written token adds 1 and an expert
@@ -972,7 +972,7 @@ struct Engine::Impl {
         size_t bytes = 0;
         // the worker: (key, slot) jobs from q, the copied ones to done (both under mu); inflight is the main thread's
         // count of those it has not collected yet
-        bool bg = true, quit = false;
+        bool quit = false;
         std::thread th;
         std::mutex mu;
         std::condition_variable cv, cv_done;
@@ -1168,7 +1168,6 @@ struct Engine::Impl {
         const int sl = hc.where[(size_t) il * ec.ne + e];
         return sl >= 0 && !hc.busy[(size_t) sl];
     }
-    bool hc_steal = false;
     long pf_tokens_open = 0;
     int refill_tok = -1, refill_helper = 0;   // (verbose) a background refill's tokens so far (-1: none), its copies
     long refill_main = 0;
@@ -1873,7 +1872,6 @@ void Engine::Impl::ec_alloc() {
     if (const char* v = std::getenv("HY4_CACHE_PROMPT")) ec.prompt = std::max(0, std::min(2, std::atoi(v)));
     if (const char* v = std::getenv("HY4_KV_SLACK")) kv_slack = std::max(8, std::min(kKvSlack, std::atoi(v)));
     if (const char* v = std::getenv("HY4_PF_RESTORE")) ec.restore = std::atoi(v) != 0;
-    if (const char* v = std::getenv("HY4_CACHE_DEFER")) ec.defer = std::atoi(v) != 0;
     if (const char* v = std::getenv("HY4_CACHE_STAGE_KB")) ec.piece = (size_t) std::max(64, std::atoi(v)) << 10;
     if (ec.defer) {
         for (int i = 0; i < 2 && ec.defer; ++i) {
@@ -2470,7 +2468,7 @@ void Engine::Impl::ec_fcollect(bool wait, bool drop) {
     ec.fdone.clear();
 }
 
-// (defer, with HY4_CACHE_DEFER's staging on: the copies queued as the swaps' are - each slot given to its expert now,
+// (defer, with the swaps' staging on: the copies queued as the swaps' are - each slot given to its expert now,
 //  its bytes staged in pieces while the next tokens are written, the expert used once they are all up - instead of
 //  made here before the token goes on)
 void Engine::Impl::ec_fill(bool defer) {
@@ -2577,8 +2575,8 @@ void Engine::Impl::ec_adapt() {
                 const int key = il * ec.ne + e;
                 if (ec.where[(size_t) key] != -1 || ec.score[(size_t) key] <= 0.0f) continue;
                 // (an expert the helper card holds is off the CPU already: the main card's swaps go to the ones that
-                //  are not, and the helper's slots stay as they are; HY4_HELPER_STEAL=1: the main card takes them too)
-                if (hc.slots && !hc_steal && hc.where[(size_t) key] != -1) continue;
+                //  are not, and the helper's slots stay as they are)
+                if (hc.slots && hc.where[(size_t) key] != -1) continue;
                 best.push_back(key);
                 std::push_heap(best.begin(), best.end(), by_score);
                 if ((int) best.size() > per) {
@@ -3413,8 +3411,6 @@ void Engine::Impl::hc_alloc() {
     if (const char* v = std::getenv("HY4_HELPER_EVERY")) hc.every = std::max(1, std::atoi(v));
     if (const char* v = std::getenv("HY4_HELPER_SWAPS")) hc.per = std::max(0, std::atoi(v));
     if (const char* v = std::getenv("HY4_HELPER_FILL")) hc.fill_cap = std::max(0, std::atoi(v));
-    if (const char* v = std::getenv("HY4_HELPER_STEAL")) hc_steal = std::atoi(v) != 0;
-    if (const char* v = std::getenv("HY4_HELPER_BG")) hc.bg = std::atoi(v) != 0;
     if (const char* v = std::getenv("HY4_HELPER_MARGIN")) hc.margin = (float) std::atof(v);
     if (const char* v = std::getenv("HY4_HELPER_BIAS")) hc.bias = (float) std::atof(v);
     if (hc.margin < 0.0f) hc.margin = ec.margin;
@@ -3517,7 +3513,7 @@ void Engine::Impl::hc_alloc() {
     hc.owner.assign((size_t) hc.slots, -1);
     hc.busy.assign((size_t) hc.slots, 0);
     hc.where.assign((size_t) g.n_layer * ec.ne, -1);
-    if (hc.slots && hc.bg && hc.pcap > 0) {   // (the worker's own staging: HY4_HELPER_STAGE's size, two buffers)
+    if (hc.slots && hc.pcap > 0) {   // (the worker's own staging: HY4_HELPER_STAGE's size, two buffers)
         bool ok = true;
         for (int i = 0; i < 2 && ok; ++i) {
             ok = cudaHostAlloc((void**) &hc.wpin[i], hc.pcap, cudaHostAllocPortable) == cudaSuccess;
@@ -3532,7 +3528,7 @@ void Engine::Impl::hc_alloc() {
         }
     }
     if (const char* v = std::getenv("HY4_HELPER_FILL_BATCH")) hc.fill_batch = std::max(1, std::atoi(v));
-    if (hc.slots && hc.bg) hc.th = std::thread([this] { hc_worker(); });
+    if (hc.slots) hc.th = std::thread([this] { hc_worker(); });
     // The helper works in bursts of tens of microseconds a layer, so on its own its driver leaves it in P3 / P5: the
     // RTX 3090 measured 420-1,260 MHz and its memory at 5,001 or 810 MHz of 9,751 under maya-ink's Inkling 2, whose
     // expert GEMVs took 180-280 us there against 15-23 on the 5090.  A kernel kept resident while tokens are written
@@ -4065,9 +4061,7 @@ bool Engine::Impl::pf_alloc(std::string& err) {
 
 // The prompt path's buffers from the arena's start for chunks of up to Cn rows, attention pieces of Ca (pf.tqi the
 // indexer's tile), the prefetch's layer buffers with_pre: the same list for the size (assign false) and the pointers,
-// 256-byte aligned; the bytes taken.  (HY4_PF_LAYOUT=1: the full layout's parts at the load - the chunk's rows (x Cn),
-// the attention's piece (x Ca), the score and weight tiles, the group buffers, the prefetch's layer buffers, the
-// embedding rows)
+// 256-byte aligned; the bytes taken.
 size_t Engine::Impl::pf_carve(int Cn, int Ca, bool with_pre, bool assign) {
     const int E = g.n_embd, HC = g.hc, NL = g.n_lat, ne = g.n_expert, nu = g.n_used;
     const int ffe = g.n_ff_exp, ffs = g.n_ff_sh, ql = g.q_lora, QK = g.qk_head, V = g.v_head;
@@ -4075,17 +4069,11 @@ size_t Engine::Impl::pf_carve(int Cn, int Ca, bool with_pre, bool assign) {
     const int cd = g.eg_cols * g.eg_dim, D = g.idx_dim, NH = g.idx_heads, KP = std::max(1, g.idx_kpool);
     const size_t CE = (size_t) Cn * E;
     const size_t gu_cols = (size_t) std::max(ffe, ffs) * 2;
-    static const bool layout = std::getenv("HY4_PF_LAYOUT") != nullptr;
-    size_t at = 0, mark = 0;
+    size_t at = 0;
     auto carve = [&](auto*& ptr, size_t n) {
         using T = std::remove_reference_t<decltype(*ptr)>;
         if (assign) ptr = (T*) (pf.arena + at);
         at += (n * sizeof(T) + 255) & ~(size_t) 255;
-    };
-    auto part = [&](const char* what) {
-        if (layout && !assign)
-            std::fprintf(stderr, "maya-hy4: the prompt path's arena: %-26s %8.1f MiB\n", what, (at - mark) / 1048576.0);
-        mark = at;
     };
     carve(pf.ids, (size_t) Cn);
     carve(pf.R, (size_t) Cn * HC * E);
@@ -4111,7 +4099,6 @@ size_t Engine::Impl::pf_carve(int Cn, int Ca, bool with_pre, bool assign) {
     carve(pf.Ye, (size_t) Cn * std::max(E, NL));
     carve(pf.GU, (size_t) Cn * gu_cols);
     carve(pf.He, (size_t) Cn * std::max(ffe, ffs));
-    part("the chunk's rows (x Cn)");
     // Engram (a piece of `sub` rows at a time)
     carve(pf.EGR, (size_t) Ca * std::max(cd, 1));
     carve(pf.EGY, (size_t) Ca * std::max(cd, 1));
@@ -4143,7 +4130,6 @@ size_t Engine::Impl::pf_carve(int Cn, int Ca, bool with_pre, bool assign) {
         carve(pf.IS, (size_t) pf.tqi * max_pools);
         carve(pf.icells, (size_t) pf.tqi * std::max(1, pf.top_pools) * KP);
     }
-    part("the attention's piece (x Ca)");
     carve(pf.S, pf.s_elems);
     carve(pf.P, pf.s_elems);
     carve(pf.W1, pf.w1_elems);
@@ -4153,20 +4139,16 @@ size_t Engine::Impl::pf_carve(int Cn, int Ca, bool with_pre, bool assign) {
         carve(pf.GWu, (size_t) pf.GE * ffe * NL);
         carve(pf.GWd, (size_t) pf.GE * ffe * NL);
     }
-    part("the score / weight tiles");
     // two group buffers in turn, `stage` experts each (the copy of one group while the other's are multiplied)
     carve(pf.gbuf[0], (size_t) pf.GE * pf.slot_bytes);
     carve(pf.gbuf[1], (size_t) pf.GE * pf.slot_bytes);
-    part("the group buffers");
     if (pre.on && with_pre) {   // (the prefetch's two layer buffers)
         carve(pre.buf[0], pre.bytes);
         carve(pre.buf[1], pre.bytes);
     } else if (assign) {
         pre.buf[0] = pre.buf[1] = nullptr;   // (a small layout: no prefetch)
     }
-    part("the prefetch's layer buffers");
     if (embd_host) carve(pf.Erows, (size_t) Cn * embd.rb);   // (a chunk's embedding rows)
-    part("the embedding rows (x Cn)");
     return at;
 }
 
@@ -5872,7 +5854,7 @@ void Engine::Impl::pre_step(int rows) {
         // The prompt changed the scores, and the main cache with them: the helper follows, with more copies after a
         // longer prompt (an eighth of its tokens, 64 .. fill_cap).
         const int cap = std::min(hc.fill_cap, std::max(64, (int) std::min<long>(pf_tokens_open / 8, INT_MAX)));
-        if (bg_refill && hc.bg && hc.th.joinable()) {
+        if (bg_refill && hc.th.joinable()) {
             hc.fill_left = cap;   // (released fill_batch at a time, from the token's end on)
             hc_update(std::min(hc.fill_left, hc.fill_batch), false, true);
             hc.fill_left -= hc.issued;
@@ -6629,7 +6611,7 @@ void Engine::Impl::window_keep(int kept) {
     } else if (hc.slots) {
         const long before = hc.tok;
         hc.tok += kept;
-        if (hc.tok / hc.every != before / hc.every) hc_update(hc.per, true, hc.bg);
+        if (hc.tok / hc.every != before / hc.every) hc_update(hc.per, true, true);
     }
 }
 
@@ -6809,7 +6791,7 @@ const float* Engine::Impl::step(int token) {
         st.ms_update += now_ms() - u0;
     } else if (hc.slots && ++hc.tok % hc.every == 0) {
         const double u0 = now_ms();
-        hc_update(hc.per, true, hc.bg);
+        hc_update(hc.per, true, true);
         st.ms_update += now_ms() - u0;
     }
     if (refill_tok >= 0) {   // (a background refill under way: told when both caches' copies are up)

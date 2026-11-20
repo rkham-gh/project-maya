@@ -98,7 +98,7 @@ public:
     /// rewrites them as it decodes those positions).
     int dfly_draft(int tok, int max_n, int* out, float* conf);
     double dfly_ms() const;   // (the last dfly_draft's time)
-    float dfly_conf2(int i) const;   // (the last drafts' other confidence: HY4_DFLY_CONF's other one)
+    float dfly_conf2(int i) const;   // (the last drafts' confidence-head values)
     /// n tokens at pos() as one prompt: the logits after the last one (as step()), pos + n.  nullptr when they do not
     /// fit before max_ctx().  progress (when set) is called as they go, with the tokens read so far.
     const float* prefill(const int* ids, int n, void (*progress)(void*, int) = nullptr, void* ctx = nullptr);

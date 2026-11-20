@@ -180,31 +180,6 @@ bool Engine::Impl::dfly_load(const std::string& path, std::string& err) {
     auto mq = [&](const std::string& name, int64_t n, int64_t k, DMat& m) -> bool {   // a [n out][k in] weight
         const uint16_t* v = st.bf16(P0 + name, {n, k}, err);
         if (!v) return false;
-        static const int bf = std::getenv("HY4_DFLY_BF16") ? std::atoi(std::getenv("HY4_DFLY_BF16")) : 0;
-        if (bf) {   // (HY4_DFLY_BF16=1, a check: the checkpoint's BF16 kept - every GEMV a column at a time, F32 input;
-                    //  2: Q8_0's values as BF16 - Q8_0's weights with F32 activations)
-            m.type = 30;
-            m.k = (int) k;
-            m.n = (int) n;
-            m.rb = (size_t) k * 2;
-            std::vector<uint16_t> h(v, v + (size_t) n * k);
-            if (bf == 2)
-                for (size_t b0 = 0; b0 < h.size(); b0 += 32) {
-                    float amax = 0.0f;
-                    for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(bf16f(h[b0 + j])));
-                    const float dq = __half2float(__float2half(amax / 127.0f)), id = dq != 0.0f ? 1.0f / dq : 0.0f;
-                    for (int j = 0; j < 32; ++j) {
-                        const float q = (float) std::lround(bf16f(h[b0 + j]) * id) * dq;
-                        uint32_t u;
-                        std::memcpy(&u, &q, 4);
-                        h[b0 + j] = (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
-                    }
-                }
-            uint8_t* d = dalloc<uint8_t>(h.size() * 2);
-            CK(cudaMemcpy(d, h.data(), h.size() * 2, cudaMemcpyHostToDevice));
-            m.w = d;
-            return true;
-        }
         q8_upload([v](size_t i) { return bf16f(v[i]); }, (int) k, (int) n, m);
         return true;
     };
@@ -290,11 +265,8 @@ bool Engine::Impl::dfly_load(const std::string& path, std::string& err) {
     dd_e = dalloc<float>((size_t) E);
     dd_logits = dalloc<float>((size_t) g.vocab);
     dd_amx = dalloc<float>((size_t) 3 * 128);
-    // the drafts' head: the target's, or (HY4_DFLY_VOCAB=<n>) its first n rows - a draft vocabulary of the n lowest ids
-    // (the tokenizer's merges' order: the most frequent first), argmax over those alone
+    // the drafts' head: the target's
     dfl_head = output;
-    if (const char* v = std::getenv("HY4_DFLY_VOCAB"))
-        if (std::atoi(v) > 0 && std::atoi(v) < g.vocab) dfl_head.n = std::atoi(v);
     const size_t nq = std::max({(size_t) T * FF, (size_t) T * H * QK, (size_t) T * H * VH, (size_t) 2 * E});
     dd_xq = dalloc<int8_t>(nq);
     dd_xd = dalloc<float>(nq / 32);
@@ -536,12 +508,11 @@ int Engine::Impl::dfly_draft(int tok, int max_n, int* out, float* conf) {
     }
     CK(cudaStreamSynchronize(s));
     const int* otok = (const int*) dh_out;
-    static const int cmode = std::getenv("HY4_DFLY_CONF") ? std::atoi(std::getenv("HY4_DFLY_CONF")) : 0;
     for (int i = 0; i < max_n; ++i) {
         out[i] = otok[i];
         const float pr = dh_out[kDflN + i], ch = 1.0f / (1.0f + std::exp(-(dh_out[2 * kDflN + i] + dfl_ch_b)));
-        conf[i] = cmode == 1 ? ch : pr;   // (HY4_DFLY_CONF=1: the confidence head's; 0: the draft's probability)
-        dfl_conf2[i] = cmode == 1 ? pr : ch;
+        conf[i] = pr;   // (the draft's probability; the confidence head's value is the other one, reported)
+        dfl_conf2[i] = ch;
     }
     if (dump) {
         std::ofstream f(std::string(std::getenv("HY4_DFLY_DUMP")) + ".meta", std::ios::app);

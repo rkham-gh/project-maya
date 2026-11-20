@@ -22,8 +22,7 @@
 // DFly2 (--dfly; hy4_dfly.inc): each round drafts 5 tokens after the newest one from the target's state at the row
 // before it; DraftPolicy's cost-aware window (maya-ds4's DS4_DRAFT_COST) takes as many as pay by their probabilities -
 // calibrated online against what held - and the round times it measured at this depth (the drafting included); the
-// lookup's proposal competes as beside maya-ds4's drafter (choose(); a trusted long match is verified without
-// drafting).
+// lookup's proposal competes as beside maya-ds4's drafter (choose()).
 // Drafting rests for 48 rounds when its rounds commit fewer tokens a millisecond than plain ones (16 rounds judged; a
 // plain round every 32 keeps that rate). Keys: dfly=0|1; spec=1 (server.py's strata_tune: the plain token loop, no
 // drafting at all) or spec=N (windows of N rows at most).
@@ -741,7 +740,7 @@ int main(int argc, char** argv) {
     // prompt, and a probe every kDfProbe rounds
     constexpr int kDfJudge = 16, kDfRest = 48, kDfProbe = 32;
     double df_tok[3] = {}, df_ms[3] = {}, pl_tok[3] = {}, pl_ms[3] = {};
-    int df_n[3] = {}, df_tlast = 1;
+    int df_n[3] = {};
     auto band_of = [](size_t pos) { return pos < 8192 ? 0 : pos < 65536 ? 1 : 2; };
     long long df_rests = 0;
     std::vector<int32_t> dbuf((size_t) std::max(1, wmax));
@@ -777,11 +776,6 @@ int main(int argc, char** argv) {
         int think_budget = 0, think_end = -1;   // (the server's thinking budget: </think> forced after that many)
         int lk_on = lk_min > 0 && wmax >= 2 ? 1 : 0, wcap = wmax;
         int df_on = df_have ? 1 : 0;   // (dfly=0|1; spec=1: no drafting at all, spec=N: windows of N at most)
-        // (lookup_trust=0|1, server.py's strata_tune key: a long trusted lookup match verified without DFly2's draft;
-        //  HY4_LOOKUP_TRUST, 0: on code edits trusted lookups took the place of DFly2's longer windows - a first
-        //  measurement, its order not rotated; see test-results/2026-11-18-hy4/NOTES.md)
-        static const int trust_env = std::getenv("HY4_LOOKUP_TRUST") ? std::atoi(std::getenv("HY4_LOOKUP_TRUST")) : 0;
-        int lk_trust = trust_env != 0;
         std::vector<std::string> fields;
         while (ss >> w) fields.push_back(w);
         // the ids: digits and commas only, at least one (a field the stream stops in would leave a prompt cut short)
@@ -814,7 +808,6 @@ int main(int argc, char** argv) {
                     lk_on = lk_min > 0 && wmax >= 2 && std::atoi(v.c_str()) != 0 ? 1 : 0;
                 else if (k == "window") wcap = std::max(1, std::min(wmax, std::atoi(v.c_str())));
                 else if (k == "dfly") df_on = df_have && std::atoi(v.c_str()) != 0 ? 1 : 0;
-                else if (k == "lookup_trust") lk_trust = std::atoi(v.c_str()) != 0;
                 else if (k == "spec") {   // (server.py's strata_tune spec: 1 the plain loop, N a window's rows at most)
                     const int n = std::atoi(v.c_str());
                     if (n == 1) df_on = lk_on = 0;
@@ -904,7 +897,7 @@ int main(int argc, char** argv) {
         long long offered = 0, accepted = 0;
         long long rounds = 0, wins[17] = {};   // (the rounds, the windows by their size: the policy's choices)
         long long df_off = 0, df_acc = 0, lk_off = 0, lk_acc = 0;   // (the drafts verified and kept, by their source)
-        long long df_rounds = 0, lk_trusted = 0, df_restr = 0;   // (rounds that drafted, trusted lookups, rested ones)
+        long long df_rounds = 0, df_restr = 0;   // (rounds that drafted, rested ones)
         long long df_refill = 0;                                  // (... and rounds in a refill, no drafting)
         int df_rest = 0;
         // a token sampled: the thinking budget's forcing, printed, counted; then whether the request ends at it - 1
@@ -973,7 +966,7 @@ int main(int argc, char** argv) {
             // the window: DFly2's drafts by the cost-aware window, the lookup's where the policy expects more of it
             // (maya-ds4's round: a lookup whose first token is the drafter's), or the lookup's alone without DFly2
             int T = 1, nd = -1;
-            bool from_lk = false, trusted = false;
+            bool from_lk = false;
             bool draft = df_on && room >= 2;
             // (no drafting while the caches' refill after a prompt runs: every round is slow then, windows the most,
             //  and its round times would stand for this depth's afterwards - nor do those rounds judge the rest)
@@ -986,10 +979,6 @@ int main(int argc, char** argv) {
             } else if (draft && rounds % kDfProbe == kDfProbe - 1) {
                 draft = false;   // (a plain round now and then: the rate drafting is judged against)
             }
-            if (draft && lk_trust && kd > 0 && policy.trust(df_tlast, kd, match)) {   // (a long trusted match: verified alone)
-                const strata::spec::DraftPolicy::Pick pk = policy.choose(df_tlast, kd, match);
-                if (pk.lookup && pk.t >= 2) T = pk.t, from_lk = trusted = true, draft = false, ++lk_trusted;
-            }
             if (draft) nd = eng.dfly_draft(t, room - 1, ddr, dconf);
             if (nd >= 0) ++df_rounds;
             if (nd > 0) {
@@ -997,12 +986,11 @@ int main(int argc, char** argv) {
                 double q[16];
                 dcost.chain(dconf, nd, q);
                 T = dcost.window(q, nd, room);
-                df_tlast = T;
                 if (kd > 0 && (int) dbuf[0] == ddr[0]) {
                     const strata::spec::DraftPolicy::Pick pk = policy.choose(T, kd, match);
                     if (pk.lookup) T = pk.t, from_lk = true;
                 }
-            } else if (kd > 0 && !trusted) {
+            } else if (kd > 0) {
                 const strata::spec::DraftPolicy::Pick pk = policy.choose(1, kd, match);
                 if (pk.lookup && pk.t >= 2) T = pk.t, from_lk = true;
             }
@@ -1038,8 +1026,7 @@ int main(int argc, char** argv) {
                 else df_off += T - 1, df_acc += kept - 1;
                 if (nd >= 0) dcost.observe_cost(T, ms);
                 if (nd > 0 && !from_lk) dcost.observe_drafts(dconf, T - 1, kept - 1);
-                // (a trusted round's time with a draft's added: the policy's costs stay those of drafted rounds)
-                if (lk_on) policy.observe(from_lk, T, kept - 1, match, trusted ? ms + eng.dfly_ms() : ms);
+                if (lk_on) policy.observe(from_lk, T, kept - 1, match, ms);
                 if (!refill) df_judge(nd >= 0, kept, ms);
                 continue;
             }
@@ -1101,9 +1088,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr,
                          "maya-hy4: drafts %lld of %lld kept (DFly2 %lld of %lld, lookup %lld of %lld), %lld rounds for "
                          "%d tokens, windows%s; DFly2 drafted in %lld rounds, rested %lld (%lld rests so far), "
-                         "%lld in a refill; %lld trusted lookups\n",
+                         "%lld in a refill\n",
                          accepted, offered, df_acc, df_off, lk_acc, lk_off, rounds, generated, ws.c_str(), df_rounds,
-                         df_restr, df_rests, df_refill, lk_trusted);
+                         df_restr, df_rests, df_refill);
             if (df_on) std::fprintf(stderr, "maya-hy4: DFly2's round costs: %s\n", dcost.cost_text().c_str());
         }
         std::printf("DONE %d %zu %.1f %.1f %s %lld %lld %zu\n", generated, ids.size(), p1 - p0, now_ms() - p1,
