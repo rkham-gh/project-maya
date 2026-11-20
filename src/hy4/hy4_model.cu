@@ -244,9 +244,9 @@ struct Engine::Impl {
     uint8_t* snap_kv = nullptr;   // the sliding-window layers' rings at snap_pos
     int max_pools = 0;
     // host (pinned)
-    float *h_f = nullptr, *h_rlog = nullptr, *h_tail = nullptr, *h_logits = nullptr, *h_eg = nullptr;
+    float *h_f = nullptr, *h_logits = nullptr, *h_eg = nullptr;
     int* h_pos = nullptr;   // [0] the position, [1] the token (or 0), [2] the token's sequence number (tseq)
-    // The device's routing (the token path; HY4_DEV_ROUTE=0: the host's, as before).  Each MoE layer routes on the
+    // The device's routing (the token path).  Each MoE layer routes on the
     // device, runs its experts in the main card's cache from a table there (where: every key's slot, uploaded when it
     // changed; slotptr: the slots' pointers) and its shared expert in the segment's graph, and publishes its plan to
     // host-mapped memory; the host reads the plans in order (no syncs), runs the CPU lane's and the helper's experts
@@ -254,7 +254,6 @@ struct Engine::Impl {
     // the BF16 routers' F32 values for the prompt path's Sgemm (the largest's, made at the first prompt)
     size_t router_f32 = 0;
     float* router_f32_buf = nullptr;
-    bool dr = false;
     int *d_where = nullptr, *h_where = nullptr;
     std::vector<int> where_up;   // (the table as last uploaded)
     const uint8_t** d_slotptr = nullptr;
@@ -267,6 +266,8 @@ struct Engine::Impl {
     bool fault = false;   // (a card gave up waiting: see step_dr's end; reset() clears it)
     size_t plan_ints = 0, ans_ints = 0;
     int tseq = 0;
+    bool mapped_alloc(std::string& err);   // (the token path's host-mapped buffers, before the experts are pinned)
+    int win_rows() const;                  // (a window's rows at most, before the helper's say: wTm's bound)
     void dr_alloc();
     void dr_where();
     void tok_moe(const Layer& l, int il);
@@ -670,10 +671,8 @@ struct Engine::Impl {
     void tok_head();
     void tok_seg(int seg);   // the graphs' bodies: 0 the embedding .. the first MoE layer's router, il, n_layer: head
     void tok_graphs();
-    size_t tail_bytes() const { return ((size_t) 4 + g.n_lat) * sizeof(float); }
     std::vector<cudaGraphExec_t> gx;   // a segment's graph (tok_graphs): [0] the start, [il] a MoE layer's, [n_layer] head
     int graphs = -1;                   // -1: not made yet, 0: none, 1: made
-    void route_host(const Layer& l, const float* rl, int* sel, float* w) const;
 
     // ---------------------------------------------------------------- the prompt path (prefill)
     // A chunk of up to C tokens a layer at a time on the GPU: the dense matrices decoded to F16 and multiplied by
@@ -1688,8 +1687,6 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     xq_l = dalloc<int8_t>((size_t) NL);
     xd_l = dalloc<float>((size_t) NL / 32);
     h_f = halloc<float>((size_t) NL);
-    h_rlog = halloc<float>((size_t) g.n_expert);
-    h_tail = halloc<float>((size_t) 4 + NL);
     h_logits = halloc<float>((size_t) g.vocab);
     h_pos = halloc<int>(4);
     if (!g.eg_layers.empty()) {
@@ -1739,6 +1736,9 @@ bool Engine::Impl::load(const Options& opt, std::string& err) {
     // Every routed expert's pages touched once, now: the first touch of a mapped page costs a fault (~1 us a 4 KB
     // page on Windows even with the file in RAM), which held maya-ink's prompt-path copies to 3.5 GB/s and the CPU
     // lane's first tokens back.  HY4_PREFAULT=0: not done.
+    // (first the token path's host-mapped buffers - plans, answers, the windows' - a few MB this PC's pinned-memory
+    //  cap would otherwise take from what the experts' 76.5 GB leave)
+    if (!mapped_alloc(err)) return false;
     xp_pin();
     // Engram's table read once, now, when the experts are pinned (HY4_EG_PREFAULT, 1 then): its rows are read through
     // the mapping a few at a time, and with the experts out of the file cache there is room for all of it - without
@@ -5288,15 +5288,11 @@ void Engine::Impl::tok_router(const Layer& l) {
     mv(l.gate_inp, f, xq_f, xd_f, rlog);
     mv(l.lat_down, f, xq_f, xd_f, lat);
     k::q8(lat, 1, g.n_lat, xq_l, xd_l, s);
-    if (dr) return;   // (the device's routing: tok_moe next)
-    CK(cudaMemcpyAsync(h_f, lat, (size_t) g.n_lat * sizeof(float), cudaMemcpyDeviceToHost, s));
-    CK(cudaMemcpyAsync(h_rlog, rlog, (size_t) g.n_expert * sizeof(float), cudaMemcpyDeviceToHost, s));
 }
 
-// A MoE layer's end: the CPU lane's latent sum and which lanes ran (h_tail, written by the host) up to the device; the
+// A MoE layer's end: the CPU lane's latent sum and which lanes ran (d_tail, from moe_wait); the
 // latent sum (+ the VRAM experts') through routed_up, plus the shared expert's, post-normed, written back to the streams
 void Engine::Impl::tok_tail(const Layer& l) {
-    if (!dr) CK(cudaMemcpyAsync(d_tail, h_tail, tail_bytes(), cudaMemcpyHostToDevice, s));   // (else moe_wait's)
     k::lat_sum_q8(d_tail + 4, ec.routed, (const int*) d_tail, g.n_lat, lsum, xq_l, xd_l, s);
     mv(l.lat_up, lsum, xq_l, xd_l, fo);
     nw_defer(fo, so, l.post_ffn);
@@ -5336,7 +5332,7 @@ void Engine::Impl::tok_seg(int seg) {
             if (l.dense) tok_dense_ffn(l);
             else {
                 tok_router(l);
-                if (dr) tok_moe(l, il);
+                tok_moe(l, il);
             }
         }
         return;
@@ -5345,13 +5341,13 @@ void Engine::Impl::tok_seg(int seg) {
     tok_tail(L[(size_t) seg - 1]);
     tok_attn(l);
     tok_router(l);
-    if (dr) tok_moe(l, seg);
+    tok_moe(l, seg);
 }
 
 void Engine::Impl::tok_graphs() {
     graphs = 0;
     const char* v = std::getenv("HY4_GRAPHS");
-    if ((v && std::atoi(v) == 0) || std::getenv("HY4_TRACE")) return;
+    if (v && std::atoi(v) == 0) return;
     gx.assign((size_t) g.n_layer + 1, nullptr);
     auto capture = [&](int seg, cudaGraphExec_t& out) {
         cudaGraph_t gr_ = nullptr;
@@ -5376,46 +5372,14 @@ void Engine::Impl::tok_graphs() {
     graphs = 1;
 }
 
-// Hy4's routing on the host (llama.cpp's build_moe_ffn with sigmoid gating): sigmoid, + bias for the choice, the top
-// n_used (ties: the lower id); the weights the chosen sigmoids normalized x scale
-void Engine::Impl::route_host(const Layer& l, const float* rl, int* sel, float* w) const {
-    const int ne = g.n_expert;
-    float p[512], sc[512];
-    for (int e = 0; e < ne; ++e) {
-        p[e] = 1.0f / (1.0f + std::exp(-rl[e]));
-        sc[e] = p[e] + l.exp_bias[(size_t) e];
-    }
-    int idx[512];
-    for (int e = 0; e < ne; ++e) idx[e] = e;
-    std::partial_sort(idx, idx + g.n_used, idx + ne,
-                      [&](int a1, int b1) { return sc[a1] > sc[b1] || (sc[a1] == sc[b1] && a1 < b1); });
-    float sum = 0.0f;
-    for (int i = 0; i < g.n_used; ++i) {
-        sel[i] = idx[i];
-        sum += p[idx[i]];
-    }
-    const float den = std::max(sum, 6.103515625e-5f);
-    for (int i = 0; i < g.n_used; ++i) w[i] = p[sel[i]] / den * g.exp_scale;
-}
-
 // The helper card's own queued work (with the device's routing): each MoE layer's experts there read from the plan in
 // host-mapped memory by the card itself (hd_plan waits for it), its sum answered there (hd_answer) for the main card's
-// moe_wait2; the host runs only the CPU lane's.  (Without the device's routing - HY4_DEV_ROUTE=0 - the host launches
-// the helper's experts.)
+// moe_wait2; the host runs only the CPU lane's.
 void Engine::Impl::hd_alloc() {
-    hd = dr && hc.slots > 0;
+    hd = hc.slots > 0 && m_hans;
     if (!hd) return;
     const int NL = g.n_lat;
     const size_t nk = (size_t) g.n_layer * g.n_expert;
-    void* ha = nullptr;
-    if (cudaHostAlloc(&ha, (size_t) g.n_layer * ans_ints * sizeof(int), cudaHostAllocMapped | cudaHostAllocPortable) !=
-        cudaSuccess) {
-        cudaGetLastError();
-        hd = false;
-        std::fprintf(stderr, "maya-hy4: no host-mapped memory for the helper card's answers: the host launches its experts\n");
-        return;
-    }
-    m_hans = (int*) ha;
     std::memset(m_hans, 0, (size_t) g.n_layer * ans_ints * sizeof(int));
     CK(cudaHostGetDevicePointer((void**) &md_hans, m_hans, 0));
     auto portable = [&](size_t bytes) {   // (pinned for the helper's context too)
@@ -5534,40 +5498,72 @@ void Engine::Impl::hd_launch(int il) {
 }
 
 // ------------------------------------------------------------------------------------------------ the device's routing
-void Engine::Impl::dr_alloc() {
-    const char* v = std::getenv("HY4_DEV_ROUTE");
-    dr = !(v && std::atoi(v) == 0) && g.n_used <= 16;
-    if (!dr) return;
+// The token path's host-mapped buffers (the device's routing: a layer's plan and answer, the diagnostics; the helper's
+// answers; the windows' plans and answers) and the where table's host copy, taken at the load before the experts are
+// pinned: they are a few MB, and this PC's pinned-memory cap would otherwise leave them nothing.  Also the device
+// routing's limits, a load check: n_used <= 16 and the latent a multiple of 128 (the plan's 16-byte copies of the
+// int8 rows and scales: nl / 16 and nl / 128 pieces).
+bool Engine::Impl::mapped_alloc(std::string& err) {
     const int NL = g.n_lat;
-    const size_t nk = (size_t) g.n_layer * g.n_expert;
-    if (NL % 128 != 0) {   // (the plan's 16-byte copies of the int8 rows and scales: nl / 16 and nl / 128 pieces)
-        std::fprintf(stderr, "maya-hy4: the latent's width %d is not a multiple of 128: the host routes\n", NL);
-        dr = false;
-        return;
+    if (g.n_used > 16) {
+        err = "the model routes " + std::to_string(g.n_used) + " experts a token; the device's routing takes 16 at most";
+        return false;
+    }
+    if (NL % 128 != 0) {
+        err = "the latent's width " + std::to_string(NL) + " is not a multiple of 128 (the device's routing needs it)";
+        return false;
     }
     plan_ints = k::plan_ints(NL);
     ans_ints = ((size_t) k::kAnsHead + NL + 63) & ~(size_t) 63;
-    const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
-    void *hp = nullptr, *ha = nullptr, *hd = nullptr;
-    if (cudaHostAlloc(&hp, (size_t) g.n_layer * plan_ints * sizeof(int), fl) != cudaSuccess ||
-        cudaHostAlloc(&ha, (size_t) g.n_layer * ans_ints * sizeof(int), fl) != cudaSuccess ||
-        cudaHostAlloc(&hd, 64, fl) != cudaSuccess) {
-        cudaGetLastError();
-        dr = false;
-        std::fprintf(stderr, "maya-hy4: no host-mapped memory for the device's routing: the host routes\n");
-        return;
+    const int Tm = win_rows();
+    if (Tm >= 2) {
+        wplan_ints = k::winplan_ints(Tm, NL);
+        wans_ints = k::winans_ints(Tm, NL);
     }
-    m_plan = (int*) hp;
-    m_ans = (int*) ha;
-    m_diag = (unsigned*) hd;
-    std::memset(m_plan, 0, (size_t) g.n_layer * plan_ints * sizeof(int));
-    std::memset(m_ans, 0, (size_t) g.n_layer * ans_ints * sizeof(int));
-    std::memset(m_diag, 0, 64);
+    const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
+    size_t total = 0;
+    bool ok = true;
+    auto take = [&](size_t bytes) -> void* {
+        void* p = nullptr;
+        if (!ok || cudaHostAlloc(&p, bytes, fl) != cudaSuccess) {
+            ok = false;
+            return nullptr;
+        }
+        std::memset(p, 0, bytes);
+        total += bytes;
+        return p;
+    };
+    m_plan = (int*) take((size_t) g.n_layer * plan_ints * sizeof(int));
+    m_ans = (int*) take((size_t) g.n_layer * ans_ints * sizeof(int));
+    m_diag = (unsigned*) take(64);
+    if (o.helper_gpu >= 0) m_hans = (int*) take((size_t) g.n_layer * ans_ints * sizeof(int));
+    if (Tm >= 2) {
+        mw_plan = (int*) take((size_t) g.n_layer * wplan_ints * sizeof(int));
+        mw_ans = (int*) take((size_t) g.n_layer * wans_ints * sizeof(int));
+        mw_hans = (int*) take((size_t) g.n_layer * wans_ints * sizeof(int));
+    }
+    void* hw = nullptr;
+    const size_t nk = (size_t) g.n_layer * g.n_expert;
+    if (ok && cudaHostAlloc(&hw, nk * sizeof(int), cudaHostAllocPortable) != cudaSuccess) ok = false;
+    if (!ok) {
+        cudaGetLastError();
+        err = "no pinned / host-mapped memory for the token path's plans and answers (" +
+              std::to_string((total + nk * sizeof(int)) >> 20) + " MB or so): this PC's pinned memory is used up - "
+              "probably by other engines still running, or the commit limit; stop them (or set HY4_PIN_EXPERTS=0, "
+              "which pins no experts) and start again";
+        return false;
+    }
+    h_where = (int*) hw;
+    std::memset(h_where, 0, nk * sizeof(int));
+    return true;
+}
+
+void Engine::Impl::dr_alloc() {
+    const size_t nk = (size_t) g.n_layer * g.n_expert;
     CK(cudaHostGetDevicePointer((void**) &md_plan, m_plan, 0));
     CK(cudaHostGetDevicePointer((void**) &md_ans, m_ans, 0));
     CK(cudaHostGetDevicePointer((void**) &md_diag, m_diag, 0));
     d_where = dalloc<int>(nk);
-    h_where = halloc<int>(nk);
     where_up.assign(nk, INT_MIN);
     d_slotptr = (const uint8_t**) dalloc<const uint8_t*>((size_t) std::max(1, ec.slots));
     if (ec.slots)
@@ -5876,14 +5872,17 @@ void Engine::Impl::pre_step(int rows) {
 // A window of T tokens a pass (step_window): the token path's work with T columns (the dense set read once), T rows
 // (per token), the attention and the indexer token by token (causal; a group a token closes pooled before the next
 // one scores), the experts of T tokens in one plan and one answer a layer.  Its own buffers, sized here for wTm.
-void Engine::Impl::win_alloc() {
+int Engine::Impl::win_rows() const {
     const char* v = std::getenv("HY4_WINDOW_MAX");
-    wTm = v ? std::max(0, std::min(8, std::atoi(v))) : 6;
-    if (!dr || !hd) wTm = 0;   // (the device's routing and the helper's own work: its answer each layer)
+    int t = v ? std::max(0, std::min(8, std::atoi(v))) : 6;
     // (a draft's rejected tokens write ring rows a position past the kept ones - those of positions T - 1 back in the
     // sliding window's past at most: the ring holds swa_window + wTm - 1 rows, so the next token still reads its own)
-    if (g.swa_window > 0) wTm = std::min(wTm, kSwaRing - g.swa_window + 1);
-    if (wTm < 2) {
+    if (g.swa_window > 0) t = std::min(t, kSwaRing - g.swa_window + 1);
+    return t;
+}
+void Engine::Impl::win_alloc() {
+    wTm = hd ? win_rows() : 0;   // (the helper's own work: its answer each layer)
+    if (wTm < 2 || !mw_plan) {
         wTm = 0;
         return;
     }
@@ -5973,25 +5972,7 @@ void Engine::Impl::win_alloc() {
     wd_wsel = dalloc<float>((size_t) 16 * Tm);
     wd_need = dalloc<int>(1);
     (void) nu;
-    // plans and answers in host-mapped memory, a layer's each
-    wplan_ints = k::winplan_ints(Tm, NL);
-    wans_ints = k::winans_ints(Tm, NL);
-    const unsigned fl = cudaHostAllocMapped | cudaHostAllocPortable;
-    void *hp = nullptr, *ha = nullptr, *hh = nullptr;
-    if (cudaHostAlloc(&hp, (size_t) g.n_layer * wplan_ints * sizeof(int), fl) != cudaSuccess ||
-        cudaHostAlloc(&ha, (size_t) g.n_layer * wans_ints * sizeof(int), fl) != cudaSuccess ||
-        cudaHostAlloc(&hh, (size_t) g.n_layer * wans_ints * sizeof(int), fl) != cudaSuccess) {
-        cudaGetLastError();
-        wTm = 0;
-        std::fprintf(stderr, "maya-hy4: no host-mapped memory for windows: none\n");
-        return;
-    }
-    mw_plan = (int*) hp;
-    mw_ans = (int*) ha;
-    mw_hans = (int*) hh;
-    std::memset(mw_plan, 0, (size_t) g.n_layer * wplan_ints * sizeof(int));
-    std::memset(mw_ans, 0, (size_t) g.n_layer * wans_ints * sizeof(int));
-    std::memset(mw_hans, 0, (size_t) g.n_layer * wans_ints * sizeof(int));
+    // plans and answers in host-mapped memory, a layer's each (mapped_alloc's, sized for win_rows())
     CK(cudaHostGetDevicePointer((void**) &mdw_plan, mw_plan, 0));
     CK(cudaHostGetDevicePointer((void**) &mdw_ans, mw_ans, 0));
     CK(cudaHostGetDevicePointer((void**) &mdw_hans, mw_hans, 0));
@@ -6611,7 +6592,6 @@ const float* Engine::Impl::step(int token) {
     if (fault || pos >= max_ctx || token < 0 || token >= g.vocab) return nullptr;   // (fault: failed() until reset())
     const double t0 = now_ms();
     double cpu_ms = 0.0;
-    const int NL = g.n_lat;
     static const bool ptimes = std::getenv("HY4_STEP_TIMES") != nullptr;
     double tp = t0;
     auto phase = [&](double& acc) {
@@ -6643,116 +6623,11 @@ const float* Engine::Impl::step(int token) {
     h_pos[2] = ++tseq;
     CK(cudaMemcpyAsync(dpos, h_pos, 3 * sizeof(int), cudaMemcpyHostToDevice, s));
     phase(pt.embed);
-    if (dr) {
-        step_dr(cpu_ms, tp);
-        if (fault) {   // (a card gave up waiting: the token is not to be trusted)
-            ++pos;
-            return nullptr;
-        }
+    step_dr(cpu_ms, tp);
+    if (fault) {   // (a card gave up waiting: the token is not to be trusted)
+        ++pos;
+        return nullptr;
     }
-    else {   // the host's routing: a sync each MoE layer
-
-    static const bool trace = std::getenv("HY4_TRACE") != nullptr;
-    const int ne = g.n_expert, ff = g.n_ff_exp;
-    for (int il = g.n_dense; il < g.n_layer; ++il) {
-        Layer& l = L[(size_t) il];
-        const int seg = il == g.n_dense ? 0 : il;
-        if (trace) {
-            CK(cudaStreamSynchronize(s));
-            std::fprintf(stderr, "[trace] pos %d layer %d\n", pos, il);
-            std::fflush(stderr);
-        }
-        if (graphs > 0) CK(cudaGraphLaunch(gx[(size_t) seg], s));
-        else tok_seg(seg);
-        const bool staging = ec_stage_begin(ec.piece);   // (a piece of the swaps' copies while the GPU works)
-        CK(cudaStreamSynchronize(s));
-        if (staging) ec_stage_end();
-        dump("streams", il, R, pos);
-        phase(pt.att);
-        const double c0 = now_ms();
-        int sel[16];
-        float wv[16];
-        route_host(l, h_rlog, sel, wv);
-        phase(pt.route);
-        // the chosen experts in VRAM go to the GPU, the others to the CPU lane, both at once
-        int gslot[16], csel[16], hslot[16];
-        float gw[16], cw[16], hw[16];
-        int ng = 0, nc = 0, nh = 0;
-        if (route_log)
-            for (int i = 0; i < g.n_used; ++i) route_tok.push_back((uint16_t) sel[i]);
-        for (int i = 0; i < g.n_used; ++i) {
-            const size_t key = (size_t) il * ne + sel[i];
-            ec.score[key] += 1.0f;
-            const int sl = ec.slots ? ec.where[key] : -1;
-            const int hs = sl < 0 && hc.slots ? hc.where[key] : -1;
-            if (sl >= 0) {
-                gslot[ng] = sl;
-                gw[ng++] = wv[i];
-            } else if (hs >= 0) {
-                hslot[nh] = hs;
-                hw[nh++] = wv[i];
-            } else {
-                csel[nc] = sel[i];
-                cw[nc++] = wv[i];
-            }
-        }
-        ec.lookups += g.n_used;
-        ec.hits += ng;
-        hc.hits += nh;
-        // the CPU lane's workers start on the rest now; this thread launches the GPUs' parts, then joins them
-        float* h_routed = h_tail + 4;
-        if (nc) lane.begin(*pool, l.cl, NL, ff, csel, cw, nc, h_f, h_routed);
-        if (nh) hc_experts(l, hslot, hw, nh);   // (the helper card starts on its share first: it is the slower one)
-        if (ng) gpu_experts(l, gslot, gw, ng);
-        // the shared expert (f's int8 rows), unclamped
-        {
-            const DMat* ms[2] = {&l.sh_gate, &l.sh_up};
-            float* ys[2] = {sg, su};
-            mv_many(ms, ys, 2, f, xq_f, xd_f);
-        }
-        k::swiglu(sg, su, sh, g.n_ff_sh, 0.0f, s);
-        k::q8(sh, 1, g.n_ff_sh, xq_h, xd_h, s);
-        mv(l.sh_down, sh, xq_h, xd_h, so);
-        if (trace) {
-            CK(cudaStreamSynchronize(s));
-            std::fprintf(stderr, "[trace] layer %d: experts %d %d %d %d .., %d on the GPU; CPU lane next\n", il, sel[0],
-                         sel[1], sel[2], sel[3], ng);
-            std::fflush(stderr);
-        }
-        phase(pt.glaunch);
-        if (nc) lane.end();
-        const double c1 = now_ms();
-        st.ms_lane += c1 - c0;
-        st.lane_layers += nc > 0;
-        st.helper_layers += nh > 0;
-        if (nh) {   // the helper's sum joins the CPU lane's on the host (the device adds that to its own at the layer's end)
-            {
-                OnDev od(hc.dev);
-                CK(cudaStreamSynchronize(hc.s));
-            }
-            if (nc)
-                for (int i = 0; i < NL; ++i) h_routed[i] += hc.h_out[i];
-            else std::memcpy(h_routed, hc.h_out, (size_t) NL * sizeof(float));
-            st.ms_helper += now_ms() - c1;
-        }
-        cpu_ms += now_ms() - c0;
-        phase(pt.cpu);
-        pt.cpu_experts += nc;
-        int* flags = (int*) h_tail;   // which lanes ran, for this layer's end (the next segment's start)
-        flags[0] = nc > 0 || nh > 0;
-        flags[1] = ng > 0;
-        phase(pt.tail);
-    }
-
-    // the last layer's end and the output head
-    {
-        if (graphs > 0) CK(cudaGraphLaunch(gx[(size_t) g.n_layer], s));
-        else tok_seg(g.n_layer);
-        const bool staging = ec_stage_begin(4 * ec.piece);   // (the head's GEMV is the token's longest wait)
-        CK(cudaStreamSynchronize(s));
-        if (staging) ec_stage_end();
-    }
-    }   // (the host's routing)
     dump("final", g.n_layer, R, pos);
     ++pos;
     dfl_row = 0;   // (DFly2: the source row for a draft at pos)
