@@ -25,7 +25,7 @@ namespace dg = strata::ds4::gguf;
 // before the generation's number goes up), join() returns when all of them are through with it, so a worker can never
 // carry one run's job counter or function into the next.  A worker waits for the next generation spinning (a token's
 // layers come every few hundred microseconds; a sleeping thread takes tens of them to wake on Windows), and sleeps on
-// the condition variable once none has come for HY4_POOL_SPIN_US.
+// the condition variable once none has come for 3 ms.
 struct Pool::Impl {
     std::vector<std::thread> th;
     int workers = 0;
@@ -77,7 +77,6 @@ struct Pool::Impl {
 
 Pool::Pool(int workers) : p(new Impl) {
     p->workers = std::max(0, workers);
-    if (const char* v = std::getenv("HY4_POOL_SPIN_US")) p->spin = std::chrono::microseconds(std::max(0, std::atoi(v)));
     for (int i = 0; i < p->workers; ++i) p->th.emplace_back([this] { p->loop(); });
 }
 Pool::~Pool() {

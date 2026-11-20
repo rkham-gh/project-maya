@@ -776,14 +776,14 @@ struct Engine::Impl {
                       const uint8_t* const* wd);
     void chunk(const int* ids, int T, bool want_logits);
     const float* prefill(const int* ids, int n, void (*progress)(void*, int), void* ctx);
-    // (HY4_PF_PREFETCH=1) A chunk of HY4_PF_PREFETCH_MIN tokens (4096) or more uses nearly every expert of every
+    // (HY4_PF_PREFETCH, on; 0: off) A chunk of HY4_PF_PREFETCH_MIN tokens (4096) or more uses nearly every expert of every
     // layer, so a copier thread stages each MoE layer's experts that are not in the VRAM cache into one of two layer
     // buffers ([the gates | the ups | the downs] of the layer's experts, as the GGUF holds them) while the GPU computes
     // the layers before - the copies (the prompt path's bound: ~150 GB a chunk at what the RAM gives three passes) no
     // longer wait for the attention's compute, nor it for them.  Its own pinned staging, pool and copy stream; the
     // layer's GEMMs read the same weights in the same order as the group path's (the same bits).
     struct Prefetch {
-        bool on = false;
+        bool on = true;
         int min_T = 4096;
         size_t bytes = 0;                          // a layer buffer's
         uint8_t* buf[2] = {nullptr, nullptr};      // (in the arena)
@@ -815,7 +815,7 @@ struct Engine::Impl {
     // they follow what the conversation uses now; the scores can be kept in a file (Options::profile) for the next
     // start.  maya-ink's cache (src/ink/ink_model.cu, its measured settings), slots sized per class of layers' bytes,
     // the prompt path's arena lent between prompts and the MLA caches' rows past the position lent too.
-    // A swap's copy is staged in pieces (HY4_CACHE_STAGE_KB, 2 MB) while the CPU waits for a layer's attention on the
+    // A swap's copy is staged in pieces (2 MB) while the CPU waits for a layer's attention on the
     // GPU, and the expert is used from the token after the one its last piece went up in (copied at the
     // swap only when the pinned staging can't be had).
     // A prompt chunk's counts go on the written tokens' scale (HY4_CACHE_PROMPT=2, the default since cc69fc0; pf_score):
@@ -962,7 +962,7 @@ struct Engine::Impl {
         // 4096 41.8 / 43.7 tok/s, 1024 43.1 / 45.0, 0 43.3 / 45.4)
         int every = 1, per = 32, fill_cap = 1024;  // (see docs/LING.md, "Two cards")
         // A background fill after a prompt (HY4_BG_REFILL): fill_left copies still to release, at most fill_batch on
-        // their way at a time (HY4_HELPER_FILL_BATCH, 64) - each batch's victims evicted only when it is released, at a
+        // their way at a time (64) - each batch's victims evicted only when it is released, at a
         // token's end, so the rest keep serving; issued: the last hc_update's copies
         int fill_left = 0, fill_batch = 64, issued = 0;
         // the worker's own staging (as hc_copy_many's, apart from the token's thread's): two pinned buffers in turn
@@ -1865,14 +1865,10 @@ void Engine::Impl::ec_alloc() {
     ec.y = dalloc<float>((size_t) 16 * E);
     ec.routed = dalloc<float>(E);
     CK(cudaEventCreateWithFlags(&ec.copied, cudaEventDisableTiming));
-    if (const char* v = std::getenv("HY4_CACHE_DECAY")) ec.decay = (float) std::atof(v);
-    if (const char* v = std::getenv("HY4_CACHE_EVERY")) ec.every = std::max(1, std::atoi(v));
     if (const char* v = std::getenv("HY4_CACHE_SWAPS")) ec.per = std::max(0, std::atoi(v));
-    if (const char* v = std::getenv("HY4_CACHE_MARGIN")) ec.margin = (float) std::atof(v);
     if (const char* v = std::getenv("HY4_CACHE_PROMPT")) ec.prompt = std::max(0, std::min(2, std::atoi(v)));
     if (const char* v = std::getenv("HY4_KV_SLACK")) kv_slack = std::max(8, std::min(kKvSlack, std::atoi(v)));
     if (const char* v = std::getenv("HY4_PF_RESTORE")) ec.restore = std::atoi(v) != 0;
-    if (const char* v = std::getenv("HY4_CACHE_STAGE_KB")) ec.piece = (size_t) std::max(64, std::atoi(v)) << 10;
     if (ec.defer) {
         for (int i = 0; i < 2 && ec.defer; ++i) {
             ec.defer = cudaHostAlloc((void**) &ec.apin[i], 4 * ec.piece, cudaHostAllocPortable) == cudaSuccess;
@@ -2913,7 +2909,6 @@ void Engine::Impl::hp_alloc() {
     if (const char* v = std::getenv("HY4_PF_SPLIT")) hp.split = std::max(0, std::min(2, std::atoi(v)));
     if (const char* v = std::getenv("HY4_PF_SPLIT_FRAC")) hp.split_frac = std::max(0.0, std::min(1.0, std::atof(v)));
     if (const char* v = std::getenv("HY4_PF_SPLIT_MB")) hp.stage_bytes = (size_t) std::max(8, std::atoi(v)) << 20;
-    if (const char* v = std::getenv("HY4_PF_SPLIT_B")) hp.bmax = std::max(1, std::atoi(v));
     if (!xp_on) hp.split = 0;   // (the region's copies come straight from the pinned experts)
     if (const char* v = std::getenv("HY4_PF_HELPER_LOG")) hp.log = std::fopen(v, "a");
     const int NL = g.n_lat, ff = g.n_ff_exp, nu = g.n_used;
@@ -3408,11 +3403,8 @@ void Engine::Impl::hc_alloc() {
         return;
     }
     hc.dev = o.helper_gpu;
-    if (const char* v = std::getenv("HY4_HELPER_EVERY")) hc.every = std::max(1, std::atoi(v));
     if (const char* v = std::getenv("HY4_HELPER_SWAPS")) hc.per = std::max(0, std::atoi(v));
     if (const char* v = std::getenv("HY4_HELPER_FILL")) hc.fill_cap = std::max(0, std::atoi(v));
-    if (const char* v = std::getenv("HY4_HELPER_MARGIN")) hc.margin = (float) std::atof(v);
-    if (const char* v = std::getenv("HY4_HELPER_BIAS")) hc.bias = (float) std::atof(v);
     if (hc.margin < 0.0f) hc.margin = ec.margin;
     const int E = g.n_lat, ff = g.n_ff_exp, nc = (int) ec.cls_bytes.size();
     OnDev od(hc.dev);
@@ -3527,7 +3519,6 @@ void Engine::Impl::hc_alloc() {
             }
         }
     }
-    if (const char* v = std::getenv("HY4_HELPER_FILL_BATCH")) hc.fill_batch = std::max(1, std::atoi(v));
     if (hc.slots) hc.th = std::thread([this] { hc_worker(); });
     // The helper works in bursts of tens of microseconds a layer, so on its own its driver leaves it in P3 / P5: the
     // RTX 3090 measured 420-1,260 MHz and its memory at 5,001 or 810 MHz of 9,751 under maya-ink's Inkling 2, whose

@@ -17,7 +17,7 @@ namespace hy4 {
 
 /// A fixed set of worker threads; run() hands out jobs 0 .. n - 1 (the caller takes some too) and returns when all
 /// are done.  start() / join() split it: the workers begin at start(), the caller joins in at join().  Between runs the
-/// workers spin a while (HY4_POOL_SPIN_US, default 3000: a token's layers come faster than a sleeping thread wakes on
+/// workers spin a while (3 ms: a token's layers come faster than a sleeping thread wakes on
 /// Windows), then sleep.
 class Pool {
 public:

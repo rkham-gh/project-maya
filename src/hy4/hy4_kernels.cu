@@ -848,13 +848,8 @@ void mla_decode(const float* qa, const float* qf, int qk, int nope, const __half
                 const int* cells, const int* ncell, const float* sinks, int H, float scale, int nsp, float* scratch,
                 float* out, int8_t* oq, float* od, cudaStream_t s, int ring) {
     const size_t smem = ((size_t) kMlaHG * kMlaD + (size_t) kMlaHG * kMlaTile + 3 * kMlaHG) * sizeof(float);   // 41 KB
-    // (HY4_MLA_SPLIT_MIN: a split's fewest keys - 64, 32 or 16; 16 on the tensor cores, a tile a block - 10 us a call,
-    //  23 with 64 - and 64 on FP32)
-    static const int smin = [] {
-        const char* v = std::getenv("HY4_MLA_SPLIT_MIN");
-        const int m = v ? std::atoi(v) : (g_mla_tc ? 16 : kMlaTile);
-        return m == 16 || m == 32 ? m : kMlaTile;
-    }();
+    // (a split's fewest keys: 16 on the tensor cores, a tile a block - 10 us a call, 23 with 64 - and 64 on FP32)
+    static const int smin = g_mla_tc ? 16 : kMlaTile;
     if (g_mla_tc)
         mla_decode_tc_kernel<<<dim3(nsp, H / kMlaHG), kTcThreads, kTcSmem, s>>>(qa, qf, qk, nope, cache, dpos, win, cells,
                                                                                 ncell, ring, nsp, scale, scratch, smin,
