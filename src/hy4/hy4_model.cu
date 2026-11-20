@@ -1104,7 +1104,15 @@ struct Engine::Impl {
             long R3 = 0, R5 = 0;
             int ns = 0, ntb = 0;   // (8b+: the region's experts the 3090 computed, take-backs)
             double cms = 0;        // (its copies' ms)
+            // (the log's diagnosis columns) why the claims stopped: 0 none tried, 1 the region used up (the 5090's
+            // claims met them), 2 the copy-time rule, 3 the cold guard; the copies' MB and ms while the residents'
+            // compute ran and after it; the residents' launches and the host ms the worker spent issuing them
+            int why = 0;
+            double mb_during = 0, ms_during = 0, mb_after = 0, ms_after = 0;
+            long launches = 0;
+            double lms = 0;
         } meta[2];
+        std::atomic<bool> res_done{false};   // (the log: this job's residents issued and e_kr recorded)
         ~HPF() {
             if (sth.joinable()) {
                 {
@@ -3112,6 +3120,10 @@ void Engine::Impl::hp_worker() {
         //  launches take the host ~5 ms, and the copies would wait for them (item8f/s1: 22 of ~38 claimed a layer)
         std::vector<std::pair<int, size_t>> mine;   // (index in R.e, staging offset), in claim order
         double cms = 0;
+        // (HY4_PF_HELPER_LOG's diagnosis columns: see Meta)
+        int why = 0;
+        double mb_d = 0, ms_d = 0, mb_a = 0, ms_a = 0;
+        hp.res_done.store(false);
         if (j.steal) {
             {
                 std::lock_guard<std::mutex> lk(hp.smu);
@@ -3136,13 +3148,22 @@ void Engine::Impl::hp_worker() {
                     int s0, s1;
                     {
                         std::lock_guard<std::mutex> lk(R.mu);
-                        if (R.next <= R.lo) return false;
-                        if (!R.fixed && (double) (R.lo - R.p5.load()) * (double) eb < 28.9e9 * hp.last_tb) return false;
+                        if (R.next <= R.lo) {
+                            why = 1;
+                            return false;
+                        }
+                        if (!R.fixed && (double) (R.lo - R.p5.load()) * (double) eb < 28.9e9 * hp.last_tb) {
+                            why = 2;
+                            return false;
+                        }
                         const int B = std::max(1, std::min(hp.bmax, (int) (hp.tb_ms * 1e-3 * hp.rate3 / (double) eb)));
                         s1 = R.next;
                         s0 = std::max(R.lo, s1 - B);
                         if (!R.fixed && hp.proj == 2) {   // (the cold guard)
-                            if (!hp.f3_ok || hp.f3 > hp.f3_cold) return false;
+                            if (!hp.f3_ok || hp.f3 > hp.f3_cold) {
+                                why = 3;
+                                return false;
+                            }
                             for (int i = s0; i < s1; ++i) rcl += R.cnt[(size_t) i];
                         } else {
                             for (int i = s0; i < s1; ++i) rcl += R.cnt[(size_t) i];
@@ -3181,6 +3202,12 @@ void Engine::Impl::hp_worker() {
                     const double bytes = (double) (x.s1 - x.s0) * (double) eb;
                     hp.last_tb = dt * 1e-3;
                     hp.rate3 = 0.7 * hp.rate3 + 0.3 * bytes / hp.last_tb;
+                    if (hp.log) {   // (the diagnosis: this batch landed while the residents computed, or after)
+                        const bool after = hp.res_done.load() &&
+                                           (!hp.e_kr[b] || cudaEventQuery(hp.e_kr[b]) == cudaSuccess);
+                        (after ? mb_a : mb_d) += bytes / 1048576.0;
+                        (after ? ms_a : ms_d) += dt;
+                    }
                     if (verify_fills())
                         for (size_t q = x.from; q < x.from + (size_t) (x.s1 - x.s0); ++q) {
                             const int key = il * g.n_expert + R.e[(size_t) mine[q].first];
@@ -3209,8 +3236,11 @@ void Engine::Impl::hp_worker() {
             }
             hp.scv.notify_all();
         }
+        const double tl0 = hp.log ? now_ms() : 0.0;
+        long nlaunch = 0;
         for (size_t i = 0; i < j.e.size(); ++i) {
             const uint8_t* w = j.blob[i];
+            nlaunch += 3 + 5 * (long) ((j.cnt[i] + hp.RT - 1) / hp.RT);   // (the log: 3 f16_rows, 5 a row tile)
             if (!iq::f16_rows(c.tg, w, NL, ff, (uint16_t*) hp.W1, NL, hp.s) ||
                 !iq::f16_rows(c.tu, w + gb, NL, ff, (uint16_t*) (hp.W1 + (size_t) ff * NL), NL, hp.s) ||
                 !iq::f16_rows(c.td, w + gb + ub, ff, NL, (uint16_t*) hp.W2, ff, hp.s)) {
@@ -3228,6 +3258,9 @@ void Engine::Impl::hp_worker() {
             }
         }
         if (hp.e_kr[b]) CK(cudaEventRecord(hp.e_kr[b], hp.s));   // (the residents' compute end)
+        const double tl1 = hp.log ? now_ms() : 0.0;
+        if (hp.log) (void) cudaStreamQuery(hp.s);   // (submitted, so e_kr can complete while the claims still run)
+        hp.res_done.store(true);
         if (j.steal) {   // (8b+) the region: claimed top down in batches, copied while the residents compute
             HPF::Region& R = hp.rg;
             const size_t eb = R.eb;
@@ -3266,6 +3299,16 @@ void Engine::Impl::hp_worker() {
             hp.meta[(size_t) b].ns = (int) mine.size();
             hp.meta[(size_t) b].ntb = ntb0;
             hp.meta[(size_t) b].cms = cms;
+        }
+        if (hp.log) {   // (the diagnosis columns; the region's ones zero without a steal)
+            HPF::Meta& mt = hp.meta[(size_t) b];
+            mt.why = j.steal ? why : 0;
+            mt.mb_during = mb_d;
+            mt.ms_during = ms_d;
+            mt.mb_after = mb_a;
+            mt.ms_after = ms_a;
+            mt.launches = nlaunch;
+            mt.lms = tl1 - tl0;
         }
         if (hp.e_k1[b]) {
             if (!j.steal) CK(cudaEventRecord(hp.e_ks[b], hp.s));
@@ -3306,8 +3349,11 @@ void Engine::Impl::hp_collect(int b) {
         CK(cudaEventElapsedTime(&comp3, hp.in_used[b], hp.e_c1[b]));
         CK(cudaEventElapsedTime(&out3, hp.e_c1[b], hp.out_ready[b]));
     }
-    std::fprintf(hp.log, "%ld,%d,%d,%d,%d,%ld,%d,%ld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.3f\n", m.seq, m.il, m.T,
-                 m.pos, m.n3, m.R3, m.n5, m.R5, d2h, in3, comp3, out3, own, stall, h2d, m.ns, m.ntb, m.cms);
+    // (then the diagnosis columns: why the claims stopped, the copies' MB / ms during the residents' compute and after,
+    //  the residents' launches and the host ms spent issuing them)
+    std::fprintf(hp.log, "%ld,%d,%d,%d,%d,%ld,%d,%ld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%.3f,%d,%.1f,%.3f,%.1f,%.3f,%ld,%.3f\n",
+                 m.seq, m.il, m.T, m.pos, m.n3, m.R3, m.n5, m.R5, d2h, in3, comp3, out3, own, stall, h2d, m.ns, m.ntb, m.cms,
+                 m.why, m.mb_during, m.ms_during, m.mb_after, m.ms_after, m.launches, m.lms);
     std::fflush(hp.log);
 }
 

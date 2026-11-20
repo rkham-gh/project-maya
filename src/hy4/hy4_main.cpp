@@ -595,6 +595,10 @@ int main(int argc, char** argv) {
         const double t1 = now_ms();
         for (size_t i = 0; i < a1.size() && lg; ++i) lg = eng.step(a1[i]);
         if (!lg) return false;
+        // (HY4_TURN2_GAP_MS=<ms>, a check: the cards left idle that long before p2 is read - a user's pause, so the
+        //  read starts on cold clocks, as cut.py --gap does through the server)
+        if (const char* gv = std::getenv("HY4_TURN2_GAP_MS"))
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::max(0, std::atoi(gv))));
         const double t2 = now_ms();
         lg = eng.prefill(p2.data(), (int) p2.size());
         if (!lg) return false;
