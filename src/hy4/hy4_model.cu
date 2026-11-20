@@ -5400,10 +5400,10 @@ void Engine::Impl::route_host(const Layer& l, const float* rl, int* sel, float* 
 
 // The helper card's own queued work (with the device's routing): each MoE layer's experts there read from the plan in
 // host-mapped memory by the card itself (hd_plan waits for it), its sum answered there (hd_answer) for the main card's
-// moe_wait2; the host runs only the CPU lane's.  HY4_DEV_HELPER=0: the host launches the helper's experts, as before.
+// moe_wait2; the host runs only the CPU lane's.  (Without the device's routing - HY4_DEV_ROUTE=0 - the host launches
+// the helper's experts.)
 void Engine::Impl::hd_alloc() {
-    const char* v = std::getenv("HY4_DEV_HELPER");
-    hd = dr && hc.slots > 0 && !(v && std::atoi(v) == 0);
+    hd = dr && hc.slots > 0;
     if (!hd) return;
     const int NL = g.n_lat;
     const size_t nk = (size_t) g.n_layer * g.n_expert;
