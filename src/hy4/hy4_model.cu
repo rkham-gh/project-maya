@@ -605,7 +605,8 @@ struct Engine::Impl {
     }
 
     // (HY4_DUMP=1) a row of the residual stream after a layer's attention or FFN: its RMS and first values, to stderr -
-    // the token path's (after each segment) and the prompt path's last token (after each part) compared line by line
+    // the prompt path's last token after each part, for layer-by-layer comparisons; the token path dumps only its
+    // final row (its per-layer rows went with the host's routing, c7cf37b)
     void dump(const char* what, int il, const float* dev, int at) {
         static const bool on = std::getenv("HY4_DUMP") != nullptr;
         if (!on) return;
@@ -4017,6 +4018,9 @@ bool Engine::Impl::pf_alloc(std::string& err) {
             if (!xp_on) pre.pool.reset(new Pool(7));
         }
     }
+    // (said at every load: the default moved into the code, 80a8454 - a config without the line must show it on)
+    std::fprintf(stderr, "maya-hy4: the prompt path's prefetch: %s\n",
+                 pre.on ? ("on (chunks of " + std::to_string(pre.min_T) + "+ tokens)").c_str() : "off");
     // Every buffer in one arena (none holds anything from one prompt to the next, so the expert cache can borrow it,
     // and each is written before it is read): its size from the full layout, then its pointers (pf_carve)
     pf.C_full = Cn;
